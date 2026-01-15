@@ -7,19 +7,18 @@ import sys
 # ==========================================
 # 0. 環境檢測與 OCR 初始化 (關鍵修復點)
 # ==========================================
-# 這段程式碼定義了 OCR_AVAILABLE，如果缺少這段，app.py 就會崩潰
 try:
     import pytesseract
     from pdf2image import convert_from_bytes
     from PIL import Image
-    OCR_AVAILABLE = True
+    # 這行是關鍵！如果沒有這行，app.py 就會崩潰
+    OCR_AVAILABLE = True 
 except ImportError:
     OCR_AVAILABLE = False
 
 # ==========================================
 # 1. 關鍵字字典
 # ==========================================
-
 EXCLUDE_KEYWORDS = [
     "化學", "反應式", "莫耳", "有機", "細胞", "遺傳", "DNA", "生態", "地質", "氣候", 
     "酸鹼", "沉澱", "氧化還原", "生物", "染色體", "演化", "板塊", "洋流", "試管",
@@ -35,9 +34,7 @@ CHAPTER_KEYWORDS = {
     "第六章.量子現象": ["光電效應", "光子", "波粒二象性", "物質波", "德布羅意", "能階", "光譜", "黑體輻射", "量子"]
 }
 
-PHYSICS_GENERAL_KEYWORDS = [
-    "物體", "粒子", "系統", "軌跡", "圖形", "數據", "實驗", "裝置", "觀察", "現象", "波長", "頻率"
-]
+PHYSICS_GENERAL_KEYWORDS = ["物體", "粒子", "系統", "軌跡", "圖形", "數據", "實驗", "裝置", "觀察", "現象", "波長", "頻率"]
 
 class SmartQuestionCandidate:
     def __init__(self, raw_text, question_number):
@@ -48,7 +45,6 @@ class SmartQuestionCandidate:
         self.predicted_chapter = "未分類"
         self.is_physics_likely = True
         self.status_reason = ""
-        
         self._parse_structure()
         self._predict_classification()
 
@@ -82,7 +78,6 @@ class SmartQuestionCandidate:
                 self.is_physics_likely = False
                 self.status_reason = f"非物理關鍵字: {', '.join(exclude_hits[:2])}"
                 return
-
         max_score = 0
         best_chap = "未分類"
         for chap, keywords in CHAPTER_KEYWORDS.items():
@@ -90,7 +85,6 @@ class SmartQuestionCandidate:
             if score > max_score:
                 max_score = score
                 best_chap = chap
-        
         if max_score > 0:
             self.predicted_chapter = best_chap
             self.is_physics_likely = True
@@ -106,7 +100,7 @@ class SmartQuestionCandidate:
 
 def perform_ocr(file_bytes):
     if not OCR_AVAILABLE:
-        return "Error: 伺服器未安裝 OCR 模組 (pytesseract/pdf2image)。"
+        return "Error: 伺服器未安裝 OCR 模組。"
     try:
         images = convert_from_bytes(file_bytes, dpi=300)
         full_text = ""
@@ -204,7 +198,6 @@ def parse_raw_file(file_obj, file_type, use_ocr=False):
             lines[start_line_idx] = first_line[match.end():].strip()
             
         raw_text_chunk = "\n".join(lines[start_line_idx:end_line_idx])
-        
         if len(raw_text_chunk.strip()) > 2:
             candidates.append(SmartQuestionCandidate(raw_text_chunk, q_num))
             
