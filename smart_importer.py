@@ -2,9 +2,19 @@ import re
 import pdfplumber
 import docx
 import io
+import sys
+
+# 嘗試匯入 OCR 相關套件，若環境未安裝則會在執行時提示
+try:
+    import pytesseract
+    from pdf2image import convert_from_bytes
+    from PIL import Image
+    OCR_AVAILABLE = True
+except ImportError:
+    OCR_AVAILABLE = False
 
 # ==========================================
-# 關鍵字字典
+# 關鍵字字典 (維持不變)
 # ==========================================
 
 EXCLUDE_KEYWORDS = [
@@ -64,7 +74,6 @@ class SmartQuestionCandidate:
     def _predict_classification(self):
         text_for_search = self.content + " " + " ".join(self.options)
         
-        # 1. 關鍵字排除
         exclude_hits = [k for k in EXCLUDE_KEYWORDS if k in text_for_search]
         if len(exclude_hits) >= 1:
             physics_rescue = sum(1 for k in ["牛頓", "電路", "透鏡", "拋體", "波長"] if k in text_for_search)
@@ -73,7 +82,6 @@ class SmartQuestionCandidate:
                 self.status_reason = f"非物理關鍵字: {', '.join(exclude_hits[:2])}"
                 return
 
-        # 2. 章節預測
         max_score = 0
         best_chap = "未分類"
         for chap, keywords in CHAPTER_KEYWORDS.items():
@@ -95,40 +103,66 @@ class SmartQuestionCandidate:
                 self.is_physics_likely = False
                 self.status_reason = "無明顯特徵"
 
-def parse_raw_file(file_obj, file_type):
-    full_text = ""
-    if file_type == 'pdf':
-        try:
-            with pdfplumber.open(file_obj) as pdf:
-                # 檢查是否為空文件或純圖片
-                first_page_text = pdf.pages[0].extract_text()
-                if not first_page_text:
-                    # 嘗試如果不加 layout 參數是否能讀到
-                    pass 
-                
-                for page in pdf.pages:
-                    # 關鍵修改：不使用 layout=True，避免雙欄排版文字碎裂
-                    # 大多數雙欄 PDF 的文字流順序是：左欄全部 -> 右欄全部
-                    text = page.extract_text() 
-                    if text: full_text += text + "\n"
-        except Exception as e:
-            return []
-    elif file_type == 'docx':
-        doc = docx.Document(file_obj)
-        full_text = "\n".join([p.text for p in doc.paragraphs])
+def perform_ocr(file_bytes):
+    """將 PDF 轉圖片並執行 OCR"""
+    if not OCR_AVAILABLE:
+        return "Error: 伺服器未安裝 OCR 模組 (tesseract/poppler)。請聯繫管理員。"
     
+    try:
+        # 將 PDF 轉為圖片 (解析度 300 dpi 以確保文字清晰)
+        images = convert_from_bytes(file_bytes, dpi=300)
+        full_text = ""
+        
+        for i, img in enumerate(images):
+            # 使用 Tesseract 辨識繁體中文與英文
+            # layout=6 表示假設是單一文字區塊 (有助於雙欄，但有時需調整)
+            # 我們使用預設模式即可
+            text = pytesseract.image_to_string(img, lang='chi_tra+eng')
+            full_text += text + "\n"
+            
+        return full_text
+    except Exception as e:
+        return f"OCR Error: {str(e)}"
+
+def parse_raw_file(file_obj, file_type, use_ocr=False):
+    """
+    主解析入口
+    use_ocr: 是否強制使用 OCR (圖片轉文字) 模式
+    """
+    full_text = ""
+    
+    # 讀取檔案內容到 bytes (為了重複使用或 OCR)
+    file_obj.seek(0)
+    file_bytes = file_obj.read()
+    
+    # 1. 決定如何取得文字
+    if use_ocr and file_type == 'pdf':
+        full_text = perform_ocr(file_bytes)
+        if full_text.startswith("Error"):
+            return [] # OCR 失敗
+    elif file_type == 'pdf':
+        try:
+            with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+                for page in pdf.pages:
+                    text = page.extract_text()
+                    if text: full_text += text + "\n"
+        except: return []
+    elif file_type == 'docx':
+        doc = docx.Document(io.BytesIO(file_bytes))
+        full_text = "\n".join([p.text for p in doc.paragraphs])
+
     if not full_text.strip():
         return []
 
     lines = full_text.split('\n')
     
-    # === 第一階段：收集所有疑似題號的候選者 ===
-    # 格式：(行號 index, 題號數字 number, 原始行文字 line_content)
-    possible_anchors = []
+    # 2. 核心邏輯：尋找題號 (與之前相同，但針對 OCR 文字做了些微調)
+    # OCR 有時會把 "1." 辨識成 "l." 或 "I."，這裡我們還是先守住數字
+    # OCR 常常會有空格問題，例如 "1 ."
     
-    # Regex: 寬鬆匹配行首數字
-    # 支援: "1.", "1 ", "(1)", "1．", "1、"
-    anchor_pattern = re.compile(r'^\s*[\(（]?(\d+)[\)）]?[\.\、\．\s]')
+    possible_anchors = []
+    # 允許數字間有空格 (針對 OCR): 1 0 . -> 10.
+    anchor_pattern = re.compile(r'^\s*[\(（]?(\d+)\s*[\)）]?\s*[\.\、\．]')
     
     for idx, line in enumerate(lines):
         line = line.strip()
@@ -138,7 +172,6 @@ def parse_raw_file(file_obj, file_type):
         if match:
             try:
                 num = int(match.group(1))
-                # 排除顯然不合理的數字 (例如年份 107, 2023 或過大的數字)
                 if 0 < num < 200: 
                     possible_anchors.append({'idx': idx, 'num': num, 'line': line})
             except: pass
@@ -146,12 +179,7 @@ def parse_raw_file(file_obj, file_type):
     if not possible_anchors:
         return []
 
-    # === 第二階段：使用 LIS (最長遞增子序列) 演算法找出真正的題號序列 ===
-    # 目標：在雜亂的 possible_anchors 中，找出一條路徑，
-    # 使得 num[i+1] == num[i] + 1 (完美連續) 或 num[i] < num[i+1] <= num[i] + 5 (允許少量跳題/漏抓)
-    
-    # dp[i] 儲存以第 i 個 anchor 結尾的最長鏈長度
-    # prev[i] 儲存路徑的前一個節點 index
+    # 3. LIS 演算法 (最長遞增子序列)
     n = len(possible_anchors)
     dp = [1] * n
     prev = [-1] * n
@@ -159,16 +187,11 @@ def parse_raw_file(file_obj, file_type):
     for i in range(n):
         for j in range(i):
             diff = possible_anchors[i]['num'] - possible_anchors[j]['num']
-            # 條件：
-            # 1. 數字遞增
-            # 2. 差值在 1~5 之間 (允許題目中間夾雜小標題導致漏抓，但不允許跳太大)
-            # 3. 行號必須在後面 (這在 loop 順序已保證)
-            if 1 <= diff <= 5:
+            if 1 <= diff <= 5: # 允許跳題範圍
                 if dp[j] + 1 > dp[i]:
                     dp[i] = dp[j] + 1
                     prev[i] = j
     
-    # 找出最長鏈的結尾
     max_len = 0
     end_idx = -1
     for i in range(n):
@@ -176,45 +199,35 @@ def parse_raw_file(file_obj, file_type):
             max_len = dp[i]
             end_idx = i
             
-    # 如果找不到長度 > 2 的序列，可能是單題匯入或辨識失敗
     if max_len < 2 and n > 5:
-        # 如果真的很少，放寬標準，只要是 1 開頭就試試看
+        # 找不到序列
         pass 
         
-    # 重建路徑 (倒推回來)
     valid_anchors = []
     curr = end_idx
     while curr != -1:
         valid_anchors.append(possible_anchors[curr])
         curr = prev[curr]
-    valid_anchors.reverse() # 轉回正序
+    valid_anchors.reverse()
     
-    # === 第三階段：根據篩選出的 Anchor 切割文本 ===
     candidates = []
-    
     for i in range(len(valid_anchors)):
         current_anchor = valid_anchors[i]
         start_line_idx = current_anchor['idx']
         q_num = current_anchor['num']
         
-        # 決定結束行：下一個 anchor 的開始行，或是文件結尾
         if i < len(valid_anchors) - 1:
             end_line_idx = valid_anchors[i+1]['idx']
         else:
             end_line_idx = len(lines)
             
-        # 組合題目內容
-        # 第一行通常包含題號，我們把題號去除，只留內容
         first_line = lines[start_line_idx]
-        # 去除開頭的 "1." 或 "1 "
-        content_start_match = anchor_pattern.match(first_line)
-        if content_start_match:
-            lines[start_line_idx] = first_line[content_start_match.end():].strip()
+        match = anchor_pattern.match(first_line)
+        if match:
+            lines[start_line_idx] = first_line[match.end():].strip()
             
-        # 收集範圍內的所有行
         raw_text_chunk = "\n".join(lines[start_line_idx:end_line_idx])
         
-        # 只有當內容長度足夠時才加入 (避免只抓到一個題號)
         if len(raw_text_chunk) > 2:
             candidates.append(SmartQuestionCandidate(raw_text_chunk, q_num))
             
