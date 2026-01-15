@@ -4,7 +4,7 @@ import docx
 import io
 
 # ==========================================
-# 關鍵字字典：用於判斷科目與章節
+# 關鍵字字典
 # ==========================================
 
 EXCLUDE_KEYWORDS = [
@@ -100,105 +100,122 @@ def parse_raw_file(file_obj, file_type):
     if file_type == 'pdf':
         try:
             with pdfplumber.open(file_obj) as pdf:
+                # 檢查是否為空文件或純圖片
+                first_page_text = pdf.pages[0].extract_text()
+                if not first_page_text:
+                    # 嘗試如果不加 layout 參數是否能讀到
+                    pass 
+                
                 for page in pdf.pages:
-                    # 使用 layout=True 保持位置，避免雙欄混亂
-                    text = page.extract_text(x_tolerance=3, y_tolerance=3, layout=True)
+                    # 關鍵修改：不使用 layout=True，避免雙欄排版文字碎裂
+                    # 大多數雙欄 PDF 的文字流順序是：左欄全部 -> 右欄全部
+                    text = page.extract_text() 
                     if text: full_text += text + "\n"
-        except: return []
+        except Exception as e:
+            return []
     elif file_type == 'docx':
         doc = docx.Document(file_obj)
         full_text = "\n".join([p.text for p in doc.paragraphs])
     
+    if not full_text.strip():
+        return []
+
     lines = full_text.split('\n')
-    candidates = []
     
-    # === 寬鬆的題號掃描 ===
-    # 策略：先抓出所有「疑似題號」的行，再決定哪些是真的
-    # 允許：1. (1) 1 (帶有空格或點)
-    q_start_pattern = re.compile(r'(?:^|\s)[\(（]?(\d+)[\)）]?[\.\、\．\s]')
+    # === 第一階段：收集所有疑似題號的候選者 ===
+    # 格式：(行號 index, 題號數字 number, 原始行文字 line_content)
+    possible_anchors = []
     
-    current_q_num = 0
-    current_text = []
+    # Regex: 寬鬆匹配行首數字
+    # 支援: "1.", "1 ", "(1)", "1．", "1、"
+    anchor_pattern = re.compile(r'^\s*[\(（]?(\d+)[\)）]?[\.\、\．\s]')
     
-    for line in lines:
+    for idx, line in enumerate(lines):
         line = line.strip()
         if not line: continue
         
-        matches = list(q_start_pattern.finditer(line))
-        found_match = None
-        
-        # 尋找這行中最合理的題號
-        for match in matches:
+        match = anchor_pattern.match(line)
+        if match:
             try:
                 num = int(match.group(1))
-            except: continue
-            
-            # 判斷是否接受這個數字為新題號
-            is_valid = False
-            
-            # 條件A: 重設 (遇到 1) - 永遠接受，即便目前已經到第 10 題 (可能是誤判或新部分)
-            if num == 1:
-                is_valid = True
-            
-            # 條件B: 循序漸進 (接續上一題，允許跳號 1-5 題)
-            elif current_q_num > 0 and 0 < (num - current_q_num) <= 5:
-                is_valid = True
-                
-            # 條件C: 任意起點 (如果目前是 0，且數字 < 100，假設是試卷中段開始)
-            elif current_q_num == 0 and 1 < num < 100:
-                is_valid = True
-                
-            # 條件D: 修正 (如果當前題號 == 1 但內容很少，可能是抓到頁碼，允許被新的 1 取代)
-            elif current_q_num == 1 and num == 1:
-                is_valid = True
+                # 排除顯然不合理的數字 (例如年份 107, 2023 或過大的數字)
+                if 0 < num < 200: 
+                    possible_anchors.append({'idx': idx, 'num': num, 'line': line})
+            except: pass
 
-            if is_valid:
-                # 為了避免行內數字誤判 (如 "長度 20 公尺")
-                # 簡單檢查：數字後面的文字長度
-                # 如果是題號，通常後面會有文字，或者這行就是題號
-                found_match = (num, match)
-                break # 這一行找到一個合理的就先當作題目開始 (簡化雙欄處理)
+    if not possible_anchors:
+        return []
+
+    # === 第二階段：使用 LIS (最長遞增子序列) 演算法找出真正的題號序列 ===
+    # 目標：在雜亂的 possible_anchors 中，找出一條路徑，
+    # 使得 num[i+1] == num[i] + 1 (完美連續) 或 num[i] < num[i+1] <= num[i] + 5 (允許少量跳題/漏抓)
+    
+    # dp[i] 儲存以第 i 個 anchor 結尾的最長鏈長度
+    # prev[i] 儲存路徑的前一個節點 index
+    n = len(possible_anchors)
+    dp = [1] * n
+    prev = [-1] * n
+    
+    for i in range(n):
+        for j in range(i):
+            diff = possible_anchors[i]['num'] - possible_anchors[j]['num']
+            # 條件：
+            # 1. 數字遞增
+            # 2. 差值在 1~5 之間 (允許題目中間夾雜小標題導致漏抓，但不允許跳太大)
+            # 3. 行號必須在後面 (這在 loop 順序已保證)
+            if 1 <= diff <= 5:
+                if dp[j] + 1 > dp[i]:
+                    dp[i] = dp[j] + 1
+                    prev[i] = j
+    
+    # 找出最長鏈的結尾
+    max_len = 0
+    end_idx = -1
+    for i in range(n):
+        if dp[i] > max_len:
+            max_len = dp[i]
+            end_idx = i
+            
+    # 如果找不到長度 > 2 的序列，可能是單題匯入或辨識失敗
+    if max_len < 2 and n > 5:
+        # 如果真的很少，放寬標準，只要是 1 開頭就試試看
+        pass 
         
-        if found_match:
-            num, match = found_match
-            
-            # 存檔上一題
-            if current_text:
-                # 過濾過短的誤判 (例如只有題號沒有內容)
-                if len("".join(current_text)) > 2: 
-                    candidates.append(SmartQuestionCandidate("\n".join(current_text), current_q_num))
-            
-            current_q_num = num
-            current_text = []
-            
-            # 擷取題號後的內容
-            content_start = match.end()
-            remain_text = line[content_start:].strip()
-            if remain_text:
-                current_text.append(remain_text)
+    # 重建路徑 (倒推回來)
+    valid_anchors = []
+    curr = end_idx
+    while curr != -1:
+        valid_anchors.append(possible_anchors[curr])
+        curr = prev[curr]
+    valid_anchors.reverse() # 轉回正序
+    
+    # === 第三階段：根據篩選出的 Anchor 切割文本 ===
+    candidates = []
+    
+    for i in range(len(valid_anchors)):
+        current_anchor = valid_anchors[i]
+        start_line_idx = current_anchor['idx']
+        q_num = current_anchor['num']
+        
+        # 決定結束行：下一個 anchor 的開始行，或是文件結尾
+        if i < len(valid_anchors) - 1:
+            end_line_idx = valid_anchors[i+1]['idx']
         else:
-            # 不是新題目，歸入當前題目
-            if current_q_num > 0:
-                current_text.append(line)
-    
-    # 存最後一題
-    if current_text and current_q_num > 0:
-        candidates.append(SmartQuestionCandidate("\n".join(current_text), current_q_num))
-    
-    # 排序修正 (解決雙欄導致的跳號)
-    candidates.sort(key=lambda x: x.number)
-    
-    # 移除重複題號 (保留內容較長的那個)
-    unique_candidates = []
-    seen_nums = {}
-    for c in candidates:
-        if c.number in seen_nums:
-            existing_idx = seen_nums[c.number]
-            # 如果現在這個內容比之前那個長，就替換
-            if len(c.content) > len(unique_candidates[existing_idx].content):
-                unique_candidates[existing_idx] = c
-        else:
-            seen_nums[c.number] = len(unique_candidates)
-            unique_candidates.append(c)
+            end_line_idx = len(lines)
             
-    return unique_candidates
+        # 組合題目內容
+        # 第一行通常包含題號，我們把題號去除，只留內容
+        first_line = lines[start_line_idx]
+        # 去除開頭的 "1." 或 "1 "
+        content_start_match = anchor_pattern.match(first_line)
+        if content_start_match:
+            lines[start_line_idx] = first_line[content_start_match.end():].strip()
+            
+        # 收集範圍內的所有行
+        raw_text_chunk = "\n".join(lines[start_line_idx:end_line_idx])
+        
+        # 只有當內容長度足夠時才加入 (避免只抓到一個題號)
+        if len(raw_text_chunk) > 2:
+            candidates.append(SmartQuestionCandidate(raw_text_chunk, q_num))
+            
+    return candidates
