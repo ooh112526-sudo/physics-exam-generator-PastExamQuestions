@@ -7,3 +7,4 @@ pytesseract
 pdf2image
 pillow
 google-cloud-firestore
+streamlit-cropper
