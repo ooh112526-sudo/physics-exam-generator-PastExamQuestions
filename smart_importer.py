@@ -82,25 +82,18 @@ def clean_json_string(json_str):
     return json_str.strip()
 
 def crop_image(original_img, box_2d, force_full_width=False, padding_y=10):
-    """
-    裁切圖片
-    force_full_width: 是否強制寬度為整張圖片 (解決右側被切掉的問題)
-    """
     if not box_2d or len(box_2d) != 4: return None
     
     width, height = original_img.size
     ymin, xmin, ymax, xmax = box_2d
     
-    # 應用 padding (上下擴展)
     ymin = max(0, ymin - padding_y)
     ymax = min(1000, ymax + padding_y)
     
-    # 決定左右範圍
     if force_full_width:
         left = 0
         right = width
     else:
-        # 一般附圖裁切，稍微加點 padding
         xmin = max(0, xmin - 10)
         xmax = min(1000, xmax + 10)
         left = (xmin / 1000) * width
@@ -179,26 +172,29 @@ def parse_with_gemini(file_bytes, file_type, api_key):
         if file_type == 'pdf':
             extra_instruction = """
             對於每一題，請回傳兩個座標範圍：
-            1. 'full_question_box_2d': 包含題號、題目文字、選項與圖片的完整區域。請盡量寬鬆，包含到上一題結束與下一題開始的空白處。
+            1. 'full_question_box_2d': 包含題號、題目文字、選項與圖片的完整區域。
             2. 'box_2d': 如果該題有附圖(diagram)，請標示圖片的範圍；若無則省略。
             座標格式皆為 [ymin, xmin, ymax, xmax] (範圍 0-1000)。
             """
         
+        # 關鍵 Prompt 修改：嚴格過濾非物理題
         prompt = f"""
-        你是一個高中自然科老師助理。這份試卷包含物理、化學、生物、地科。
+        你是一個高中物理老師助理。這份試卷包含物理、化學、生物、地科試題。
         請詳細分析這 {len(batch_imgs)} 頁考卷圖片。
         
-        目標：
-        1. 辨識所有試題，並判斷科目 (Physics, Chemistry, Biology, EarthScience)。
-        2. 判斷題型：Single (單選), Multi (多選), Fill (填充)。
-        3. {extra_instruction}
+        【重要任務】：
+        1. **僅擷取物理科試題** (Physics)。
+        2. **嚴格過濾**：若題目屬於純化學 (Chemistry)、純生物 (Biology) 或純地球科學 (Earth Science)，請**不要**列入回傳清單，直接忽略。
+        3. 若為「跨科題」且包含物理概念，則可以保留。
+        
+        輸出格式：JSON List
+        {extra_instruction}
         
         JSON 格式範例：
         [
             {{
                 "number": 1,
-                "subject": "Physics", 
-                "type": "Single",
+                "type": "Single", // 或 Multi, Fill
                 "content": "題目敘述...",
                 "options": ["(A)...", "(B)..."],
                 "answer": "A",
@@ -210,7 +206,7 @@ def parse_with_gemini(file_bytes, file_type, api_key):
         ]
         注意：
         - page_index 代表該題目在「這批圖片」中的索引(從 0 開始)。
-        - 即使是非物理題也要列出，但標記正確科目，方便後端過濾。
+        - 再次強調：不要輸出生物、地科、化學題目。
         """
 
         input_parts = [prompt]
@@ -258,6 +254,11 @@ def parse_with_gemini(file_bytes, file_type, api_key):
             if isinstance(data, dict): data = [data]
             
             for item in data:
+                # 再次過濾：雖然 Prompt 已要求，但程式端再檢查一次 Subject (如果 AI 還是傳了)
+                # 這裡假設 AI 如果回傳了，就是它認為是物理題，除非它明確標示了 subject 欄位且非 Physics
+                if 'subject' in item and item['subject'].lower() not in ['physics', '物理']:
+                    continue
+
                 diagram_bytes = None
                 ref_bytes = None
                 
@@ -269,13 +270,10 @@ def parse_with_gemini(file_bytes, file_type, api_key):
                         if 0 <= absolute_idx < len(source_images):
                             src_img = source_images[absolute_idx]
                             
-                            # 1. 附圖 (Diagram) - 保持精準，不強制全寬
                             if 'box_2d' in item:
                                 diagram_bytes = crop_image(src_img, item['box_2d'], force_full_width=False, padding_y=5)
                                 
-                            # 2. 題目完整截圖 (Reference) - 強制全寬 (0~1000)
                             if 'full_question_box_2d' in item:
-                                # padding_y=50 (擴大上下範圍)
                                 ref_bytes = crop_image(src_img, item['full_question_box_2d'], force_full_width=True, padding_y=50)
                                 
                     except Exception as e:
@@ -291,7 +289,7 @@ def parse_with_gemini(file_bytes, file_type, api_key):
                     image_bytes=diagram_bytes,      
                     ref_image_bytes=ref_bytes,     
                     q_type=item.get('type', 'Single'),
-                    subject=item.get('subject', 'Physics') 
+                    subject='Physics' # 強制標記為 Physics，因為已經過濾過了
                 )
                 cand.content = item.get('content', '')
                 all_candidates.append(cand)
