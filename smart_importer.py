@@ -10,18 +10,21 @@ HAS_GENAI = False
 HAS_PDF2IMAGE = False
 HAS_OCR = False
 
+# 1. 檢查 Google AI SDK
 try:
     import google.generativeai as genai
     HAS_GENAI = True
 except ImportError:
     pass
 
+# 2. 檢查 PDF 轉圖片工具 (Poppler)
 try:
     from pdf2image import convert_from_bytes
     HAS_PDF2IMAGE = True
 except ImportError:
     pass
 
+# 3. 檢查 Tesseract OCR
 try:
     import pytesseract
     HAS_OCR = True
@@ -32,6 +35,7 @@ except ImportError:
 # 供 app.py 呼叫的狀態檢查函式
 # ==========================================
 def is_ocr_available():
+    """回傳是否具備本機 OCR 能力 (需同時有 PDF 工具與 Tesseract)"""
     return HAS_PDF2IMAGE and HAS_OCR
 
 # ==========================================
@@ -66,6 +70,7 @@ class SmartQuestionCandidate:
         self.is_physics_likely = is_likely
         self.status_reason = status_reason
 
+        # 若非 AI 辨識，嘗試手動解析
         if not options and status_reason != "Gemini AI 辨識":
             self._parse_structure()
             if chapter == "未分類":
@@ -92,6 +97,7 @@ class SmartQuestionCandidate:
             self.content = self.raw_text.strip()
 
     def _predict_classification(self):
+        # 簡易關鍵字分類
         text_for_search = self.content + " " + " ".join(self.options)
         for chap, kws in CHAPTER_KEYWORDS.items():
             if any(k in text_for_search for k in kws):
@@ -110,27 +116,31 @@ def clean_json_string(json_str):
     return json_str.strip()
 
 def parse_with_gemini(file_bytes, file_type, api_key):
+    # 1. 檢查套件
     if not HAS_GENAI: return {"error": "缺少 google-generativeai 套件"}
     if not HAS_PDF2IMAGE: return {"error": "缺少 pdf2image 套件 (Poppler 未安裝)"}
     if not api_key: return {"error": "請輸入 API Key"}
 
+    # 2. 設定 API
     try:
         genai.configure(api_key=api_key)
     except Exception as e:
         return {"error": f"API Key 設定失敗: {str(e)}"}
 
+    # 3. 轉圖片
     images = []
     try:
         if file_type == 'pdf':
+            # 只取前 10 頁
             images = convert_from_bytes(file_bytes, dpi=200, fmt='jpeg')[:10]
         else:
             return {"error": "目前僅支援 PDF"}
     except Exception as e:
-        return {"error": f"PDF 轉圖片失敗 (Poppler問題?): {str(e)}"}
+        return {"error": f"PDF 轉圖片失敗。若在雲端請確認 packages.txt 已建立並重啟 App。詳細: {str(e)}"}
 
     if not images: return {"error": "PDF 頁面為空"}
 
-    # Prompt
+    # 4. 呼叫 Gemini (使用您帳號實際可用的模型)
     chapters_str = "\n".join(PHYSICS_CHAPTERS_LIST)
     prompt = f"""
     你是一個高中物理老師助理。請分析試卷圖片。
@@ -153,46 +163,40 @@ def parse_with_gemini(file_bytes, file_type, api_key):
     input_parts = [prompt]
     input_parts.extend(images)
 
-    # === 真實世界可用的模型清單 ===
-    # 注意：Gemini 3.0/2.0 在真實伺服器尚未發布，必須使用 1.5 系列
+    # === 根據您的錯誤訊息調整後的模型清單 ===
     candidate_models = [
-        "gemini-1.5-flash",       # 目前最穩定且快速
-        "gemini-1.5-pro",         # 效能較強
-        "gemini-1.5-flash-latest",
-        "gemini-1.5-pro-latest"
+        "gemini-2.5-flash",       # 首選：最新且快速 (明確在您的清單中)
+        "gemini-2.5-pro",         # 次選：最新旗艦 (明確在您的清單中)
+        "gemini-2.0-flash",       # 備用：上一代穩定版
+        "gemini-2.0-flash-exp",   # 備用：實驗版
+        "gemini-flash-latest",    # 通用別名
+        "gemini-pro-latest"       # 通用別名
     ]
 
     response = None
     last_error = None
     used_model = "Unknown"
 
+    # 嘗試所有模型直到成功
     for model_name in candidate_models:
         try:
             model = genai.GenerativeModel(model_name)
             response = model.generate_content(input_parts)
             used_model = model_name
-            break 
+            break # 成功則跳出
         except Exception as e:
             last_error = e
             continue
 
     if not response:
-        # 如果所有已知模型都失敗，嘗試列出該 Key 可用的模型名稱以供除錯
-        available_models = []
-        try:
-            for m in genai.list_models():
-                if 'generateContent' in m.supported_generation_methods:
-                    available_models.append(m.name)
-        except:
-            available_models = ["無法取得列表"]
-
-        return {"error": f"所有模型皆失敗。最後錯誤: {str(last_error)}。您的 Key 可用模型: {', '.join(available_models)}"}
+        # 再次失敗時顯示更多資訊
+        return {"error": f"所有模型嘗試皆失敗。請確認 API Key 權限。最後錯誤: {str(last_error)}"}
 
     try:
         try:
             text = response.text
         except ValueError:
-            return {"error": f"Gemini ({used_model}) 拒絕回應"}
+            return {"error": f"Gemini ({used_model}) 拒絕回應 (可能觸發安全機制)"}
 
         json_text = clean_json_string(text)
         data = json.loads(json_text)
@@ -205,7 +209,7 @@ def parse_with_gemini(file_bytes, file_type, api_key):
                 options=item.get('options', []),
                 chapter=item.get('chapter', '未分類'),
                 is_likely=True,
-                status_reason=f"Gemini AI ({used_model})"
+                status_reason=f"Gemini AI ({used_model})" # 標註使用的模型版本
             )
             cand.content = item.get('content', '')
             candidates.append(cand)
@@ -235,6 +239,7 @@ def parse_raw_file(file_obj, file_type, use_ocr=False):
                     full_text += (p.extract_text() or "") + "\n"
         except: pass
         
+    # 簡易 Regex 抓題號 (fallback)
     candidates = []
     lines = full_text.split('\n')
     pattern = re.compile(r'^\s*[\(（]?(\d+)[\)）]?[\.\、]')
