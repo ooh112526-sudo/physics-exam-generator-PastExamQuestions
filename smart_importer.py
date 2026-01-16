@@ -14,7 +14,6 @@ HAS_DOCX = False
 
 try:
     import google.generativeai as genai
-    from google.ai.generativelanguage_v1beta.types import content
     HAS_GENAI = True
 except ImportError: pass
 
@@ -65,7 +64,7 @@ class SmartQuestionCandidate:
         self.image_bytes = image_bytes
         self.ref_image_bytes = ref_image_bytes
         self.q_type = q_type
-        self.subject = subject # 新增科目欄位
+        self.subject = subject
 
 # ==========================================
 # 工具函式
@@ -82,26 +81,32 @@ def clean_json_string(json_str):
         json_str = json_str[start:end+1]
     return json_str.strip()
 
-def crop_image(original_img, box_2d, padding_x=10, padding_y=10):
+def crop_image(original_img, box_2d, force_full_width=False, padding_y=10):
     """
-    裁切圖片，支援自訂 padding
-    box_2d: [ymin, xmin, ymax, xmax] (0-1000)
+    裁切圖片
+    force_full_width: 是否強制寬度為整張圖片 (解決右側被切掉的問題)
     """
     if not box_2d or len(box_2d) != 4: return None
     
     width, height = original_img.size
     ymin, xmin, ymax, xmax = box_2d
     
-    # 應用 padding (上下左右擴展)
-    # y 軸多擴展一些以涵蓋上下題
+    # 應用 padding (上下擴展)
     ymin = max(0, ymin - padding_y)
     ymax = min(1000, ymax + padding_y)
-    xmin = max(0, xmin - padding_x)
-    xmax = min(1000, xmax + padding_x)
     
-    left = (xmin / 1000) * width
+    # 決定左右範圍
+    if force_full_width:
+        left = 0
+        right = width
+    else:
+        # 一般附圖裁切，稍微加點 padding
+        xmin = max(0, xmin - 10)
+        xmax = min(1000, xmax + 10)
+        left = (xmin / 1000) * width
+        right = (xmax / 1000) * width
+    
     top = (ymin / 1000) * height
-    right = (xmax / 1000) * width
     bottom = (ymax / 1000) * height
     
     if right <= left or bottom <= top: return None
@@ -192,13 +197,13 @@ def parse_with_gemini(file_bytes, file_type, api_key):
         [
             {{
                 "number": 1,
-                "subject": "Physics", // 務必準確分類
+                "subject": "Physics", 
                 "type": "Single",
                 "content": "題目敘述...",
                 "options": ["(A)...", "(B)..."],
                 "answer": "A",
                 "chapter": "從此清單選擇: {chapters_str}",
-                "full_question_box_2d": [100, 0, 300, 1000], // 寬度盡量滿版
+                "full_question_box_2d": [100, 0, 300, 1000],
                 "box_2d": [200, 500, 300, 700],
                 "page_index": 0 
             }}
@@ -231,7 +236,6 @@ def parse_with_gemini(file_bytes, file_type, api_key):
                 break
             except Exception as e:
                 last_error = e
-                # 嘗試非 JSON 模式
                 if "mode" in str(e).lower() or "support" in str(e).lower():
                     try:
                         response = model.generate_content(input_parts)
@@ -265,19 +269,14 @@ def parse_with_gemini(file_bytes, file_type, api_key):
                         if 0 <= absolute_idx < len(source_images):
                             src_img = source_images[absolute_idx]
                             
-                            # 1. 附圖 (Diagram) - 保持精準
+                            # 1. 附圖 (Diagram) - 保持精準，不強制全寬
                             if 'box_2d' in item:
-                                diagram_bytes = crop_image(src_img, item['box_2d'], padding_x=5, padding_y=5)
+                                diagram_bytes = crop_image(src_img, item['box_2d'], force_full_width=False, padding_y=5)
                                 
-                            # 2. 題目完整截圖 (Reference) - 大幅擴張
-                            # 如果 AI 給的 x 範圍太窄，我們強制設為全寬 (0-1000)
+                            # 2. 題目完整截圖 (Reference) - 強制全寬 (0~1000)
                             if 'full_question_box_2d' in item:
-                                box = item['full_question_box_2d']
-                                # 強制全寬度 (0, 1000) 以方便閱讀
-                                box[1] = 0    # xmin
-                                box[3] = 1000 # xmax
-                                # 上下大幅擴張 padding_y=50 (約 5% 頁面高度)
-                                ref_bytes = crop_image(src_img, box, padding_x=0, padding_y=50)
+                                # padding_y=50 (擴大上下範圍)
+                                ref_bytes = crop_image(src_img, item['full_question_box_2d'], force_full_width=True, padding_y=50)
                                 
                     except Exception as e:
                         print(f"Image crop error: {e}")
@@ -292,7 +291,7 @@ def parse_with_gemini(file_bytes, file_type, api_key):
                     image_bytes=diagram_bytes,      
                     ref_image_bytes=ref_bytes,     
                     q_type=item.get('type', 'Single'),
-                    subject=item.get('subject', 'Physics') # 抓取科目
+                    subject=item.get('subject', 'Physics') 
                 )
                 cand.content = item.get('content', '')
                 all_candidates.append(cand)
