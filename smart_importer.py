@@ -89,18 +89,25 @@ def clean_json_string(json_str):
     return json_str.strip()
 
 def crop_image(original_img, box_2d, force_full_width=False, padding_y=10):
+    """
+    裁切圖片
+    force_full_width: 是否強制寬度為整張圖片 (解決右側被切掉的問題)
+    """
     if not box_2d or len(box_2d) != 4: return None
     
     width, height = original_img.size
     ymin, xmin, ymax, xmax = box_2d
     
+    # 應用 padding (上下擴展)
     ymin = max(0, ymin - padding_y)
     ymax = min(1000, ymax + padding_y)
     
+    # 決定左右範圍
     if force_full_width:
         left = 0
         right = width
     else:
+        # 一般附圖裁切，稍微加點 padding
         xmin = max(0, xmin - 10)
         xmax = min(1000, xmax + 10)
         left = (xmin / 1000) * width
@@ -122,7 +129,7 @@ def crop_image(original_img, box_2d, force_full_width=False, padding_y=10):
         return None
 
 # ==========================================
-# Gemini AI 解析邏輯 (含重試機制)
+# Gemini AI 解析邏輯
 # ==========================================
 def parse_with_gemini(file_bytes, file_type, api_key):
     if not HAS_GENAI: return {"error": "缺少 google-generativeai 套件"}
@@ -159,7 +166,6 @@ def parse_with_gemini(file_bytes, file_type, api_key):
     if not source_images and file_type == 'pdf': return {"error": "PDF 頁面為空"}
 
     # 分批處理
-    # 策略調整：BATCH_SIZE 稍微加大，減少請求次數，但可能增加單次 Token
     BATCH_SIZE = 5 
     total_pages = len(source_images)
     all_candidates = []
@@ -173,7 +179,6 @@ def parse_with_gemini(file_bytes, file_type, api_key):
     prompt_chapters = [c for c in PHYSICS_CHAPTERS_LIST if c != "未分類"]
     chapters_str = "\n".join(prompt_chapters)
     
-    # === 批次迴圈 ===
     for batch_idx, batch_imgs in enumerate(batches):
         start_page_idx = batch_idx * BATCH_SIZE
         
@@ -181,7 +186,7 @@ def parse_with_gemini(file_bytes, file_type, api_key):
         if file_type == 'pdf':
             extra_instruction = """
             對於每一題，請回傳兩個座標範圍：
-            1. 'full_question_box_2d': 包含題號、題目文字、選項與圖片的完整區域。請盡量寬鬆。
+            1. 'full_question_box_2d': 包含題號、題目文字、選項與圖片的完整區域。請盡量寬鬆，包含到上一題結束與下一題開始的空白處。
             2. 'box_2d': 如果該題有附圖(diagram)，請標示圖片的範圍；若無則省略。
             座標格式皆為 [ymin, xmin, ymax, xmax] (範圍 0-1000)。
             """
@@ -213,7 +218,9 @@ def parse_with_gemini(file_bytes, file_type, api_key):
                 "page_index": 0 
             }}
         ]
-        注意：page_index 代表該題目在「這批圖片」中的索引(從 0 開始)。
+        注意：
+        - page_index 代表該題目在「這批圖片」中的索引(從 0 開始)。
+        - 即使是非物理題也要列出，但標記正確科目，方便後端過濾。
         """
 
         input_parts = [prompt]
@@ -223,45 +230,28 @@ def parse_with_gemini(file_bytes, file_type, api_key):
         input_parts.extend(batch_imgs)
 
         candidate_models = [
-            "gemini-2.5-flash",       # 首選
-            "gemini-2.0-flash",       # 備用
-            "gemini-2.0-flash-exp",   # 備用
-            "gemini-1.5-flash"        # 最後備用
+            "gemini-2.5-flash", "gemini-2.5-pro", 
+            "gemini-2.0-flash", "gemini-2.0-flash-exp", 
+            "gemini-flash-latest"
         ]
         
         generation_config = {"response_mime_type": "application/json"}
         response = None
         last_error = None
         
-        # 重試機制 (Retry Loop)
-        MAX_RETRIES = 3
-        for attempt in range(MAX_RETRIES + 1):
-            
-            # 內層迴圈：嘗試不同模型
-            for model_name in candidate_models:
-                try:
-                    model = genai.GenerativeModel(model_name)
-                    response = model.generate_content(input_parts, generation_config=generation_config)
-                    break # 成功則跳出模型迴圈
-                except Exception as e:
-                    last_error = e
-                    # 如果是 429 錯誤，不要換模型，而是等待重試
-                    if "429" in str(e):
-                        break 
-                    # 如果是其他錯誤(如不支援JSON)，換模型試試
-                    continue
-            
-            if response:
-                break # 成功取得回應，跳出重試迴圈
-
-            # 如果失敗原因是 429 (Quota exceeded)，則等待
-            if last_error and "429" in str(last_error):
-                wait_time = 20 * (attempt + 1) # 指數退避: 20s, 40s, 60s
-                print(f"Rate limited (429). Waiting {wait_time}s before retry {attempt+1}/{MAX_RETRIES}...")
-                time.sleep(wait_time)
-            else:
-                # 其他錯誤 (如內容被擋)，可能重試也沒用，跳出
+        for model_name in candidate_models:
+            try:
+                model = genai.GenerativeModel(model_name)
+                response = model.generate_content(input_parts, generation_config=generation_config)
                 break
+            except Exception as e:
+                last_error = e
+                if "mode" in str(e).lower() or "support" in str(e).lower():
+                    try:
+                        response = model.generate_content(input_parts)
+                        if response: break
+                    except: pass
+                continue
 
         if not response:
             error_msg = str(last_error) if last_error else "Unknown error"
@@ -278,9 +268,11 @@ def parse_with_gemini(file_bytes, file_type, api_key):
             if isinstance(data, dict): data = [data]
             
             for item in data:
+                # 過濾非物理題
                 if 'subject' in item and item['subject'].lower() not in ['physics', '物理']:
                     continue
                 
+                # 排除關鍵字 (雙重保險)
                 content_text = (item.get('content', '') + " " + " ".join(item.get('options', []))).lower()
                 physics_keywords = ["牛頓", "速度", "加速度", "電路", "磁場", "光學", "焦耳"]
                 is_cross_subject = any(pk in content_text for pk in physics_keywords)
@@ -299,10 +291,13 @@ def parse_with_gemini(file_bytes, file_type, api_key):
                         if 0 <= absolute_idx < len(source_images):
                             src_img = source_images[absolute_idx]
                             
+                            # 1. 附圖 (Diagram) - 保持精準，不強制全寬
                             if 'box_2d' in item:
                                 diagram_bytes = crop_image(src_img, item['box_2d'], force_full_width=False, padding_y=5)
                                 
+                            # 2. 題目完整截圖 (Reference) - 強制全寬 (0~1000)
                             if 'full_question_box_2d' in item:
+                                # padding_y=50 (擴大上下範圍)
                                 ref_bytes = crop_image(src_img, item['full_question_box_2d'], force_full_width=True, padding_y=50)
                                 
                     except Exception as e:
@@ -326,8 +321,7 @@ def parse_with_gemini(file_bytes, file_type, api_key):
         except Exception as e:
             errors.append(f"Batch {batch_idx+1} parsing error: {str(e)}")
             
-        # 成功後也要休息，避免下一批馬上撞牆
-        time.sleep(15) 
+        time.sleep(1)
 
     if not all_candidates and errors:
         return {"error": f"分析失敗詳情: {'; '.join(errors)}"}
