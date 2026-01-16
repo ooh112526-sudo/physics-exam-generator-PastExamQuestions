@@ -6,17 +6,36 @@ import json
 import time
 import sys
 
-# 嘗試匯入 OCR 與 Google AI 套件
-# 若環境未安裝，OCR_AVAILABLE 會變成 False，部分功能將停用
+# ==========================================
+# 依賴套件檢查 (拆分檢查以利除錯)
+# ==========================================
+HAS_GENAI = False
+HAS_PDF2IMAGE = False
+HAS_OCR = False
+
+# 1. 檢查 Google AI SDK
 try:
-    import pytesseract
-    from pdf2image import convert_from_bytes
-    from PIL import Image
     import google.generativeai as genai
     from google.api_core import retry
-    OCR_AVAILABLE = True
+    HAS_GENAI = True
 except ImportError:
-    OCR_AVAILABLE = False
+    print("Warning: google-generativeai 未安裝")
+
+# 2. 檢查 PDF 轉圖片工具 (Gemini 視覺辨識需要)
+try:
+    from pdf2image import convert_from_bytes
+    from PIL import Image
+    HAS_PDF2IMAGE = True
+except ImportError:
+    print("Warning: pdf2image 或 pillow 未安裝")
+
+# 3. 檢查 Tesseract OCR (本機備用模式需要)
+try:
+    import pytesseract
+    HAS_OCR = True
+except ImportError:
+    print("Warning: pytesseract 未安裝")
+
 
 # ==========================================
 # 常數定義
@@ -31,7 +50,6 @@ PHYSICS_CHAPTERS_LIST = [
     "第六章.量子現象"
 ]
 
-# (以下為舊版 Regex 邏輯需要的關鍵字，保留以供備用模式使用)
 EXCLUDE_KEYWORDS = [
     "化學", "反應式", "莫耳", "有機", "細胞", "遺傳", "DNA", "生態", "地質", "氣候", 
     "酸鹼", "沉澱", "氧化還原", "生物", "染色體", "演化", "板塊", "洋流", "試管",
@@ -59,20 +77,18 @@ class SmartQuestionCandidate:
     def __init__(self, raw_text, question_number, options=None, chapter="未分類", is_likely=True, status_reason=""):
         self.raw_text = raw_text
         self.number = question_number
-        self.content = raw_text # 預設內容
+        self.content = raw_text 
         self.options = options if options else []
         self.predicted_chapter = chapter
         self.is_physics_likely = is_likely
         self.status_reason = status_reason
 
-        # 如果是傳統 Regex 模式建立的，可能需要解析結構
         if not options and status_reason != "Gemini AI 辨識":
             self._parse_structure()
             if chapter == "未分類":
                 self._predict_classification()
 
     def _parse_structure(self):
-        """(Regex模式用) 解析題目結構：分離選項與題幹"""
         opt_pattern = re.compile(r'\s*[\(（]?[A-Ea-e][\)）][\.\、\．]?\s+')
         match = opt_pattern.search(self.raw_text)
         if match:
@@ -93,10 +109,7 @@ class SmartQuestionCandidate:
             self.content = self.raw_text.strip()
 
     def _predict_classification(self):
-        """(Regex模式用) 關鍵字預測分類"""
         text_for_search = self.content + " " + " ".join(self.options)
-        
-        # 1. 排除
         exclude_hits = [k for k in EXCLUDE_KEYWORDS if k in text_for_search]
         if len(exclude_hits) >= 1:
             physics_rescue = sum(1 for k in ["牛頓", "電路", "透鏡", "拋體", "波長"] if k in text_for_search)
@@ -104,8 +117,7 @@ class SmartQuestionCandidate:
                 self.is_physics_likely = False
                 self.status_reason = f"非物理關鍵字: {', '.join(exclude_hits[:2])}"
                 return
-
-        # 2. 章節
+        
         max_score = 0
         best_chap = "未分類"
         for chap, keywords in CHAPTER_KEYWORDS.items():
@@ -130,7 +142,6 @@ class SmartQuestionCandidate:
 # ==========================================
 
 def clean_json_string(json_str):
-    """清理 Gemini 回傳的 Markdown 格式，提取純 JSON"""
     if "```json" in json_str:
         json_str = json_str.split("```json")[1].split("```")[0]
     elif "```" in json_str:
@@ -138,79 +149,76 @@ def clean_json_string(json_str):
     return json_str.strip()
 
 def parse_with_gemini(file_bytes, file_type, api_key):
-    """
-    將檔案轉換為圖片，並呼叫 Gemini 1.5 Flash 進行多模態辨識
-    """
-    if not OCR_AVAILABLE:
-         return {"error": "伺服器未安裝必要套件 (google-generativeai 或 pdf2image)。請檢查 requirements.txt 與 packages.txt。"}
+    # 1. 檢查 Python 套件是否安裝
+    if not HAS_GENAI:
+        return {"error": "缺少 'google-generativeai' 套件。請檢查 requirements.txt。"}
+    if not HAS_PDF2IMAGE:
+        return {"error": "缺少 'pdf2image' 套件。請檢查 requirements.txt。"}
     
     if not api_key:
         return {"error": "請輸入 Google Gemini API Key"}
     
-    # 設定 API
+    # 2. 設定 API
     try:
         genai.configure(api_key=api_key)
         model = genai.GenerativeModel('gemini-1.5-flash')
     except Exception as e:
-        return {"error": f"Gemini API 設定失敗: {str(e)}"}
+        return {"error": f"Gemini API 設定失敗，Key 可能無效: {str(e)}"}
     
+    # 3. 嘗試轉換圖片 (這步最常失敗，因為需要 poppler)
     images = []
-    
     try:
         if file_type == 'pdf':
-            # 將 PDF 轉為圖片列表 (dpi=200 兼顧清晰度與傳輸速度)
-            # 限制處理前 15 頁以避免過大
-            images = convert_from_bytes(file_bytes, dpi=200, fmt='jpeg')[:15]
+            # 只取前 10 頁，減少傳輸量與錯誤機率
+            images = convert_from_bytes(file_bytes, dpi=200, fmt='jpeg')[:10]
         else:
-            return {"error": "目前 AI 辨識僅支援 PDF 檔案 (需轉為圖片處理)"}
+            return {"error": "目前 AI 辨識僅支援 PDF 檔案"}
     except Exception as e:
-        return {"error": f"PDF 轉圖片失敗: {str(e)}。請確認系統已安裝 poppler-utils。"}
+        return {"error": f"PDF 轉圖片失敗。請確認 packages.txt 包含 'poppler-utils' 且已重啟 App。詳細錯誤: {str(e)}"}
 
-    # 準備 Prompt
+    if not images:
+        return {"error": "PDF 轉換後沒有圖片，請確認檔案是否正常。"}
+
+    # Prompt
     chapters_str = "\n".join(PHYSICS_CHAPTERS_LIST)
-    
     prompt = f"""
-    你是一個專業的高中物理老師助理。請幫我分析這份自然科試卷的圖片。
+    你是一個高中物理老師助理。請分析試卷圖片。
+    目標：
+    1. 辨識所有「物理科」試題。
+    2. 回傳 JSON List。
     
-    任務目標：
-    1. 辨識出所有的「物理科」試題。請忽略單純的化學、生物、地科題目。
-    2. 如果是跨科題目且包含物理概念，請保留。
-    3. 將辨識出的題目整理成 JSON 格式。
-    
-    請依照以下 JSON 結構回傳一個 List，不要包含任何其他解釋文字：
+    格式範例：
     [
         {{
-            "number": 題號 (整數),
-            "content": "題目敘述 (不含選項，去除題號)",
-            "options": ["(A) 選項內容", "(B) 選項內容", ...],
-            "answer": "答案 (若試卷上有標示，否則留空)",
-            "chapter": "從下列清單中選擇最合適的章節: {chapters_str}"
+            "number": 1,
+            "content": "題目敘述...",
+            "options": ["(A)...", "(B)..."],
+            "answer": "A",
+            "chapter": "從此清單選擇: {chapters_str}"
         }}
     ]
-
-    注意：
-    - 題號請依序排列。
-    - 數學公式請使用 LaTeX 格式 (例如 $E=mc^2$)。
-    - 若無法判斷章節，請填「未分類」。
-    - 確保 JSON 格式合法。
     """
     
     input_parts = [prompt]
-    # 加入圖片物件
-    for img in images: 
-        input_parts.append(img)
-        
+    for img in images: input_parts.append(img)
+    
+    # 4. 呼叫 API (簡化安全設定，避免舊版相容性問題)
     try:
-        # 發送請求
+        # 嘗試不傳送 safety_settings，使用預設值，避免參數格式錯誤
+        # 若需要調整，請確保 google-generativeai 版本是最新的
         response = model.generate_content(input_parts)
         
-        # 解析回傳的文字
-        json_text = clean_json_string(response.text)
+        try:
+            text_response = response.text
+        except ValueError:
+            # 可能是被安全阻擋
+            return {"error": f"Gemini 拒絕回應。原因: {response.candidates[0].finish_reason if response.candidates else 'Unknown'}"}
+
+        json_text = clean_json_string(text_response)
         data = json.loads(json_text)
         
         candidates = []
         for item in data:
-            # 建立候選題物件
             cand = SmartQuestionCandidate(
                 raw_text=item.get('content', ''),
                 question_number=item.get('number', 0),
@@ -219,66 +227,59 @@ def parse_with_gemini(file_bytes, file_type, api_key):
                 is_likely=True,
                 status_reason="Gemini AI 辨識"
             )
-            # 確保內容正確賦值
             cand.content = item.get('content', '')
             candidates.append(cand)
-            
         return candidates
 
     except json.JSONDecodeError:
-        return {"error": "Gemini 回傳的資料無法解析為 JSON，請重試。"}
+        return {"error": "AI 回傳了非 JSON 格式的資料，請重試一次。"}
     except Exception as e:
-        return {"error": f"Gemini API 呼叫失敗: {str(e)}"}
+        return {"error": f"Gemini API 連線或回應錯誤: {str(e)}"}
 
 # ==========================================
-# 傳統 OCR 與 Regex 邏輯 (備用模式)
+# 傳統 OCR 邏輯 (備用)
 # ==========================================
-
-def perform_ocr(file_bytes):
-    """將 PDF 轉圖片並執行 OCR"""
-    if not OCR_AVAILABLE:
-        return "Error: 伺服器未安裝 OCR 模組 (tesseract/poppler)。"
-    
-    try:
-        images = convert_from_bytes(file_bytes, dpi=300)
-        full_text = ""
-        for img in images:
-            # 使用 Tesseract 辨識
-            text = pytesseract.image_to_string(img, lang='chi_tra+eng')
-            full_text += text + "\n"
-        return full_text
-    except Exception as e:
-        return f"OCR Error: {str(e)}"
+# 為了避免找不到 OCR_AVAILABLE 變數，這裡定義一個屬性供外部讀取
+def is_ocr_available():
+    return HAS_OCR and HAS_PDF2IMAGE
 
 def parse_raw_file(file_obj, file_type, use_ocr=False):
-    """
-    傳統 Regex/OCR 解析入口
-    """
     full_text = ""
     file_obj.seek(0)
     file_bytes = file_obj.read()
     
-    # 1. 取得文字
+    # 使用我們拆分後的檢查變數
     if use_ocr and file_type == 'pdf':
-        full_text = perform_ocr(file_bytes)
-        if full_text.startswith("Error"): return []
+        if not HAS_PDF2IMAGE:
+             print("Error: 缺少 pdf2image，無法執行 OCR")
+             return []
+        
+        try:
+            images = convert_from_bytes(file_bytes, dpi=300)
+            for img in images:
+                if HAS_OCR:
+                    full_text += pytesseract.image_to_string(img, lang='chi_tra+eng') + "\n"
+        except Exception as e:
+            print(f"OCR Error: {e}")
+            pass
+
     elif file_type == 'pdf':
         try:
             with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
                 for page in pdf.pages:
-                    text = page.extract_text()
-                    if text: full_text += text + "\n"
-        except: return []
+                    t = page.extract_text()
+                    if t: full_text += t + "\n"
+        except: pass
     elif file_type == 'docx':
-        doc = docx.Document(io.BytesIO(file_bytes))
-        full_text = "\n".join([p.text for p in doc.paragraphs])
+        try:
+            doc = docx.Document(io.BytesIO(file_bytes))
+            full_text = "\n".join([p.text for p in doc.paragraphs])
+        except: pass
 
     if not full_text.strip(): return []
-
+    
     lines = full_text.split('\n')
     possible_anchors = []
-    
-    # 允許數字間有空格 (針對 OCR): 1 0 . -> 10.
     anchor_pattern = re.compile(r'^\s*[\(（]?(\d+)\s*[\)）]?\s*[\.\、\．]')
     
     for idx, line in enumerate(lines):
@@ -294,11 +295,9 @@ def parse_raw_file(file_obj, file_type, use_ocr=False):
 
     if not possible_anchors: return []
 
-    # LIS 演算法 (最長遞增子序列)
     n = len(possible_anchors)
     dp = [1] * n
     prev = [-1] * n
-    
     for i in range(n):
         for j in range(i):
             diff = possible_anchors[i]['num'] - possible_anchors[j]['num']
@@ -326,19 +325,13 @@ def parse_raw_file(file_obj, file_type, use_ocr=False):
         current_anchor = valid_anchors[i]
         start_line_idx = current_anchor['idx']
         q_num = current_anchor['num']
+        end_line_idx = valid_anchors[i+1]['idx'] if i < len(valid_anchors)-1 else len(lines)
         
-        if i < len(valid_anchors) - 1:
-            end_line_idx = valid_anchors[i+1]['idx']
-        else:
-            end_line_idx = len(lines)
-            
         first_line = lines[start_line_idx]
         match = anchor_pattern.match(first_line)
-        if match:
-            lines[start_line_idx] = first_line[match.end():].strip()
+        if match: lines[start_line_idx] = first_line[match.end():].strip()
             
         raw_text_chunk = "\n".join(lines[start_line_idx:end_line_idx])
-        
         if len(raw_text_chunk) > 2:
             candidates.append(SmartQuestionCandidate(raw_text_chunk, q_num))
             
