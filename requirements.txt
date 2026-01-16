@@ -2,7 +2,7 @@ streamlit
 python-docx
 pdfplumber
 pandas
+google-generativeai
 pytesseract
 pdf2image
 pillow
-google-generativeai
