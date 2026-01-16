@@ -2,6 +2,7 @@ import streamlit as st
 import docx
 from docx.shared import Pt, Inches
 from docx.oxml.ns import qn
+from docx.enum.text import WD_ALIGN_PARAGRAPH
 import random
 import io
 import pandas as pd
@@ -78,11 +79,13 @@ if 'imported_candidates' not in st.session_state:
     st.session_state['imported_candidates'] = []
 
 # ==========================================
-# 工具函式
+# 工具函式 (Word 生成優化)
 # ==========================================
 def generate_word_files(selected_questions):
     exam_doc = docx.Document()
     ans_doc = docx.Document()
+    
+    # 設定基本字型
     style = exam_doc.styles['Normal']
     style.font.name = 'Times New Roman'
     style.font.size = Pt(12)
@@ -92,24 +95,50 @@ def generate_word_files(selected_questions):
     ans_doc.add_heading('物理科 答案卷', 0)
     
     for idx, q in enumerate(selected_questions, 1):
+        # 1. 題目區
         p = exam_doc.add_paragraph()
         type_label = {'Single': '【單選】', 'Multi': '【多選】', 'Fill': '【填充】'}.get(q.type, '')
         src_label = f"[{q.source}] " if q.source else ""
+        
         runner = p.add_run(f"{idx}. {src_label}{type_label} {q.content.strip()}")
         runner.bold = True
         
+        # 2. 圖片區
         if q.image_data:
             try:
-                exam_doc.add_picture(io.BytesIO(q.image_data), width=Inches(2.5))
+                # 圖片單獨一段，置中或靠左
+                img_p = exam_doc.add_paragraph()
+                run = img_p.add_run()
+                run.add_picture(io.BytesIO(q.image_data), width=Inches(2.5))
             except: pass
 
-        if q.type in ['Single', 'Multi']:
-            for i, opt in enumerate(q.options):
-                exam_doc.add_paragraph(f"{opt}")
+        # 3. 選項區 (智慧排版)
+        if q.type in ['Single', 'Multi'] and q.options:
+            opts = q.options
+            # 簡單判斷：如果所有選項都短，使用表格或並排
+            max_len = max([len(o) for o in opts]) if opts else 0
+            
+            # 如果選項很短 (< 15 字)，嘗試並排 (表格隱藏邊框)
+            if max_len < 15 and len(opts) > 0:
+                table = exam_doc.add_table(rows=1, cols=len(opts))
+                # 移除邊框需要較複雜的 xml 操作，這裡先簡單處理為文字段落
+                # 為了避免格式跑掉，最穩健的方法是「垂直排列」但間距縮小
+                # 或者使用 Tab 分隔
+                
+                # 方案：如果真的很短，用一行顯示
+                line_text = "    ".join(opts)
+                exam_doc.add_paragraph(line_text)
+            else:
+                # 選項較長，垂直排列
+                for opt in opts:
+                    exam_doc.add_paragraph(f"{opt}")
+                    
         elif q.type == 'Fill':
             exam_doc.add_paragraph("答：______________________")
-        exam_doc.add_paragraph("") 
+            
+        exam_doc.add_paragraph("") # 空行分隔
         
+        # 4. 答案卷
         ans_p = ans_doc.add_paragraph()
         ans_p.add_run(f"{idx}. {q.answer}")
         
@@ -179,13 +208,12 @@ with tab1:
     if st.session_state['imported_candidates']:
         st.divider()
         st.subheader("3. 匯入校對與截圖")
-        st.info("AI 已自動過濾非物理題，並擴大截圖範圍以便校對。")
+        st.info("AI 已自動過濾非物理題。右側截圖已設為全寬，方便對照。")
         
-        # 篩選器：是否只顯示物理題
+        # 篩選器
         show_all = st.checkbox("顯示所有科目 (包含化學/生物/地科)", value=False)
         
         for i, cand in enumerate(st.session_state['imported_candidates']):
-            # 過濾邏輯
             if not show_all and cand.subject != "Physics":
                 continue
                 
@@ -208,7 +236,6 @@ with tab1:
                     new_chap = st.selectbox(f"章節分類 #{i}", smart_importer.PHYSICS_CHAPTERS_LIST, index=current_chap_idx)
                     cand.predicted_chapter = new_chap
                     
-                    # 顯示附圖狀態
                     if cand.image_bytes:
                         st.image(cand.image_bytes, caption="目前附圖", width=200)
                     else:
@@ -216,7 +243,7 @@ with tab1:
 
                 with c2:
                     if cand.ref_image_bytes:
-                        st.markdown("✂️ **截圖工具 (範圍已擴大)**")
+                        st.markdown("✂️ **截圖工具**")
                         try:
                             pil_ref = Image.open(io.BytesIO(cand.ref_image_bytes))
                             cropped_img = st_cropper(
@@ -249,7 +276,6 @@ with tab1:
         if col_submit.button("✅ 確認匯入 (僅匯入顯示中的題目)", type="primary"):
             count = 0
             for cand in st.session_state['imported_candidates']:
-                # 再次過濾：只匯入當前篩選條件下的題目
                 if not show_all and cand.subject != "Physics":
                     continue
                     
