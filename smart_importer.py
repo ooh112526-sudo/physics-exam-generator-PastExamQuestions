@@ -140,7 +140,7 @@ def parse_with_gemini(file_bytes, file_type, api_key):
 
     if not images: return {"error": "PDF 頁面為空"}
 
-    # 4. 呼叫 Gemini (加入模型自動切換機制)
+    # 4. 呼叫 Gemini (更新模型清單)
     chapters_str = "\n".join(PHYSICS_CHAPTERS_LIST)
     prompt = f"""
     你是一個高中物理老師助理。請分析試卷圖片。
@@ -163,37 +163,39 @@ def parse_with_gemini(file_bytes, file_type, api_key):
     input_parts = [prompt]
     input_parts.extend(images)
 
-    # 定義候選模型清單 (優先順序)
+    # === 模型優先權清單 (新增 Gemini 3.0 Pro & Flash) ===
     candidate_models = [
-        'gemini-1.5-flash',
-        'gemini-1.5-flash-latest',
-        'gemini-1.5-flash-001',
-        'gemini-1.5-pro'
+        "gemini-3.0-pro",         # 最新旗艦 (2026)
+        "gemini-3.0-flash",       # 最新快速 (2026)
+        "gemini-2.0-pro",         # 2.0 旗艦
+        "gemini-2.0-flash",       # 2.0 快速
+        "gemini-1.5-pro",         # 1.5 穩定版 (Fallback)
+        "gemini-1.5-flash",       # 1.5 快速版 (Fallback)
     ]
 
     response = None
     last_error = None
+    used_model = "Unknown"
 
     # 嘗試所有模型直到成功
     for model_name in candidate_models:
         try:
             model = genai.GenerativeModel(model_name)
             response = model.generate_content(input_parts)
-            # 如果成功，跳出迴圈
-            break 
+            used_model = model_name
+            break # 成功則跳出
         except Exception as e:
             last_error = e
-            # 繼續嘗試下一個模型
             continue
 
     if not response:
-        return {"error": f"所有 AI 模型皆嘗試失敗。請確認您的 API Key 是否正確且啟用 Generative Language API。最後一次錯誤: {str(last_error)}"}
+        return {"error": f"所有 AI 模型嘗試皆失敗。請確認 API Key 正確。最後錯誤: {str(last_error)}"}
 
     try:
         try:
             text = response.text
         except ValueError:
-            return {"error": f"Gemini 拒絕回應 (可能觸發安全機制)"}
+            return {"error": f"Gemini ({used_model}) 拒絕回應 (可能觸發安全機制)"}
 
         json_text = clean_json_string(text)
         data = json.loads(json_text)
@@ -206,14 +208,14 @@ def parse_with_gemini(file_bytes, file_type, api_key):
                 options=item.get('options', []),
                 chapter=item.get('chapter', '未分類'),
                 is_likely=True,
-                status_reason="Gemini AI 辨識"
+                status_reason=f"Gemini AI ({used_model})" # 標註使用的模型版本
             )
             cand.content = item.get('content', '')
             candidates.append(cand)
         return candidates
 
     except Exception as e:
-        return {"error": f"Gemini 執行錯誤: {str(e)}"}
+        return {"error": f"Gemini ({used_model}) 執行錯誤: {str(e)}"}
 
 # ==========================================
 # 傳統 OCR 邏輯 (備用)
