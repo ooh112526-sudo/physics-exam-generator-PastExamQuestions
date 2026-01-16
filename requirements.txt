@@ -6,3 +6,4 @@ google-generativeai>=0.7.0
 pytesseract
 pdf2image
 pillow
+google-cloud-firestore
