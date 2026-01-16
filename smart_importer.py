@@ -39,9 +39,8 @@ def is_ocr_available():
 # ==========================================
 # 常數定義
 # ==========================================
-# 完整的物理章節清單
 PHYSICS_CHAPTERS_LIST = [
-    "未分類", # 預設選項
+    "未分類", 
     "第一章.科學的態度與方法", 
     "第二章.物體的運動", 
     "第三章. 物質的組成與交互作用",
@@ -88,16 +87,19 @@ def crop_image(original_img, box_2d):
     width, height = original_img.size
     ymin, xmin, ymax, xmax = box_2d
     
-    ymin = max(0, ymin - 5)
-    ymax = min(1000, ymax + 5)
-    xmin = max(0, xmin - 5)
-    xmax = min(1000, xmax + 5)
+    # 增加 padding 並確保不越界
+    ymin = max(0, ymin - 10)
+    ymax = min(1000, ymax + 10)
+    xmin = max(0, xmin - 10)
+    xmax = min(1000, xmax + 10)
     
     left = (xmin / 1000) * width
     top = (ymin / 1000) * height
     right = (xmax / 1000) * width
     bottom = (ymax / 1000) * height
     
+    if right <= left or bottom <= top: return None
+
     try:
         cropped = original_img.crop((left, top, right, bottom))
         img_byte_arr = io.BytesIO()
@@ -156,7 +158,6 @@ def parse_with_gemini(file_bytes, file_type, api_key):
     else:
         batches = [source_images[i:i + BATCH_SIZE] for i in range(0, total_pages, BATCH_SIZE)]
 
-    # 移除 "未分類" 用於 Prompt，避免 AI 偷懶
     prompt_chapters = [c for c in PHYSICS_CHAPTERS_LIST if c != "未分類"]
     chapters_str = "\n".join(prompt_chapters)
     
@@ -176,7 +177,7 @@ def parse_with_gemini(file_bytes, file_type, api_key):
         你是一個高中物理老師助理。請詳細分析這 {len(batch_imgs)} 頁考卷圖片。
         目標：
         1. 辨識所有「物理科」試題。
-        2. 判斷題型：Single, Multi, Fill。
+        2. 判斷題型：Single (單選), Multi (多選), Fill (填充)。
         3. {extra_instruction}
         
         JSON 格式範例：
@@ -204,23 +205,44 @@ def parse_with_gemini(file_bytes, file_type, api_key):
         
         input_parts.extend(batch_imgs)
 
-        candidate_models = ["gemini-2.0-flash", "gemini-1.5-pro", "gemini-1.5-flash"]
+        # === 關鍵修正：將 gemini-2.5-flash 設為首選，並加入其他可用模型 ===
+        candidate_models = [
+            "gemini-2.5-flash",       # 首選
+            "gemini-2.5-pro",         # 次選
+            "gemini-2.0-flash",       # 備用
+            "gemini-2.0-flash-exp",   # 備用
+            "gemini-flash-latest"     # 最後備用
+        ]
         
         generation_config = {"response_mime_type": "application/json"}
         response = None
+        last_error = None
         
         for model_name in candidate_models:
             try:
                 model = genai.GenerativeModel(model_name)
                 response = model.generate_content(input_parts, generation_config=generation_config)
                 break
-            except: continue
+            except Exception as e:
+                last_error = e
+                # 嘗試不使用 JSON 模式 (有些舊模型不支援)
+                if "mode" in str(e).lower() or "support" in str(e).lower():
+                    try:
+                        response = model.generate_content(input_parts)
+                        if response: break
+                    except: pass
+                continue
 
         if not response:
-            errors.append(f"Batch {batch_idx+1} failed.")
+            error_msg = str(last_error) if last_error else "Unknown error"
+            errors.append(f"Batch {batch_idx+1} failed ({error_msg})")
             continue
 
         try:
+            if not response.text:
+                errors.append(f"Batch {batch_idx+1} blocked by safety filters.")
+                continue
+
             json_text = clean_json_string(response.text)
             data = json.loads(json_text)
             if isinstance(data, dict): data = [data]
@@ -261,12 +283,12 @@ def parse_with_gemini(file_bytes, file_type, api_key):
                 all_candidates.append(cand)
                 
         except Exception as e:
-            errors.append(f"Batch {batch_idx+1} parse error: {str(e)}")
+            errors.append(f"Batch {batch_idx+1} parsing error: {str(e)}")
             
         time.sleep(1)
 
     if not all_candidates and errors:
-        return {"error": f"分析失敗: {'; '.join(errors)}"}
+        return {"error": f"分析失敗詳情: {'; '.join(errors)}"}
         
     all_candidates.sort(key=lambda x: x.number)
     return all_candidates
