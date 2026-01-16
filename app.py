@@ -7,8 +7,9 @@ import io
 import pandas as pd
 import time
 import base64
+from PIL import Image
+from streamlit_cropper import st_cropper 
 
-# 引用模組
 import smart_importer
 import firebase_db
 
@@ -19,24 +20,21 @@ st.set_page_config(page_title="物理題庫系統 (Pro)", layout="wide", page_ic
 # ==========================================
 class Question:
     def __init__(self, q_type, content, options=None, answer=None, original_id=0, image_data=None, 
-                 source="一般試題", chapter="", unit="", db_id=None):
-        self.id = db_id if db_id else str(int(time.time()*1000)) # 使用時間戳當 ID
-        self.type = q_type
+                 source="一般試題", chapter="未分類", unit="", db_id=None):
+        self.id = db_id if db_id else str(int(time.time()*1000)) 
+        self.type = q_type 
         self.source = source
         self.chapter = chapter
         self.unit = unit
         self.content = content
         self.options = options if options else []
         self.answer = answer
-        self.image_data = image_data # bytes
+        self.image_data = image_data 
 
     def to_dict(self):
-        """序列化為字典 (存 Firestore 用)"""
-        # image_data bytes 需轉為 base64 字串才能存 JSON/Firestore
         img_str = None
         if self.image_data:
             img_str = base64.b64encode(self.image_data).decode('utf-8')
-            
         return {
             "id": self.id,
             "type": self.type,
@@ -50,13 +48,11 @@ class Question:
 
     @staticmethod
     def from_dict(data):
-        """從字典還原"""
         img_bytes = None
         if data.get("image_data_b64"):
             try:
                 img_bytes = base64.b64decode(data["image_data_b64"])
             except: pass
-            
         return Question(
             q_type=data.get("type", "Single"),
             content=data.get("content", ""),
@@ -65,22 +61,18 @@ class Question:
             original_id=0,
             image_data=img_bytes,
             source=data.get("source", ""),
-            chapter=data.get("chapter", ""),
+            chapter=data.get("chapter", "未分類"),
             db_id=data.get("id")
         )
 
-# 初始化 Session State
 if 'question_pool' not in st.session_state:
     st.session_state['question_pool'] = []
-    # 嘗試從雲端載入
     cloud_data = firebase_db.load_questions_from_cloud()
     if cloud_data:
         st.session_state['question_pool'] = [Question.from_dict(d) for d in cloud_data]
-        st.toast(f"已從雲端載入 {len(cloud_data)} 題", icon="☁️")
     else:
-        # 如果沒有雲端資料，也沒有設定檔
         if not firebase_db.get_db():
-            st.warning("⚠️ 未偵測到 Firebase 設定。題目將只保留在本次操作中 (重新整理後消失)。")
+            st.warning("⚠️ 未偵測到 Firebase 設定。")
 
 if 'imported_candidates' not in st.session_state:
     st.session_state['imported_candidates'] = []
@@ -101,20 +93,24 @@ def generate_word_files(selected_questions):
     
     for idx, q in enumerate(selected_questions, 1):
         p = exam_doc.add_paragraph()
-        runner = p.add_run(f"{idx}. {q.content.strip()}")
+        type_label = {'Single': '【單選】', 'Multi': '【多選】', 'Fill': '【填充】'}.get(q.type, '')
+        
+        # 顯示來源標籤在題目中 (選用)
+        src_label = f"[{q.source}] " if q.source else ""
+        
+        runner = p.add_run(f"{idx}. {src_label}{type_label} {q.content.strip()}")
         runner.bold = True
         
-        # 插入圖片
         if q.image_data:
             try:
                 exam_doc.add_picture(io.BytesIO(q.image_data), width=Inches(2.5))
             except: pass
 
-        if q.type != 'Fill':
+        if q.type in ['Single', 'Multi']:
             for i, opt in enumerate(q.options):
                 exam_doc.add_paragraph(f"{opt}")
-        else:
-            exam_doc.add_paragraph("______________________")
+        elif q.type == 'Fill':
+            exam_doc.add_paragraph("答：______________________")
         exam_doc.add_paragraph("") 
         
         ans_p = ans_doc.add_paragraph()
@@ -132,7 +128,6 @@ def generate_word_files(selected_questions):
 # 介面
 # ==========================================
 st.title("🧲 物理題庫系統 Pro")
-st.caption("功能：AI 圖文辨識 (PDF/Word) | 雲端儲存 | 題庫編輯")
 
 with st.sidebar:
     st.header("設定")
@@ -145,14 +140,40 @@ with st.sidebar:
             for q in st.session_state['question_pool']:
                 firebase_db.save_question_to_cloud(q.to_dict())
             st.success("儲存完成！")
-        else:
-            st.error("未設定 Firebase secrets")
 
 tab1, tab2, tab3 = st.tabs(["🧠 智慧匯入", "📝 題庫管理 & 編輯", "🚀 組卷匯出"])
 
-# === Tab 1: 智慧匯入 (PDF/Word) ===
+# === Tab 1: 智慧匯入 ===
 with tab1:
-    st.markdown("### 上傳試卷 (PDF / Word)")
+    st.markdown("### 1. 設定試卷來源標籤")
+    
+    col_src1, col_src2, col_src3 = st.columns(3)
+    with col_src1:
+        exam_type = st.selectbox("考試類型", ["學測", "分科", "北模", "中模", "全模", "自行輸入"])
+    with col_src2:
+        exam_year = st.text_input("年度 (例如 112)", value="113")
+    with col_src3:
+        # 如果是模擬考，才顯示場次選擇
+        exam_session_opts = [""] 
+        if "模" in exam_type:
+            exam_session_opts = ["第1次", "第2次", "第3次", "第4次"]
+        elif exam_type == "自行輸入":
+            exam_session_opts = [""]
+        
+        exam_session = st.selectbox("場次 (僅模考)", exam_session_opts) if "模" in exam_type else ""
+
+    # 組合來源字串
+    final_source_tag = f"{exam_year}-{exam_type}"
+    if exam_session:
+        final_source_tag += f"-{exam_session}"
+    
+    if exam_type == "自行輸入":
+        final_source_tag = st.text_input("自訂來源名稱", value=f"{exam_year}-自訂試卷")
+
+    st.markdown(f"**預覽標籤：** `{final_source_tag}`")
+    st.divider()
+
+    st.markdown("### 2. 上傳試卷 (PDF / Word)")
     raw_file = st.file_uploader("支援 .pdf, .docx", type=['pdf', 'docx'])
     
     if raw_file and st.button("開始 AI 分析"):
@@ -160,7 +181,7 @@ with tab1:
             st.error("請輸入 API Key")
         else:
             file_type = raw_file.name.split('.')[-1].lower()
-            with st.spinner("🤖 Gemini 正在分析題目與擷取圖片..."):
+            with st.spinner("🤖 Gemini 正在分析中..."):
                 res = smart_importer.parse_with_gemini(raw_file.read(), file_type, api_key)
                 if isinstance(res, dict) and "error" in res:
                     st.error(res["error"])
@@ -168,107 +189,130 @@ with tab1:
                     st.session_state['imported_candidates'] = res
                     st.success(f"成功辨識 {len(res)} 題！")
 
-    # 匯入預覽區
     if st.session_state['imported_candidates']:
         st.divider()
-        st.subheader("預覽與勾選")
+        st.subheader("3. 匯入校對與截圖")
+        st.info("💡 請檢查「章節分類」，若 AI 判斷錯誤可在此修正為「未分類」或其他章節。")
         
-        # 轉換為 DataFrame 供編輯
-        preview_list = []
         for i, cand in enumerate(st.session_state['imported_candidates']):
-            preview_list.append({
-                "加入": True,
-                "內容": cand.content,
-                "選項": "\n".join(cand.options) if cand.options else "",
-                "章節": cand.predicted_chapter,
-                "有圖片": "✅" if cand.image_bytes else ""
-            })
-            
-        edited = st.data_editor(
-            pd.DataFrame(preview_list),
-            column_config={
-                "加入": st.column_config.CheckboxColumn(width="small"),
-                "內容": st.column_config.TextColumn(width="large"),
-                "章節": st.column_config.SelectboxColumn(options=smart_importer.PHYSICS_CHAPTERS_LIST)
-            },
-            use_container_width=True
-        )
-        
-        if st.button("確認匯入"):
-            count = 0
-            for idx, row in edited.iterrows():
-                if row["加入"]:
-                    cand = st.session_state['imported_candidates'][idx]
-                    # 使用使用者編輯過的資料
-                    opts = row["選項"].split('\n') if row["選項"] else []
+            with st.container():
+                st.markdown(f"**第 {cand.number} 題**")
+                c1, c2 = st.columns([1, 1])
+                
+                with c1:
+                    new_content = st.text_area(f"題目內容 #{i}", cand.content, height=100)
+                    cand.content = new_content
                     
-                    new_q = Question(
-                        q_type="Single" if opts else "Fill",
-                        content=row["內容"],
-                        options=opts,
-                        source="AI匯入",
-                        chapter=row["章節"],
-                        image_data=cand.image_bytes # 帶入自動截圖的圖片
+                    opts_text = "\n".join(cand.options)
+                    new_opts = st.text_area(f"選項 #{i}", opts_text, height=80)
+                    cand.options = new_opts.split('\n') if new_opts else []
+                    
+                    # 章節選擇器 (包含 '未分類')
+                    current_chap_idx = 0
+                    if cand.predicted_chapter in smart_importer.PHYSICS_CHAPTERS_LIST:
+                        current_chap_idx = smart_importer.PHYSICS_CHAPTERS_LIST.index(cand.predicted_chapter)
+                    
+                    new_chap = st.selectbox(
+                        f"章節分類 #{i}", 
+                        smart_importer.PHYSICS_CHAPTERS_LIST, 
+                        index=current_chap_idx
                     )
+                    cand.predicted_chapter = new_chap
                     
-                    st.session_state['question_pool'].append(new_q)
-                    # 同步存雲端
-                    firebase_db.save_question_to_cloud(new_q.to_dict())
-                    count += 1
-            st.success(f"匯入 {count} 題並已嘗試儲存至雲端！")
+                    if cand.image_bytes:
+                        st.image(cand.image_bytes, caption="目前附圖", width=200)
+                        if st.button(f"清除附圖 #{i}"):
+                            cand.image_bytes = None
+                            st.rerun()
+
+                with c2:
+                    if cand.ref_image_bytes:
+                        st.markdown("✂️ **截圖工具**")
+                        try:
+                            pil_ref = Image.open(io.BytesIO(cand.ref_image_bytes))
+                            cropped_img = st_cropper(
+                                pil_ref, 
+                                realtime_update=True, 
+                                box_color='#FF0000',
+                                key=f"cropper_{i}",
+                                aspect_ratio=None
+                            )
+                            if st.button(f"📷 使用此範圍為附圖 #{i}"):
+                                img_byte_arr = io.BytesIO()
+                                cropped_img.save(img_byte_arr, format='PNG')
+                                cand.image_bytes = img_byte_arr.getvalue()
+                                st.success("附圖已更新！")
+                                st.rerun()
+                        except Exception as e:
+                            st.error(f"無法載入截圖工具: {e}")
+                    else:
+                        st.info("此題無原始截圖")
+                st.divider()
+
+        col_submit, _ = st.columns([1, 3])
+        if col_submit.button("✅ 確認將所有題目匯入題庫", type="primary"):
+            count = 0
+            for cand in st.session_state['imported_candidates']:
+                new_q = Question(
+                    q_type=cand.q_type,
+                    content=cand.content,
+                    options=cand.options,
+                    source=final_source_tag, # 使用剛設定好的標籤
+                    chapter=cand.predicted_chapter,
+                    image_data=cand.image_bytes 
+                )
+                st.session_state['question_pool'].append(new_q)
+                firebase_db.save_question_to_cloud(new_q.to_dict())
+                count += 1
+            
+            st.success(f"匯入 {count} 題！")
             st.session_state['imported_candidates'] = []
             st.rerun()
 
-# === Tab 2: 題庫管理 & 編輯 ===
+# === Tab 2: 題庫管理 ===
 with tab2:
-    st.subheader("題庫列表 (可編輯)")
-    
+    st.subheader("題庫列表")
     if not st.session_state['question_pool']:
         st.info("目前沒有題目。")
     else:
-        # 顯示題目列表，每一個題目一個 Expander
-        for i, q in enumerate(st.session_state['question_pool']):
-            with st.expander(f"{i+1}. [{q.chapter}] {q.content[:30]}..."):
-                # 編輯模式
+        # 提供簡單的篩選器
+        filter_src = st.multiselect("篩選來源", list(set([q.source for q in st.session_state['question_pool']])))
+        
+        filtered_pool = st.session_state['question_pool']
+        if filter_src:
+            filtered_pool = [q for q in st.session_state['question_pool'] if q.source in filter_src]
+
+        for i, q in enumerate(filtered_pool):
+            type_badge = {'Single': '單', 'Multi': '多', 'Fill': '填'}.get(q.type, '未知')
+            with st.expander(f"[{q.source}] [{type_badge}] {q.content[:30]}..."):
                 c1, c2 = st.columns([2, 1])
                 with c1:
-                    new_content = st.text_area(f"題目內容 #{i}", q.content, height=100)
-                    new_opts_str = st.text_area(f"選項 (換行分隔) #{i}", "\n".join(q.options), height=100)
+                    q.content = st.text_area(f"題目 #{q.id}", q.content, height=100)
+                    opts_str = st.text_area(f"選項 #{q.id}", "\n".join(q.options), height=100)
+                    q.options = opts_str.split('\n') if opts_str else []
                 with c2:
-                    new_chap = st.selectbox(f"章節 #{i}", smart_importer.PHYSICS_CHAPTERS_LIST, index=smart_importer.PHYSICS_CHAPTERS_LIST.index(q.chapter) if q.chapter in smart_importer.PHYSICS_CHAPTERS_LIST else 0)
-                    new_ans = st.text_input(f"答案 #{i}", q.answer)
+                    q.type = st.selectbox(f"題型 #{q.id}", ["Single", "Multi", "Fill"], index=["Single", "Multi", "Fill"].index(q.type) if q.type in ["Single", "Multi", "Fill"] else 0)
                     
-                    # 圖片管理
-                    if q.image_data:
-                        st.image(q.image_data, caption="目前附圖", width=200)
-                        if st.button(f"刪除圖片 #{i}"):
-                            q.image_data = None
-                            st.rerun()
-                    else:
-                        uploaded_img = st.file_uploader(f"上傳圖片 #{i}", type=["png", "jpg"], key=f"up_{i}")
-                        if uploaded_img:
-                            q.image_data = uploaded_img.read()
-                            st.rerun()
-
-                col_save, col_del = st.columns(2)
-                if col_save.button(f"💾 儲存修改 #{i}"):
-                    q.content = new_content
-                    q.options = new_opts_str.split('\n') if new_opts_str else []
-                    q.chapter = new_chap
-                    q.answer = new_ans
-                    # 同步更新雲端
-                    firebase_db.save_question_to_cloud(q.to_dict())
-                    st.success("已更新！")
-                
-                if col_del.button(f"🗑️ 刪除題目 #{i}", type="primary"):
-                    firebase_db.delete_question_from_cloud(q.id)
-                    st.session_state['question_pool'].pop(i)
-                    st.rerun()
+                    # 這裡也能修改章節
+                    chap_idx = 0
+                    if q.chapter in smart_importer.PHYSICS_CHAPTERS_LIST:
+                        chap_idx = smart_importer.PHYSICS_CHAPTERS_LIST.index(q.chapter)
+                    q.chapter = st.selectbox(f"章節 #{q.id}", smart_importer.PHYSICS_CHAPTERS_LIST, index=chap_idx)
+                    
+                    q.answer = st.text_input(f"答案 #{q.id}", q.answer)
+                    
+                    if st.button(f"💾 儲存 #{q.id}"):
+                        firebase_db.save_question_to_cloud(q.to_dict())
+                        st.success("儲存成功")
+                    
+                    if st.button(f"🗑️ 刪除 #{q.id}", type="primary"):
+                        firebase_db.delete_question_from_cloud(q.id)
+                        # 需重新整理頁面以更新列表
+                        st.rerun()
 
 # === Tab 3: 組卷匯出 ===
 with tab3:
     st.subheader("生成 Word 試卷")
-    # (保留原功能)
     if st.button("生成並下載"):
         f1, f2 = generate_word_files(st.session_state['question_pool'])
         st.download_button("下載試題卷", f1, "exam.docx")
