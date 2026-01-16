@@ -21,8 +21,9 @@ st.set_page_config(page_title="物理題庫系統 (Pro)", layout="wide", page_ic
 # ==========================================
 class Question:
     def __init__(self, q_type, content, options=None, answer=None, original_id=0, image_data=None, 
-                 source="一般試題", chapter="未分類", unit="", db_id=None):
-        self.id = db_id if db_id else str(int(time.time()*1000)) 
+                 source="一般試題", chapter="未分類", unit="", db_id=None, 
+                 parent_id=None, is_group_parent=False, sub_questions=None):
+        self.id = db_id if db_id else str(int(time.time()*1000)) + str(random.randint(0, 999))
         self.type = q_type 
         self.source = source
         self.chapter = chapter
@@ -31,11 +32,20 @@ class Question:
         self.options = options if options else []
         self.answer = answer
         self.image_data = image_data 
+        
+        # 題組相關屬性
+        self.parent_id = parent_id # 若此題為子題，指向父題 ID
+        self.is_group_parent = is_group_parent # 是否為題組題幹
+        self.sub_questions = sub_questions if sub_questions else [] # 若為題幹，存子題物件 (非ID，方便操作)
 
     def to_dict(self):
         img_str = None
         if self.image_data:
             img_str = base64.b64encode(self.image_data).decode('utf-8')
+        
+        # 子題遞迴序列化
+        subs = [q.to_dict() for q in self.sub_questions] if self.sub_questions else []
+
         return {
             "id": self.id,
             "type": self.type,
@@ -44,7 +54,10 @@ class Question:
             "content": self.content,
             "options": self.options,
             "answer": self.answer,
-            "image_data_b64": img_str
+            "image_data_b64": img_str,
+            "parent_id": self.parent_id,
+            "is_group_parent": self.is_group_parent,
+            "sub_questions": subs
         }
 
     @staticmethod
@@ -54,7 +67,8 @@ class Question:
             try:
                 img_bytes = base64.b64decode(data["image_data_b64"])
             except: pass
-        return Question(
+            
+        q = Question(
             q_type=data.get("type", "Single"),
             content=data.get("content", ""),
             options=data.get("options", []),
@@ -63,8 +77,16 @@ class Question:
             image_data=img_bytes,
             source=data.get("source", ""),
             chapter=data.get("chapter", "未分類"),
-            db_id=data.get("id")
+            db_id=data.get("id"),
+            parent_id=data.get("parent_id"),
+            is_group_parent=data.get("is_group_parent", False)
         )
+        
+        # 還原子題
+        if data.get("sub_questions"):
+            q.sub_questions = [Question.from_dict(sub) for sub in data["sub_questions"]]
+            
+        return q
 
 if 'question_pool' not in st.session_state:
     st.session_state['question_pool'] = []
@@ -79,13 +101,11 @@ if 'imported_candidates' not in st.session_state:
     st.session_state['imported_candidates'] = []
 
 # ==========================================
-# 工具函式 (Word 生成優化)
+# 工具函式
 # ==========================================
 def generate_word_files(selected_questions):
     exam_doc = docx.Document()
     ans_doc = docx.Document()
-    
-    # 設定基本字型
     style = exam_doc.styles['Normal']
     style.font.name = 'Times New Roman'
     style.font.size = Pt(12)
@@ -94,53 +114,50 @@ def generate_word_files(selected_questions):
     exam_doc.add_heading('物理科 試題卷', 0)
     ans_doc.add_heading('物理科 答案卷', 0)
     
-    for idx, q in enumerate(selected_questions, 1):
-        # 1. 題目區
-        p = exam_doc.add_paragraph()
-        type_label = {'Single': '【單選】', 'Multi': '【多選】', 'Fill': '【填充】'}.get(q.type, '')
-        src_label = f"[{q.source}] " if q.source else ""
+    q_counter = 1
+    
+    def write_single_question(doc, q, idx_str):
+        p = doc.add_paragraph()
+        type_label = {'Single': '【單選】', 'Multi': '【多選】', 'Fill': '【填充】', 'Group': '【題組】'}.get(q.type, '')
+        src_label = f"[{q.source}] " if q.source and not q.parent_id else "" # 子題不重複顯示來源
         
-        runner = p.add_run(f"{idx}. {src_label}{type_label} {q.content.strip()}")
+        runner = p.add_run(f"{idx_str}. {src_label}{type_label} {q.content.strip()}")
         runner.bold = True
         
-        # 2. 圖片區
         if q.image_data:
             try:
-                # 圖片單獨一段，置中或靠左
-                img_p = exam_doc.add_paragraph()
+                img_p = doc.add_paragraph()
                 run = img_p.add_run()
                 run.add_picture(io.BytesIO(q.image_data), width=Inches(2.5))
             except: pass
 
-        # 3. 選項區 (智慧排版)
-        if q.type in ['Single', 'Multi'] and q.options:
-            opts = q.options
-            # 簡單判斷：如果所有選項都短，使用表格或並排
-            max_len = max([len(o) for o in opts]) if opts else 0
-            
-            # 如果選項很短 (< 15 字)，嘗試並排 (表格隱藏邊框)
-            if max_len < 15 and len(opts) > 0:
-                table = exam_doc.add_table(rows=1, cols=len(opts))
-                # 移除邊框需要較複雜的 xml 操作，這裡先簡單處理為文字段落
-                # 為了避免格式跑掉，最穩健的方法是「垂直排列」但間距縮小
-                # 或者使用 Tab 分隔
-                
-                # 方案：如果真的很短，用一行顯示
-                line_text = "    ".join(opts)
-                exam_doc.add_paragraph(line_text)
-            else:
-                # 選項較長，垂直排列
-                for opt in opts:
-                    exam_doc.add_paragraph(f"{opt}")
-                    
+        if q.type in ['Single', 'Multi']:
+            for i, opt in enumerate(q.options):
+                doc.add_paragraph(f"{opt}")
         elif q.type == 'Fill':
-            exam_doc.add_paragraph("答：______________________")
+            doc.add_paragraph("答：______________________")
+        doc.add_paragraph("") 
+
+    for q in selected_questions:
+        if q.is_group_parent:
+            # 寫入題幹
+            write_single_question(exam_doc, q, f"{q_counter}-{q_counter + len(q.sub_questions) - 1} 為題組")
+            # 寫入子題
+            for sub_q in q.sub_questions:
+                write_single_question(exam_doc, sub_q, str(q_counter))
+                
+                # 答案
+                ans_p = ans_doc.add_paragraph()
+                ans_p.add_run(f"{q_counter}. {sub_q.answer}")
+                q_counter += 1
+        else:
+            # 一般題目
+            write_single_question(exam_doc, q, str(q_counter))
             
-        exam_doc.add_paragraph("") # 空行分隔
-        
-        # 4. 答案卷
-        ans_p = ans_doc.add_paragraph()
-        ans_p.add_run(f"{idx}. {q.answer}")
+            # 答案
+            ans_p = ans_doc.add_paragraph()
+            ans_p.add_run(f"{q_counter}. {q.answer}")
+            q_counter += 1
         
     exam_io = io.BytesIO()
     ans_io = io.BytesIO()
@@ -159,7 +176,7 @@ with st.sidebar:
     st.header("設定")
     api_key = st.text_input("Gemini API Key", type="password")
     st.divider()
-    st.metric("題庫數量", len(st.session_state['question_pool']))
+    st.metric("題庫數量 (主題)", len(st.session_state['question_pool']))
     if st.button("強制儲存至雲端"):
         db = firebase_db.get_db()
         if db:
@@ -208,10 +225,9 @@ with tab1:
     if st.session_state['imported_candidates']:
         st.divider()
         st.subheader("3. 匯入校對與截圖")
-        st.info("AI 已自動過濾非物理題。右側截圖已設為全寬，方便對照。")
+        st.info("請在此處檢查題型與輸入答案。若未輸入，匯入後仍可編輯。")
         
-        # 篩選器
-        show_all = st.checkbox("顯示所有科目 (包含化學/生物/地科)", value=False)
+        show_all = st.checkbox("顯示所有科目", value=False)
         
         for i, cand in enumerate(st.session_state['imported_candidates']):
             if not show_all and cand.subject != "Physics":
@@ -228,6 +244,18 @@ with tab1:
                     opts_text = "\n".join(cand.options)
                     new_opts = st.text_area(f"選項 #{i}", opts_text, height=80)
                     cand.options = new_opts.split('\n') if new_opts else []
+                    
+                    # 題型選擇 (支援 Single, Multi, Fill)
+                    type_idx = ["Single", "Multi", "Fill"].index(cand.q_type) if cand.q_type in ["Single", "Multi", "Fill"] else 0
+                    new_type = st.selectbox(f"題型 #{i}", ["Single", "Multi", "Fill"], index=type_idx)
+                    cand.q_type = new_type
+
+                    # 答案輸入 (新增功能)
+                    # 我們這裡沒有直接把 answer 存在 cand 物件裡 (因為 smart_importer 的結構沒這欄位)
+                    # 所以用 session_state 暫存
+                    ans_key = f"ans_import_{i}"
+                    if ans_key not in st.session_state: st.session_state[ans_key] = ""
+                    new_ans = st.text_input(f"答案 (可留空) #{i}", value=st.session_state[ans_key], key=ans_key)
                     
                     current_chap_idx = 0
                     if cand.predicted_chapter in smart_importer.PHYSICS_CHAPTERS_LIST:
@@ -260,12 +288,10 @@ with tab1:
                                 cand.image_bytes = img_byte_arr.getvalue()
                                 st.success("附圖已更新")
                                 st.rerun()
-                            
                             if col_c2.button(f"🚫 不使用圖片 #{i}"):
                                 cand.image_bytes = None
                                 st.success("附圖已移除")
                                 st.rerun()
-                                
                         except Exception as e:
                             st.error(f"無法載入截圖工具: {e}")
                     else:
@@ -273,19 +299,23 @@ with tab1:
                 st.divider()
 
         col_submit, _ = st.columns([1, 3])
-        if col_submit.button("✅ 確認匯入 (僅匯入顯示中的題目)", type="primary"):
+        if col_submit.button("✅ 確認匯入", type="primary"):
             count = 0
-            for cand in st.session_state['imported_candidates']:
+            for i, cand in enumerate(st.session_state['imported_candidates']):
                 if not show_all and cand.subject != "Physics":
                     continue
-                    
+                
+                # 取得暫存的答案
+                ans_val = st.session_state.get(f"ans_import_{i}", "")
+                
                 new_q = Question(
                     q_type=cand.q_type,
                     content=cand.content,
                     options=cand.options,
                     source=final_source_tag, 
                     chapter=cand.predicted_chapter,
-                    image_data=cand.image_bytes 
+                    image_data=cand.image_bytes,
+                    answer=ans_val # 匯入答案
                 )
                 st.session_state['question_pool'].append(new_q)
                 firebase_db.save_question_to_cloud(new_q.to_dict())
@@ -295,7 +325,7 @@ with tab1:
             st.session_state['imported_candidates'] = []
             st.rerun()
 
-# === Tab 2: 題庫管理 (保留原樣) ===
+# === Tab 2: 題庫管理 ===
 with tab2:
     st.subheader("題庫列表")
     if not st.session_state['question_pool']:
@@ -307,26 +337,79 @@ with tab2:
             filtered_pool = [q for q in st.session_state['question_pool'] if q.source in filter_src]
 
         for i, q in enumerate(filtered_pool):
-            type_badge = {'Single': '單', 'Multi': '多', 'Fill': '填'}.get(q.type, '未知')
+            # 標示題型與題組
+            type_badge = {'Single': '單', 'Multi': '多', 'Fill': '填', 'Group': '題組'}.get(q.type, '未知')
+            if q.is_group_parent:
+                type_badge = "題組"
+                
             with st.expander(f"[{q.source}] [{type_badge}] {q.content[:30]}..."):
+                # 主題編輯區
                 c1, c2 = st.columns([2, 1])
                 with c1:
-                    q.content = st.text_area(f"題目 #{q.id}", q.content, height=100)
-                    opts_str = st.text_area(f"選項 #{q.id}", "\n".join(q.options), height=100)
-                    q.options = opts_str.split('\n') if opts_str else []
+                    q.content = st.text_area(f"題目內容 #{q.id}", q.content, height=100)
+                    
+                    if not q.is_group_parent: # 題組題幹通常沒有選項
+                        opts_str = st.text_area(f"選項 #{q.id}", "\n".join(q.options), height=100)
+                        q.options = opts_str.split('\n') if opts_str else []
+                        
                 with c2:
-                    q.type = st.selectbox(f"題型 #{q.id}", ["Single", "Multi", "Fill"], index=["Single", "Multi", "Fill"].index(q.type) if q.type in ["Single", "Multi", "Fill"] else 0)
+                    # 題型選擇
+                    q.type = st.selectbox(f"題型 #{q.id}", ["Single", "Multi", "Fill", "Group"], index=["Single", "Multi", "Fill", "Group"].index(q.type) if q.type in ["Single", "Multi", "Fill", "Group"] else 0)
+                    
+                    # 若切換為題組，設定標記
+                    if q.type == "Group":
+                        q.is_group_parent = True
+                    else:
+                        q.is_group_parent = False
+                    
                     chap_idx = 0
                     if q.chapter in smart_importer.PHYSICS_CHAPTERS_LIST:
                         chap_idx = smart_importer.PHYSICS_CHAPTERS_LIST.index(q.chapter)
                     q.chapter = st.selectbox(f"章節 #{q.id}", smart_importer.PHYSICS_CHAPTERS_LIST, index=chap_idx)
-                    q.answer = st.text_input(f"答案 #{q.id}", q.answer)
+                    
+                    if not q.is_group_parent:
+                        q.answer = st.text_input(f"答案 #{q.id}", q.answer)
                     
                     if st.button(f"💾 儲存 #{q.id}"):
                         firebase_db.save_question_to_cloud(q.to_dict())
                         st.success("儲存成功")
                     if st.button(f"🗑️ 刪除 #{q.id}", type="primary"):
                         firebase_db.delete_question_from_cloud(q.id)
+                        st.rerun()
+
+                # === 子題編輯區 (僅題組顯示) ===
+                if q.is_group_parent:
+                    st.markdown("---")
+                    st.markdown("#### 📂 子題目管理")
+                    
+                    # 顯示現有子題
+                    if q.sub_questions:
+                        for sub_idx, sub_q in enumerate(q.sub_questions):
+                            st.markdown(f"**子題 {sub_idx+1}**")
+                            sc1, sc2 = st.columns([3, 1])
+                            with sc1:
+                                sub_q.content = st.text_input(f"子題題目 #{sub_q.id}", sub_q.content)
+                                sub_opts = st.text_area(f"子題選項 #{sub_q.id}", "\n".join(sub_q.options), height=60)
+                                sub_q.options = sub_opts.split('\n') if sub_opts else []
+                            with sc2:
+                                sub_q.type = st.selectbox(f"子題類型 #{sub_q.id}", ["Single", "Multi", "Fill"], index=["Single", "Multi", "Fill"].index(sub_q.type))
+                                sub_q.answer = st.text_input(f"子題答案 #{sub_q.id}", sub_q.answer)
+                                if st.button(f"移除子題 #{sub_q.id}"):
+                                    q.sub_questions.pop(sub_idx)
+                                    firebase_db.save_question_to_cloud(q.to_dict())
+                                    st.rerun()
+                            st.divider()
+
+                    # 新增子題按鈕
+                    if st.button(f"➕ 新增子題至 #{q.id}"):
+                        new_sub = Question(
+                            q_type="Single", 
+                            content="新子題...", 
+                            options=["(A)", "(B)"],
+                            parent_id=q.id
+                        )
+                        q.sub_questions.append(new_sub)
+                        firebase_db.save_question_to_cloud(q.to_dict())
                         st.rerun()
 
 # === Tab 3: 組卷匯出 ===
