@@ -14,6 +14,7 @@ HAS_DOCX = False
 
 try:
     import google.generativeai as genai
+    from google.ai.generativelanguage_v1beta.types import content
     HAS_GENAI = True
 except ImportError: pass
 
@@ -46,6 +47,12 @@ PHYSICS_CHAPTERS_LIST = [
     "第四章.電與磁的統一", 
     "第五章. 能　量", 
     "第六章.量子現象"
+]
+
+EXCLUDE_KEYWORDS = [
+    "化學", "反應式", "有機化合物", "酸鹼", "沉澱", "氧化還原", "莫耳", "原子量",
+    "生物", "細胞", "遺傳", "DNA", "染色體", "演化", "生態", "光合作用", "酵素",
+    "地科", "地質", "板塊", "洋流", "大氣", "氣候", "岩石", "化石", "星系", "地層"
 ]
 
 # ==========================================
@@ -115,7 +122,7 @@ def crop_image(original_img, box_2d, force_full_width=False, padding_y=10):
         return None
 
 # ==========================================
-# Gemini AI 解析邏輯
+# Gemini AI 解析邏輯 (含重試機制)
 # ==========================================
 def parse_with_gemini(file_bytes, file_type, api_key):
     if not HAS_GENAI: return {"error": "缺少 google-generativeai 套件"}
@@ -152,6 +159,7 @@ def parse_with_gemini(file_bytes, file_type, api_key):
     if not source_images and file_type == 'pdf': return {"error": "PDF 頁面為空"}
 
     # 分批處理
+    # 策略調整：BATCH_SIZE 稍微加大，減少請求次數，但可能增加單次 Token
     BATCH_SIZE = 5 
     total_pages = len(source_images)
     all_candidates = []
@@ -165,6 +173,7 @@ def parse_with_gemini(file_bytes, file_type, api_key):
     prompt_chapters = [c for c in PHYSICS_CHAPTERS_LIST if c != "未分類"]
     chapters_str = "\n".join(prompt_chapters)
     
+    # === 批次迴圈 ===
     for batch_idx, batch_imgs in enumerate(batches):
         start_page_idx = batch_idx * BATCH_SIZE
         
@@ -172,19 +181,18 @@ def parse_with_gemini(file_bytes, file_type, api_key):
         if file_type == 'pdf':
             extra_instruction = """
             對於每一題，請回傳兩個座標範圍：
-            1. 'full_question_box_2d': 包含題號、題目文字、選項與圖片的完整區域。
+            1. 'full_question_box_2d': 包含題號、題目文字、選項與圖片的完整區域。請盡量寬鬆。
             2. 'box_2d': 如果該題有附圖(diagram)，請標示圖片的範圍；若無則省略。
             座標格式皆為 [ymin, xmin, ymax, xmax] (範圍 0-1000)。
             """
         
-        # 關鍵 Prompt 修改：嚴格過濾非物理題
         prompt = f"""
         你是一個高中物理老師助理。這份試卷包含物理、化學、生物、地科試題。
         請詳細分析這 {len(batch_imgs)} 頁考卷圖片。
         
         【重要任務】：
         1. **僅擷取物理科試題** (Physics)。
-        2. **嚴格過濾**：若題目屬於純化學 (Chemistry)、純生物 (Biology) 或純地球科學 (Earth Science)，請**不要**列入回傳清單，直接忽略。
+        2. **嚴格過濾**：若題目屬於純化學 (Chemistry)、純生物 (Biology) 或純地球科學 (Earth Science)，請**絕對不要**寫入回傳的 JSON 清單中。直接忽略它們。
         3. 若為「跨科題」且包含物理概念，則可以保留。
         
         輸出格式：JSON List
@@ -194,7 +202,8 @@ def parse_with_gemini(file_bytes, file_type, api_key):
         [
             {{
                 "number": 1,
-                "type": "Single", // 或 Multi, Fill
+                "subject": "Physics", 
+                "type": "Single",
                 "content": "題目敘述...",
                 "options": ["(A)...", "(B)..."],
                 "answer": "A",
@@ -204,9 +213,7 @@ def parse_with_gemini(file_bytes, file_type, api_key):
                 "page_index": 0 
             }}
         ]
-        注意：
-        - page_index 代表該題目在「這批圖片」中的索引(從 0 開始)。
-        - 再次強調：不要輸出生物、地科、化學題目。
+        注意：page_index 代表該題目在「這批圖片」中的索引(從 0 開始)。
         """
 
         input_parts = [prompt]
@@ -216,28 +223,45 @@ def parse_with_gemini(file_bytes, file_type, api_key):
         input_parts.extend(batch_imgs)
 
         candidate_models = [
-            "gemini-2.5-flash", "gemini-2.5-pro", 
-            "gemini-2.0-flash", "gemini-2.0-flash-exp", 
-            "gemini-flash-latest"
+            "gemini-2.5-flash",       # 首選
+            "gemini-2.0-flash",       # 備用
+            "gemini-2.0-flash-exp",   # 備用
+            "gemini-1.5-flash"        # 最後備用
         ]
         
         generation_config = {"response_mime_type": "application/json"}
         response = None
         last_error = None
         
-        for model_name in candidate_models:
-            try:
-                model = genai.GenerativeModel(model_name)
-                response = model.generate_content(input_parts, generation_config=generation_config)
+        # 重試機制 (Retry Loop)
+        MAX_RETRIES = 3
+        for attempt in range(MAX_RETRIES + 1):
+            
+            # 內層迴圈：嘗試不同模型
+            for model_name in candidate_models:
+                try:
+                    model = genai.GenerativeModel(model_name)
+                    response = model.generate_content(input_parts, generation_config=generation_config)
+                    break # 成功則跳出模型迴圈
+                except Exception as e:
+                    last_error = e
+                    # 如果是 429 錯誤，不要換模型，而是等待重試
+                    if "429" in str(e):
+                        break 
+                    # 如果是其他錯誤(如不支援JSON)，換模型試試
+                    continue
+            
+            if response:
+                break # 成功取得回應，跳出重試迴圈
+
+            # 如果失敗原因是 429 (Quota exceeded)，則等待
+            if last_error and "429" in str(last_error):
+                wait_time = 20 * (attempt + 1) # 指數退避: 20s, 40s, 60s
+                print(f"Rate limited (429). Waiting {wait_time}s before retry {attempt+1}/{MAX_RETRIES}...")
+                time.sleep(wait_time)
+            else:
+                # 其他錯誤 (如內容被擋)，可能重試也沒用，跳出
                 break
-            except Exception as e:
-                last_error = e
-                if "mode" in str(e).lower() or "support" in str(e).lower():
-                    try:
-                        response = model.generate_content(input_parts)
-                        if response: break
-                    except: pass
-                continue
 
         if not response:
             error_msg = str(last_error) if last_error else "Unknown error"
@@ -254,10 +278,15 @@ def parse_with_gemini(file_bytes, file_type, api_key):
             if isinstance(data, dict): data = [data]
             
             for item in data:
-                # 再次過濾：雖然 Prompt 已要求，但程式端再檢查一次 Subject (如果 AI 還是傳了)
-                # 這裡假設 AI 如果回傳了，就是它認為是物理題，除非它明確標示了 subject 欄位且非 Physics
                 if 'subject' in item and item['subject'].lower() not in ['physics', '物理']:
                     continue
+                
+                content_text = (item.get('content', '') + " " + " ".join(item.get('options', []))).lower()
+                physics_keywords = ["牛頓", "速度", "加速度", "電路", "磁場", "光學", "焦耳"]
+                is_cross_subject = any(pk in content_text for pk in physics_keywords)
+                if not is_cross_subject:
+                    if any(ek in content_text for ek in EXCLUDE_KEYWORDS):
+                        continue 
 
                 diagram_bytes = None
                 ref_bytes = None
@@ -289,7 +318,7 @@ def parse_with_gemini(file_bytes, file_type, api_key):
                     image_bytes=diagram_bytes,      
                     ref_image_bytes=ref_bytes,     
                     q_type=item.get('type', 'Single'),
-                    subject='Physics' # 強制標記為 Physics，因為已經過濾過了
+                    subject='Physics' 
                 )
                 cand.content = item.get('content', '')
                 all_candidates.append(cand)
@@ -297,7 +326,8 @@ def parse_with_gemini(file_bytes, file_type, api_key):
         except Exception as e:
             errors.append(f"Batch {batch_idx+1} parsing error: {str(e)}")
             
-        time.sleep(1)
+        # 成功後也要休息，避免下一批馬上撞牆
+        time.sleep(15) 
 
     if not all_candidates and errors:
         return {"error": f"分析失敗詳情: {'; '.join(errors)}"}
