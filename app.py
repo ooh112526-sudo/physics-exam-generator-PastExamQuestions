@@ -7,8 +7,9 @@ import io
 import re
 import pandas as pd
 import os
+import time
 
-# 引用您的 smart_importer.py
+# 引用核心邏輯
 import smart_importer
 
 st.set_page_config(page_title="物理題庫系統 (Gemini AI)", layout="wide", page_icon="🧲")
@@ -36,7 +37,6 @@ def generate_word_files(selected_questions, shuffle=True):
     exam_doc = docx.Document()
     ans_doc = docx.Document()
     
-    # 設定字型
     style = exam_doc.styles['Normal']
     style.font.name = 'Times New Roman'
     style.font.size = Pt(12)
@@ -47,24 +47,15 @@ def generate_word_files(selected_questions, shuffle=True):
     
     for idx, q in enumerate(selected_questions, 1):
         processed_q = q
-        # 簡單的打亂選項邏輯
+        # 簡單選項打亂 (有答案時暫不啟用以免對應錯誤)
         if shuffle and q.type in ['Single', 'Multi'] and not q.answer:
-             # 若沒有答案對照，僅打亂選項顯示 (有答案時需複雜邏輯，此處簡化)
-             # 若要完整打亂且保留答案正確性，需搭配 smart_importer 的完整結構
-             pass
+             random.shuffle(processed_q.options)
 
         p = exam_doc.add_paragraph()
         q_type_text = {'Single': '單選', 'Multi': '多選', 'Fill': '填充'}.get(q.type, '題')
         runner = p.add_run(f"{idx}. ({q_type_text}) {processed_q.content.strip()}")
         runner.bold = True
         
-        # 處理圖片 (若有)
-        if hasattr(q, 'image_data') and q.image_data:
-            try:
-                img_stream = io.BytesIO(q.image_data)
-                exam_doc.add_picture(img_stream, width=Inches(3.0))
-            except: pass
-
         if q.type != 'Fill':
             for i, opt in enumerate(processed_q.options):
                 exam_doc.add_paragraph(f"{opt}") 
@@ -84,7 +75,6 @@ def generate_word_files(selected_questions, shuffle=True):
     return exam_io, ans_io
 
 def parse_docx_tagged(file_bytes):
-    # 這裡保留一個空函式或舊邏輯以避免錯誤
     return []
 
 # ==========================================
@@ -126,8 +116,8 @@ with tab1:
     
     col_method, col_action = st.columns([1, 1])
     with col_method:
-        # 檢查 smart_importer 是否有 OCR 可用
-        ocr_status = " (可用)" if smart_importer.OCR_AVAILABLE else " (未安裝)"
+        # 呼叫 smart_importer 的函式來檢查狀態
+        ocr_status = " (可用)" if smart_importer.is_ocr_available() else " (功能受限: 未安裝 Poppler/Tesseract)"
         parse_method = st.radio("選擇辨識核心", ["Gemini AI (雲端)", f"本機 Regex/OCR{ocr_status}"], index=0)
     
     if raw_file:
@@ -141,13 +131,14 @@ with tab1:
                         st.error("請先在側邊欄輸入 Gemini API Key！")
                     else:
                         with st.spinner("🤖 Gemini 正在閱讀考卷... (約需 10-20 秒)"):
+                            # 呼叫 smart_importer 的 Gemini 函式
                             result = smart_importer.parse_with_gemini(file_bytes, 'pdf', api_key_input)
                             if isinstance(result, dict) and "error" in result:
                                 st.error(result["error"])
                             else:
                                 candidates = result
                 else:
-                    # 使用舊版邏輯 (需確認 smart_importer 有此函式)
+                    # 呼叫 smart_importer 的本機函式
                     candidates = smart_importer.parse_raw_file(io.BytesIO(file_bytes), 'pdf', use_ocr=True)
             
             st.session_state['imported_candidates'] = candidates
@@ -157,18 +148,14 @@ with tab1:
             elif not candidates and "Gemini" not in parse_method:
                  st.warning("本機模式未偵測到題目。請嘗試使用 Gemini AI 模式。")
 
-    # 顯示分析結果
     if st.session_state['imported_candidates']:
         st.divider()
         st.subheader("📋 辨識結果確認")
         
         editor_data = []
         for cand in st.session_state['imported_candidates']:
-            # 處理選項顯示
             opt_display = cand.options
-            if isinstance(opt_display, list):
-                opt_display = "\n".join(opt_display)
-                
+            if isinstance(opt_display, list): opt_display = "\n".join(opt_display)
             editor_data.append({
                 "加入": True,
                 "題號": cand.number,
@@ -190,22 +177,11 @@ with tab1:
         
         if st.button("✅ 確認匯入題庫"):
             count = 0
-            # 取得編輯後的資料
-            # Streamlit data_editor 回傳的是使用者修改後的 DataFrame
-            # 我們需要遍歷這個 DataFrame
-            
-            # 注意：data_editor 回傳的索引可能與原始 list 對應
-            # 但若使用者排序過，index 會亂掉，建議直接使用 edited_df 的資料建立新題目
-            
             for index, row in edited_df.iterrows():
                 if row["加入"]:
-                    # 解析選項字串回列表
                     opts_str = row["選項"]
-                    opts_list = []
-                    if isinstance(opts_str, str):
-                        opts_list = opts_str.split('\n')
-                    elif isinstance(opts_str, list):
-                        opts_list = opts_str
+                    # 處理選項字串轉回列表
+                    opts_list = opts_str.split('\n') if isinstance(opts_str, str) else (opts_str if isinstance(opts_str, list) else [])
                     
                     new_q = Question(
                         q_type="Single" if opts_list else "Fill",
@@ -218,18 +194,16 @@ with tab1:
                     )
                     st.session_state['question_pool'].append(new_q)
                     count += 1
-            
             st.success(f"已匯入 {count} 題！")
-            st.session_state['imported_candidates'] = [] # 清空暫存
-            time.sleep(1) # 讓使用者看到成功訊息
+            st.session_state['imported_candidates'] = []
+            time.sleep(1)
             st.rerun()
 
-# === Tab 2: 手動輸入 ===
+# === Tab 2 & 3: 其他功能 ===
 with tab2:
     st.subheader("手動輸入題目")
-    # 簡易手動輸入介面
     m_source = st.selectbox("來源", SOURCES)
-    m_chap = st.selectbox("章節", PHYSICS_CHAPTERS)
+    m_chap = st.selectbox("章節", list(PHYSICS_CHAPTERS))
     m_content = st.text_area("題目")
     m_opts = st.text_area("選項 (一行一個)")
     if st.button("新增"):
@@ -238,15 +212,14 @@ with tab2:
         st.session_state['question_pool'].append(q)
         st.success("已新增")
 
-# === Tab 3: 組卷匯出 ===
 with tab3:
     st.subheader("下載試卷")
     if st.session_state['question_pool']:
-        st.write(f"目前已選 {len(st.session_state['question_pool'])} 題")
+        st.write(f"已選 {len(st.session_state['question_pool'])} 題")
         if st.button("生成 Word 檔"):
             f1, f2 = generate_word_files(st.session_state['question_pool'])
-            col1, col2 = st.columns(2)
-            col1.download_button("下載試題卷", f1, "exam.docx")
-            col2.download_button("下載答案卷", f2, "ans.docx")
+            c1, c2 = st.columns(2)
+            c1.download_button("下載試題", f1, "exam.docx")
+            c2.download_button("下載詳解", f2, "ans.docx")
     else:
-        st.info("題庫是空的，請先匯入題目")
+        st.info("請先匯入題目")
