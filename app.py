@@ -98,7 +98,7 @@ if 'imported_candidates' not in st.session_state:
     st.session_state['imported_candidates'] = []
 
 # ==========================================
-# 工具函式
+# 工具函式 (Word 生成優化)
 # ==========================================
 def generate_word_files(selected_questions):
     exam_doc = docx.Document()
@@ -128,9 +128,36 @@ def generate_word_files(selected_questions):
                 run.add_picture(io.BytesIO(q.image_data), width=Inches(2.5))
             except: pass
 
-        if q.type in ['Single', 'Multi']:
-            for i, opt in enumerate(q.options):
-                doc.add_paragraph(f"{opt}")
+        # === 智慧選項排版 ===
+        if q.type in ['Single', 'Multi'] and q.options:
+            opts = q.options
+            # 計算平均長度與最大長度
+            max_len = max([len(str(o)) for o in opts]) if opts else 0
+            
+            # 策略：
+            # 1. 非常短 (< 10字)：單行並排
+            # 2. 短 (< 25字)：雙欄排列 (使用表格隱藏邊框)
+            # 3. 長：垂直排列
+            
+            if max_len < 10 and len(opts) > 0:
+                # 單行顯示 (用全形空白分隔)
+                doc.add_paragraph("　　".join(opts))
+                
+            elif max_len < 25 and len(opts) > 0 and len(opts) % 2 == 0:
+                # 雙欄表格
+                table = doc.add_table(rows=(len(opts) // 2), cols=2)
+                table.autofit = True
+                # 移除邊框 (這裡不實作複雜的XML操作，預設無邊框或細線)
+                for i, opt in enumerate(opts):
+                    row = i // 2
+                    col = i % 2
+                    table.cell(row, col).text = opt
+                doc.add_paragraph("") # 表格後空行
+            else:
+                # 垂直排列
+                for opt in opts:
+                    doc.add_paragraph(f"{opt}")
+                    
         elif q.type == 'Fill':
             doc.add_paragraph("答：______________________")
         doc.add_paragraph("") 
@@ -166,7 +193,7 @@ with st.sidebar:
     st.header("設定")
     api_key = st.text_input("Gemini API Key", type="password")
     st.divider()
-    st.metric("題庫數量 (主題)", len(st.session_state['question_pool']))
+    st.metric("題庫數量", len(st.session_state['question_pool']))
     if st.button("強制儲存至雲端"):
         db = firebase_db.get_db()
         if db:
@@ -217,11 +244,8 @@ with tab1:
         st.subheader("3. 匯入校對與截圖")
         st.info("請在此處檢查題型與輸入答案。若未輸入，匯入後仍可編輯。")
         
-        # 已移除「顯示所有科目」Checkbox，直接顯示所有 AI 回傳結果 (後端已過濾)
-        
         for i, cand in enumerate(st.session_state['imported_candidates']):
             with st.container():
-                # 顯示題號，不再特別標示科目，預設就是物理
                 st.markdown(f"**第 {cand.number} 題**")
                 c1, c2 = st.columns([1, 1])
                 
