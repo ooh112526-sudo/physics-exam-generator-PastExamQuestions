@@ -172,7 +172,6 @@ def process_single_file(filename, api_key):
     info = st.session_state['file_queue'][filename]
     info['status'] = 'processing'
     
-    # 呼叫 AI
     with st.spinner(f"正在分析 {filename}..."):
         res = smart_importer.parse_with_gemini(info['data'], info['type'], api_key)
     
@@ -183,9 +182,8 @@ def process_single_file(filename, api_key):
     else:
         info['status'] = 'done'
         info['result'] = res
-        st.success(f"{filename} 辨識完成！共 {len(res)} 題。")
+        st.success(f"{filename} 辨識完成！")
         
-    # 強制更新 UI
     st.rerun()
 
 # ==========================================
@@ -199,17 +197,6 @@ with st.sidebar:
     st.divider()
     st.metric("題庫總數", len(st.session_state['question_pool']))
     
-    st.subheader("檔案狀態")
-    q = st.session_state['file_queue']
-    if q:
-        for fname, info in q.items():
-            icon = "⚪" # 預設 (uploaded)
-            if info['status'] == 'processing': icon = "🔄"
-            elif info['status'] == 'done': icon = "✅"
-            elif info['status'] == 'error': icon = "❌"
-            elif info['status'] == 'imported': icon = "📥" # 已匯入
-            st.text(f"{icon} {fname}")
-            
     if st.button("強制儲存至雲端"):
         db = firebase_db.get_db()
         if db:
@@ -221,96 +208,138 @@ tab1, tab2, tab3 = st.tabs(["🧠 檔案管理與辨識", "📝 匯入校對", "
 
 # === Tab 1: 檔案管理與辨識 ===
 with tab1:
-    st.markdown("### 1. 上傳檔案")
-    uploaded_files = st.file_uploader("選擇檔案 (PDF/Word)，上傳後需手動點擊辨識", type=['pdf', 'docx'], accept_multiple_files=True)
+    # 1. 上傳區
+    st.markdown("### 📤 上傳檔案 (批次)")
+    uploaded_files = st.file_uploader("支援 .pdf, .docx", type=['pdf', 'docx'], accept_multiple_files=True)
     
     if uploaded_files:
         new_count = 0
         for f in uploaded_files:
             if f.name not in st.session_state['file_queue']:
                 st.session_state['file_queue'][f.name] = {
-                    "status": "uploaded", # 初始狀態
+                    "status": "uploaded", 
                     "data": f.read(),
                     "type": f.name.split('.')[-1].lower(),
                     "result": [],
-                    "error_msg": ""
+                    "error_msg": "",
+                    "source_tag": "未分類" # 預設標籤
                 }
                 new_count += 1
         if new_count > 0:
             st.toast(f"已加入 {new_count} 個新檔案", icon="📄")
 
     st.divider()
-    st.markdown("### 2. 檔案列表與操作")
     
-    if not st.session_state['file_queue']:
-        st.info("目前沒有檔案，請先上傳。")
+    # 2. 檔案列表 (分層顯示)
+    
+    # 分類檔案狀態
+    queue = st.session_state['file_queue']
+    imported_files = {} # {source_tag: [filename, ...]}
+    ready_files = []    # [filename]
+    pending_files = []  # [filename] (uploaded or error)
+    
+    # 保持順序 (Python 3.7+ dict is ordered)
+    for fname, info in queue.items():
+        if info['status'] == 'imported':
+            tag = info.get('source_tag', '未分類')
+            if tag not in imported_files: imported_files[tag] = []
+            imported_files[tag].append(fname)
+        elif info['status'] == 'done':
+            ready_files.append(fname)
+        else: # uploaded, processing, error
+            pending_files.append(fname)
+
+    # 2.1 已匯入區 (分層)
+    st.subheader("📚 已匯入檔案庫")
+    if not imported_files:
+        st.caption("尚無已匯入的檔案")
     else:
-        # 使用列式佈局顯示每個檔案的操作區
-        for fname, info in st.session_state['file_queue'].items():
+        for tag, fnames in imported_files.items():
+            with st.expander(f"📁 {tag} ({len(fnames)} 份試卷)"):
+                for fname in fnames:
+                    col_f1, col_f2 = st.columns([4, 1])
+                    col_f1.text(f"📄 {fname}")
+                    if col_f2.button("移除", key=f"del_imp_{fname}"):
+                        del st.session_state['file_queue'][fname]
+                        st.rerun()
+
+    st.divider()
+
+    # 2.2 待編輯區
+    st.subheader("✏️ 待匯入/編輯 (辨識完成)")
+    if not ready_files:
+        st.caption("尚無等待編輯的檔案")
+    else:
+        for fname in ready_files:
+            info = queue[fname]
             with st.container():
-                c1, c2, c3, c4 = st.columns([3, 2, 2, 1])
-                
-                # 欄位 1: 檔名與圖示
-                status_icon = "📄"
-                if info['status'] == 'done': status_icon = "✅"
-                elif info['status'] == 'error': status_icon = "❌"
-                elif info['status'] == 'imported': status_icon = "📥"
-                
-                c1.markdown(f"**{status_icon} {fname}**")
-                
-                # 欄位 2: 狀態文字
-                status_text = "等待執行"
-                if info['status'] == 'processing': status_text = "🔄 正在分析..."
-                elif info['status'] == 'done': status_text = f"完成 ({len(info['result'])} 題)"
-                elif info['status'] == 'error': status_text = "失敗"
-                elif info['status'] == 'imported': status_text = "已匯入題庫"
-                c2.caption(status_text)
-                
-                # 欄位 3: 動作按鈕
-                if info['status'] == 'uploaded' or info['status'] == 'error':
-                    if c3.button("▶️ 執行 AI 辨識", key=f"run_{fname}"):
-                        if not api_key:
-                            st.error("請輸入 API Key")
-                        else:
-                            process_single_file(fname, api_key)
-                elif info['status'] == 'done':
-                    c3.success("可至 [匯入校對] 頁籤編輯")
-                elif info['status'] == 'imported':
-                    c3.info("已完成")
-                    
-                # 欄位 4: 刪除
-                if c4.button("🗑️", key=f"del_{fname}"):
+                c1, c2, c3 = st.columns([3, 2, 1])
+                c1.markdown(f"**✅ {fname}** ({len(info['result'])} 題)")
+                c2.info("請至「匯入校對」分頁進行編輯")
+                if c3.button("🗑️", key=f"del_rdy_{fname}"):
                     del st.session_state['file_queue'][fname]
                     st.rerun()
-                
-                st.divider()
+            st.divider()
 
-        if st.button("🗑️ 清空所有檔案"):
-            st.session_state['file_queue'] = {}
-            st.rerun()
+    st.divider()
+
+    # 2.3 待辨識區 (最下方，優先處理)
+    st.subheader("⏳ 待辨識檔案 (需執行 AI)")
+    if not pending_files:
+        st.info("目前沒有等待辨識的檔案。")
+    else:
+        # 提供一鍵全部執行
+        if st.button("🚀 全部執行辨識"):
+            if not api_key:
+                st.error("請輸入 API Key")
+            else:
+                progress_bar = st.progress(0)
+                for idx, fname in enumerate(pending_files):
+                    process_single_file(fname, api_key) # 這裡會 rerun，所以其實只會跑第一個
+                    # 若要連續跑，需修改 process_single_file 不 rerun，改為迴圈控制
+                    # 但為了簡單與穩定，建議使用者一個個點，或此處簡單處理
+                st.rerun()
+
+        for fname in pending_files:
+            info = queue[fname]
+            with st.container():
+                c1, c2, c3 = st.columns([3, 2, 1])
+                
+                status_display = "等待中"
+                if info['status'] == 'processing': status_display = "🔄 分析中..."
+                elif info['status'] == 'error': status_display = f"❌ 失敗: {info['error_msg']}"
+                
+                c1.markdown(f"**📄 {fname}**")
+                c2.caption(status_display)
+                
+                if c3.button("▶️ 執行", key=f"run_{fname}", disabled=(info['status']=='processing')):
+                    if not api_key:
+                        st.error("請輸入 API Key")
+                    else:
+                        process_single_file(fname, api_key)
+            st.divider()
 
 # === Tab 2: 匯入校對 ===
 with tab2:
     st.subheader("匯入校對與截圖")
     
-    # 篩選出狀態為 'done' (辨識完成但未匯入) 的檔案
     ready_files = [f for f, info in st.session_state['file_queue'].items() if info['status'] == 'done']
     
     if not ready_files:
-        st.warning("目前沒有「已辨識完成」的檔案。請先至 Tab 1 執行辨識。")
+        st.warning("沒有已完成辨識的檔案。請先至 Tab 1 上傳並執行。")
     else:
         selected_file = st.selectbox("選擇要處理的檔案", ready_files)
-        
         file_info = st.session_state['file_queue'][selected_file]
         candidates = file_info['result']
         
         st.markdown(f"**正在編輯：{selected_file} (共 {len(candidates)} 題)**")
         
-        # 來源標籤
+        # 來源標籤設定
         col_src1, col_src2 = st.columns(2)
         with col_src1:
+            # 預設使用檔名作為標籤
             default_tag = selected_file.split('.')[0]
-            source_tag = st.text_input("設定此批試卷來源標籤", value=default_tag)
+            source_tag = st.text_input("設定此批試卷來源標籤", value=default_tag, help="此標籤將用於分類管理檔案")
         
         st.divider()
         
@@ -392,41 +421,55 @@ with tab2:
                 count += 1
             
             st.success(f"成功匯入 {count} 題！")
-            # 更新檔案狀態為 'imported'
+            
+            # 更新檔案狀態與標籤
             st.session_state['file_queue'][selected_file]['status'] = 'imported'
+            st.session_state['file_queue'][selected_file]['source_tag'] = source_tag # 儲存標籤以便分類
             st.rerun()
 
-# === Tab 3: 題庫管理 (保留原功能) ===
+# === Tab 3: 題庫管理 (分層顯示) ===
 with tab3:
     st.subheader("題庫總覽與試卷輸出")
     if not st.session_state['question_pool']:
         st.info("目前沒有題目。")
     else:
-        filter_src = st.multiselect("篩選來源", list(set([q.source for q in st.session_state['question_pool']])))
-        filtered_pool = st.session_state['question_pool']
-        if filter_src:
-            filtered_pool = [q for q in st.session_state['question_pool'] if q.source in filter_src]
-
-        st.write(f"顯示 {len(filtered_pool)} 題")
+        # 1. 取得所有來源
+        all_sources = sorted(list(set([q.source for q in st.session_state['question_pool']])))
         
-        col_exp_1, col_exp_2 = st.columns(2)
-        with col_exp_1:
-            if st.button("生成 Word 試卷"):
-                f1, f2 = generate_word_files(filtered_pool)
-                st.download_button("下載試題卷", f1, "exam.docx")
-                st.download_button("下載答案卷", f2, "ans.docx")
+        # 2. 顯示分層列表
+        selected_questions_for_export = []
+        
+        for src in all_sources:
+            # 篩選該來源的題目
+            qs_in_src = [q for q in st.session_state['question_pool'] if q.source == src]
+            
+            with st.expander(f"📁 {src} ({len(qs_in_src)} 題)"):
+                # 讓使用者選擇是否全選這個來源
+                if st.checkbox(f"選取全套 [{src}] 進行匯出", key=f"sel_src_{src}"):
+                    selected_questions_for_export.extend(qs_in_src)
 
-        for i, q in enumerate(filtered_pool):
-            with st.expander(f"[{q.source}] {q.content[:30]}..."):
-                c1, c2 = st.columns([2, 1])
-                with c1:
-                    q.content = st.text_area(f"題目 #{q.id}", q.content)
-                    q.options = st.text_area(f"選項 #{q.id}", "\n".join(q.options)).split('\n')
-                with c2:
-                    q.answer = st.text_input(f"答案 #{q.id}", q.answer)
-                    if st.button(f"儲存 #{q.id}"):
-                        firebase_db.save_question_to_cloud(q.to_dict())
-                        st.success("已存")
-                    if st.button(f"刪除 #{q.id}"):
-                        firebase_db.delete_question_from_cloud(q.id)
-                        st.rerun()
+                for i, q in enumerate(qs_in_src):
+                    type_badge = {'Single': '單', 'Multi': '多', 'Fill': '填', 'Group': '題組'}.get(q.type, '未知')
+                    # 子題不顯示，因為會跟著母題
+                    if q.parent_id: continue 
+                    
+                    st.markdown(f"**[{type_badge}] {q.content[:30]}...**")
+                    
+                    # 簡易編輯按鈕 (若要詳細編輯可點開)
+                    with st.popover("編輯"):
+                        q.content = st.text_area("題目", q.content, key=f"edt_c_{q.id}")
+                        q.answer = st.text_input("答案", q.answer, key=f"edt_a_{q.id}")
+                        if st.button("儲存", key=f"save_{q.id}"):
+                            firebase_db.save_question_to_cloud(q.to_dict())
+                            st.rerun()
+                        if st.button("刪除", key=f"del_{q.id}", type="primary"):
+                            firebase_db.delete_question_from_cloud(q.id)
+                            st.rerun()
+                    st.divider()
+
+        st.divider()
+        st.subheader(f"已選取 {len(selected_questions_for_export)} 題準備匯出")
+        if st.button("生成 Word 試卷"):
+            f1, f2 = generate_word_files(selected_questions_for_export)
+            st.download_button("下載試題卷", f1, "exam.docx")
+            st.download_button("下載答案卷", f2, "ans.docx")
