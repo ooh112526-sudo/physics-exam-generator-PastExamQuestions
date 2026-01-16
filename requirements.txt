@@ -5,3 +5,4 @@ pandas
 pytesseract
 pdf2image
 pillow
+google-generativeai
