@@ -54,7 +54,7 @@ PHYSICS_CHAPTERS_LIST = [
 # ==========================================
 class SmartQuestionCandidate:
     def __init__(self, raw_text, question_number, options=None, chapter="未分類", 
-                 is_likely=True, status_reason="", image_bytes=None, q_type="Single", ref_image_bytes=None):
+                 is_likely=True, status_reason="", image_bytes=None, q_type="Single", ref_image_bytes=None, subject="Physics"):
         self.raw_text = raw_text
         self.number = question_number
         self.content = raw_text 
@@ -65,6 +65,7 @@ class SmartQuestionCandidate:
         self.image_bytes = image_bytes
         self.ref_image_bytes = ref_image_bytes
         self.q_type = q_type
+        self.subject = subject # 新增科目欄位
 
 # ==========================================
 # 工具函式
@@ -81,17 +82,22 @@ def clean_json_string(json_str):
         json_str = json_str[start:end+1]
     return json_str.strip()
 
-def crop_image(original_img, box_2d):
+def crop_image(original_img, box_2d, padding_x=10, padding_y=10):
+    """
+    裁切圖片，支援自訂 padding
+    box_2d: [ymin, xmin, ymax, xmax] (0-1000)
+    """
     if not box_2d or len(box_2d) != 4: return None
     
     width, height = original_img.size
     ymin, xmin, ymax, xmax = box_2d
     
-    # 增加 padding 並確保不越界
-    ymin = max(0, ymin - 10)
-    ymax = min(1000, ymax + 10)
-    xmin = max(0, xmin - 10)
-    xmax = min(1000, xmax + 10)
+    # 應用 padding (上下左右擴展)
+    # y 軸多擴展一些以涵蓋上下題
+    ymin = max(0, ymin - padding_y)
+    ymax = min(1000, ymax + padding_y)
+    xmin = max(0, xmin - padding_x)
+    xmax = min(1000, xmax + padding_x)
     
     left = (xmin / 1000) * width
     top = (ymin / 1000) * height
@@ -168,15 +174,17 @@ def parse_with_gemini(file_bytes, file_type, api_key):
         if file_type == 'pdf':
             extra_instruction = """
             對於每一題，請回傳兩個座標範圍：
-            1. 'full_question_box_2d': 包含題號、題目文字、選項與圖片的完整區域。
+            1. 'full_question_box_2d': 包含題號、題目文字、選項與圖片的完整區域。請盡量寬鬆，包含到上一題結束與下一題開始的空白處。
             2. 'box_2d': 如果該題有附圖(diagram)，請標示圖片的範圍；若無則省略。
             座標格式皆為 [ymin, xmin, ymax, xmax] (範圍 0-1000)。
             """
         
         prompt = f"""
-        你是一個高中物理老師助理。請詳細分析這 {len(batch_imgs)} 頁考卷圖片。
+        你是一個高中自然科老師助理。這份試卷包含物理、化學、生物、地科。
+        請詳細分析這 {len(batch_imgs)} 頁考卷圖片。
+        
         目標：
-        1. 辨識所有「物理科」試題。
+        1. 辨識所有試題，並判斷科目 (Physics, Chemistry, Biology, EarthScience)。
         2. 判斷題型：Single (單選), Multi (多選), Fill (填充)。
         3. {extra_instruction}
         
@@ -184,19 +192,20 @@ def parse_with_gemini(file_bytes, file_type, api_key):
         [
             {{
                 "number": 1,
+                "subject": "Physics", // 務必準確分類
                 "type": "Single",
                 "content": "題目敘述...",
                 "options": ["(A)...", "(B)..."],
                 "answer": "A",
                 "chapter": "從此清單選擇: {chapters_str}",
-                "full_question_box_2d": [100, 100, 300, 900],
+                "full_question_box_2d": [100, 0, 300, 1000], // 寬度盡量滿版
                 "box_2d": [200, 500, 300, 700],
                 "page_index": 0 
             }}
         ]
         注意：
-        - 若無法判斷章節，請填寫 "未分類"。
         - page_index 代表該題目在「這批圖片」中的索引(從 0 開始)。
+        - 即使是非物理題也要列出，但標記正確科目，方便後端過濾。
         """
 
         input_parts = [prompt]
@@ -205,13 +214,10 @@ def parse_with_gemini(file_bytes, file_type, api_key):
         
         input_parts.extend(batch_imgs)
 
-        # === 關鍵修正：將 gemini-2.5-flash 設為首選，並加入其他可用模型 ===
         candidate_models = [
-            "gemini-2.5-flash",       # 首選
-            "gemini-2.5-pro",         # 次選
-            "gemini-2.0-flash",       # 備用
-            "gemini-2.0-flash-exp",   # 備用
-            "gemini-flash-latest"     # 最後備用
+            "gemini-2.5-flash", "gemini-2.5-pro", 
+            "gemini-2.0-flash", "gemini-2.0-flash-exp", 
+            "gemini-flash-latest"
         ]
         
         generation_config = {"response_mime_type": "application/json"}
@@ -225,7 +231,7 @@ def parse_with_gemini(file_bytes, file_type, api_key):
                 break
             except Exception as e:
                 last_error = e
-                # 嘗試不使用 JSON 模式 (有些舊模型不支援)
+                # 嘗試非 JSON 模式
                 if "mode" in str(e).lower() or "support" in str(e).lower():
                     try:
                         response = model.generate_content(input_parts)
@@ -259,11 +265,19 @@ def parse_with_gemini(file_bytes, file_type, api_key):
                         if 0 <= absolute_idx < len(source_images):
                             src_img = source_images[absolute_idx]
                             
+                            # 1. 附圖 (Diagram) - 保持精準
                             if 'box_2d' in item:
-                                diagram_bytes = crop_image(src_img, item['box_2d'])
+                                diagram_bytes = crop_image(src_img, item['box_2d'], padding_x=5, padding_y=5)
                                 
+                            # 2. 題目完整截圖 (Reference) - 大幅擴張
+                            # 如果 AI 給的 x 範圍太窄，我們強制設為全寬 (0-1000)
                             if 'full_question_box_2d' in item:
-                                ref_bytes = crop_image(src_img, item['full_question_box_2d'])
+                                box = item['full_question_box_2d']
+                                # 強制全寬度 (0, 1000) 以方便閱讀
+                                box[1] = 0    # xmin
+                                box[3] = 1000 # xmax
+                                # 上下大幅擴張 padding_y=50 (約 5% 頁面高度)
+                                ref_bytes = crop_image(src_img, box, padding_x=0, padding_y=50)
                                 
                     except Exception as e:
                         print(f"Image crop error: {e}")
@@ -277,7 +291,8 @@ def parse_with_gemini(file_bytes, file_type, api_key):
                     status_reason=f"Batch {batch_idx+1}",
                     image_bytes=diagram_bytes,      
                     ref_image_bytes=ref_bytes,     
-                    q_type=item.get('type', 'Single')
+                    q_type=item.get('type', 'Single'),
+                    subject=item.get('subject', 'Physics') # 抓取科目
                 )
                 cand.content = item.get('content', '')
                 all_candidates.append(cand)
