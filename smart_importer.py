@@ -60,7 +60,8 @@ EXCLUDE_KEYWORDS = [
 # ==========================================
 class SmartQuestionCandidate:
     def __init__(self, raw_text, question_number, options=None, chapter="未分類", 
-                 is_likely=True, status_reason="", image_bytes=None, q_type="Single", ref_image_bytes=None, subject="Physics"):
+                 is_likely=True, status_reason="", image_bytes=None, q_type="Single", 
+                 ref_image_bytes=None, full_page_bytes=None, subject="Physics"):
         self.raw_text = raw_text
         self.number = question_number
         self.content = raw_text 
@@ -68,8 +69,9 @@ class SmartQuestionCandidate:
         self.predicted_chapter = chapter if chapter in PHYSICS_CHAPTERS_LIST else "未分類"
         self.is_physics_likely = is_likely
         self.status_reason = status_reason
-        self.image_bytes = image_bytes
-        self.ref_image_bytes = ref_image_bytes
+        self.image_bytes = image_bytes      # 這是題目本身附圖 (已裁切)
+        self.ref_image_bytes = ref_image_bytes # 這是題目區域截圖 (供參考)
+        self.full_page_bytes = full_page_bytes # [新增] 這是整頁原始圖 (供手動裁切用)
         self.q_type = q_type
         self.subject = subject
 
@@ -127,6 +129,16 @@ def crop_image(original_img, box_2d, force_full_width=False, padding_y=10):
     except Exception as e:
         print(f"Crop failed: {e}")
         return None
+
+def img_to_bytes(pil_img):
+    """將 PIL Image 轉為 bytes"""
+    if pil_img is None: return None
+    img_byte_arr = io.BytesIO()
+    # 轉為 RGB 避免 RGBA 存成 JPEG 報錯
+    if pil_img.mode in ("RGBA", "P"): 
+        pil_img = pil_img.convert("RGB")
+    pil_img.save(img_byte_arr, format='JPEG')
+    return img_byte_arr.getvalue()
 
 # ==========================================
 # Gemini AI 解析邏輯
@@ -229,12 +241,12 @@ def parse_with_gemini(file_bytes, file_type, api_key):
         
         input_parts.extend(batch_imgs)
 
-        # 2026年模型清單設定：優先使用 Gemini 2.5 系列
+        # 2026年模型清單設定
         candidate_models = [
-            "gemini-2.5-flash",    # 優先使用快速版
-            "gemini-2.5-pro",      # 其次使用 Pro 版
-            "gemini-2.0-flash",    # 備用
-            "gemini-1.5-pro"       # 最後備用
+            "gemini-2.5-flash",    
+            "gemini-2.5-pro",      
+            "gemini-2.0-flash",    
+            "gemini-1.5-pro"       
         ]
         
         generation_config = {"response_mime_type": "application/json"}
@@ -248,7 +260,6 @@ def parse_with_gemini(file_bytes, file_type, api_key):
                 break
             except Exception as e:
                 last_error = e
-                # Retry logic or switch model
                 continue
 
         if not response:
@@ -266,11 +277,9 @@ def parse_with_gemini(file_bytes, file_type, api_key):
             if isinstance(data, dict): data = [data]
             
             for item in data:
-                # 過濾非物理題
                 if 'subject' in item and item['subject'].lower() not in ['physics', '物理']:
                     continue
                 
-                # 排除關鍵字 (雙重保險)
                 content_text = (item.get('content', '') + " " + " ".join(item.get('options', []))).lower()
                 physics_keywords = ["牛頓", "速度", "加速度", "電路", "磁場", "光學", "焦耳"]
                 is_cross_subject = any(pk in content_text for pk in physics_keywords)
@@ -280,6 +289,7 @@ def parse_with_gemini(file_bytes, file_type, api_key):
 
                 diagram_bytes = None
                 ref_bytes = None
+                full_page_bytes = None # 儲存整頁圖片
                 
                 if file_type == 'pdf' and 'page_index' in item:
                     try:
@@ -289,14 +299,17 @@ def parse_with_gemini(file_bytes, file_type, api_key):
                         if 0 <= absolute_idx < len(source_images):
                             src_img = source_images[absolute_idx]
                             
-                            # 1. 附圖 (Diagram) - 保持精準，不強制全寬
+                            # 儲存整頁，供前端裁切使用
+                            full_page_bytes = img_to_bytes(src_img)
+                            
                             if 'box_2d' in item:
                                 diagram_bytes = crop_image(src_img, item['box_2d'], force_full_width=False, padding_y=5)
                                 
-                            # 2. 題目完整截圖 (Reference) - 強制全寬 (0~1000)
                             if 'full_question_box_2d' in item:
-                                # padding_y=50 (擴大上下範圍)
                                 ref_bytes = crop_image(src_img, item['full_question_box_2d'], force_full_width=True, padding_y=50)
+                            else:
+                                # 如果沒有回傳範圍，預設使用整頁
+                                ref_bytes = full_page_bytes
                                 
                     except Exception as e:
                         print(f"Image crop error: {e}")
@@ -309,7 +322,8 @@ def parse_with_gemini(file_bytes, file_type, api_key):
                     is_likely=True,
                     status_reason=f"Batch {batch_idx+1}",
                     image_bytes=diagram_bytes,      
-                    ref_image_bytes=ref_bytes,     
+                    ref_image_bytes=ref_bytes,
+                    full_page_bytes=full_page_bytes, # 傳遞整頁圖片
                     q_type=item.get('type', 'Single'),
                     subject='Physics' 
                 )
