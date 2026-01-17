@@ -1,5 +1,11 @@
 streamlit
 python-docx
+pdfplumber
+pandas
+google-generativeai>=0.7.0
+pytesseract
+pdf2image
+pillow
 google-cloud-firestore
-google-generativeai
-watchdog
+google-cloud-storage
+streamlit-cropper
