@@ -9,3 +9,4 @@ pillow
 google-cloud-firestore
 google-cloud-storage
 streamlit-cropper
+requests
