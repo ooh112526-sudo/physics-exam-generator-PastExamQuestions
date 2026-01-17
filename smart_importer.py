@@ -229,10 +229,12 @@ def parse_with_gemini(file_bytes, file_type, api_key):
         
         input_parts.extend(batch_imgs)
 
+        # 2026年模型清單設定：優先使用 Gemini 2.5 系列
         candidate_models = [
-            "gemini-2.0-flash", # Use the faster model first
-            "gemini-1.5-flash",
-            "gemini-1.5-pro"
+            "gemini-2.5-flash",    # 優先使用快速版
+            "gemini-2.5-pro",      # 其次使用 Pro 版
+            "gemini-2.0-flash",    # 備用
+            "gemini-1.5-pro"       # 最後備用
         ]
         
         generation_config = {"response_mime_type": "application/json"}
