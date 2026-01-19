@@ -25,15 +25,26 @@ st.set_page_config(page_title="物理題庫系統 (Pro)", layout="wide", page_ic
 # ==========================================
 class CloudManager:
     def __init__(self):
-        self.bucket_name = os.getenv("GCS_BUCKET_NAME", "physics-exam-assets") 
+        self.bucket_name = os.getenv("GCS_BUCKET_NAME", "physics-exam-assets")
+        # 嘗試從環境變數讀取 Project ID，若無則設為 None (讓 SDK 自動嘗試偵測)
+        # 建議在 Cloud Run 環境變數中設定 GCP_PROJECT_ID
+        self.project_id = os.getenv("GCP_PROJECT_ID") 
+        
         self.db = None
         self.storage_client = None
         self.has_connection = False
         self.connection_error = ""
         
         try:
-            self.db = firestore.Client()
-            self.storage_client = storage.Client()
+            # 修正：明確指定 project 參數
+            if self.project_id:
+                self.db = firestore.Client(project=self.project_id)
+                self.storage_client = storage.Client(project=self.project_id)
+            else:
+                # 嘗試自動偵測
+                self.db = firestore.Client()
+                self.storage_client = storage.Client()
+                
             self.has_connection = True
         except Exception as e:
             self.connection_error = str(e)
@@ -285,7 +296,12 @@ with st.sidebar:
         st.warning(f"☁️ Cloud: 未連線")
         if cloud_manager.connection_error:
             st.caption(f"錯誤: {cloud_manager.connection_error}")
-            st.info("請確認是否已執行 'gcloud auth application-default login' 或設定 Service Account")
+            
+            # 提示使用者可能缺少的環境變數
+            if "Project was not passed" in cloud_manager.connection_error:
+                st.info("請設定環境變數 'GCP_PROJECT_ID'")
+            else:
+                st.info("請確認 Cloud Run 權限或本機憑證")
 
     st.divider()
     st.metric("題庫總數", len(st.session_state['question_pool']))
@@ -436,7 +452,6 @@ with tab2:
         
         st.divider()
         
-        # 使用 Form 解決卡頓問題
         with st.form(key=f"edit_form_{selected_file}"):
             for i, cand in enumerate(candidates):
                 st.markdown(f"**第 {cand.number} 題**")
@@ -452,7 +467,6 @@ with tab2:
                     cand.q_type = st.selectbox(f"題型 #{i}", ["Single", "Multi", "Fill"], index=type_idx, key=f"{selected_file}_t_{i}")
                     
                     ans_key = f"{selected_file}_ans_{i}"
-                    # 從 session_state 或預設值讀取
                     default_ans = st.session_state.get(ans_key, "")
                     st.text_input(f"答案 (可留空) #{i}", value=default_ans, key=ans_key)
                     
@@ -466,43 +480,23 @@ with tab2:
 
                 with c2:
                     st.markdown("✂️ **截圖工具**")
-                    # 優先使用參考截圖，若無則使用整頁圖片 (Fallback)
                     image_to_crop = cand.ref_image_bytes if cand.ref_image_bytes else cand.full_page_bytes
                     
                     if image_to_crop:
                         try:
                             pil_ref = Image.open(io.BytesIO(image_to_crop))
-                            # 每個 Cropper 需要唯一的 Key
-                            cropped_img = st_cropper(
+                            st_cropper(
                                 pil_ref, realtime_update=True, box_color='#FF0000',
                                 key=f"{selected_file}_cropper_{i}", aspect_ratio=None
                             )
-                            # 在 Form 內無法直接用 Button 觸發 logic，這裡只做顯示
-                            # 截圖動作需移出 Form 或使用 callback
                             st.caption("提示：截圖需在 Form 提交後或獨立操作")
                         except: st.error("截圖載入失敗")
                     else:
                         st.info("無法取得此題的參考圖片 (也無整頁圖片)")
                 st.divider()
             
-            # Form 提交按鈕
-            submit_changes = st.form_submit_button("💾 暫存所有修改 (不會上傳)")
+            st.form_submit_button("💾 暫存所有修改 (不會上傳)")
         
-        # 截圖確認區 (移出 Form 以便即時互動)
-        st.info("👇 若需更新截圖，請在下方操作 (需先在上方調整好紅框)")
-        
-        # 為了避免每個題目都要生成一次按鈕造成混亂，可以做一個「選題處理截圖」的介面
-        # 但為了簡單，這裡示範針對特定題號操作
-        
-        target_q_idx = st.number_input("選擇要更新截圖的題號索引 (0開始)", 0, len(candidates)-1, 0)
-        c_act1, c_act2 = st.columns(2)
-        if c_act1.button("📷 更新該題附圖"):
-            # 嘗試取得該題的 cropper 狀態
-            # Streamlit Cropper 的回傳值是在 Rerun 時才會更新，這裡比較 tricky
-            # 實務上建議將 Cropper 獨立於 Form 之外
-            pass 
-            
-        # 由於 Cropper 在 Form 內會有互動問題，我們將「確認匯入」按鈕保留在最下方
         if st.button(f"✅ 確認匯入 [{selected_file}] 至雲端", type="primary"):
             progress_bar = st.progress(0)
             count = 0
