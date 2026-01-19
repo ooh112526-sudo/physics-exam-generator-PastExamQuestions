@@ -13,11 +13,11 @@ from streamlit_cropper import st_cropper
 import os
 import datetime
 import uuid
+import json  # 新增 json 模組
 from google.cloud import firestore
 from google.cloud import storage
 import google.auth 
 from google.oauth2 import service_account # 新增: 用於讀取 Secrets 金鑰
-import json # 新增 json 模組
 
 import smart_importer
 
@@ -36,7 +36,7 @@ class CloudManager:
         self.project_id = None
 
         try:
-            # 優先嘗試：從 Streamlit Secrets 讀取 (適用於 Streamlit Cloud)
+            # 策略 1：優先嘗試從 Streamlit Secrets 讀取 (適用於 Streamlit Cloud)
             if "gcp_service_account" in st.secrets:
                 try:
                     service_account_info = st.secrets["gcp_service_account"]
@@ -46,13 +46,13 @@ class CloudManager:
                     self.db = firestore.Client(credentials=creds, project=self.project_id)
                     self.storage_client = storage.Client(credentials=creds, project=self.project_id)
                     self.has_connection = True
-                    print("已透過 Streamlit Secrets 連線至 Google Cloud")
+                    # print("已透過 Streamlit Secrets 連線至 Google Cloud")
                     return 
                 except Exception as e:
                     print(f"Streamlit Secrets 連線失敗: {e}")
 
-            # 嘗試：從環境變數讀取 JSON 字串 (適用於 Cloud Run)
-            # 我們將整個 JSON 內容壓縮成一行字串放在 GCP_SERVICE_ACCOUNT_JSON 環境變數中
+            # 策略 2：嘗試從環境變數讀取 JSON 字串 (適用於 Cloud Run 繞過檔案限制)
+            # 請在 Cloud Run 環境變數設定 GCP_SERVICE_ACCOUNT_JSON，值為 JSON 檔案的完整內容
             service_account_json = os.getenv("GCP_SERVICE_ACCOUNT_JSON")
             if service_account_json:
                 try:
@@ -60,19 +60,20 @@ class CloudManager:
                     creds = service_account.Credentials.from_service_account_info(service_account_info)
                     self.project_id = service_account_info.get("project_id")
                     
-                    # 強制設定 Project ID，避免自動偵測失敗
+                    # 確保有 Project ID
                     if not self.project_id:
                          self.project_id = os.getenv("GCP_PROJECT_ID")
 
                     self.db = firestore.Client(credentials=creds, project=self.project_id)
                     self.storage_client = storage.Client(credentials=creds, project=self.project_id)
                     self.has_connection = True
-                    print("已透過環境變數 JSON 連線至 Google Cloud")
+                    # print("已透過環境變數 JSON 連線至 Google Cloud")
                     return
                 except Exception as e:
                     print(f"環境變數 JSON 連線失敗: {e}")
 
-            # 備用嘗試：Cloud Run 自動偵測 (Workload Identity Federation)
+            # 策略 3：備用嘗試 Cloud Run 自動偵測 (Workload Identity)
+            # 如果沒有設定金鑰，嘗試使用預設服務帳號
             self.project_id = (
                 os.getenv("GCP_PROJECT_ID") or 
                 os.getenv("GOOGLE_CLOUD_PROJECT")
@@ -90,6 +91,7 @@ class CloudManager:
                 self.storage_client = storage.Client(project=self.project_id)
                 self.has_connection = True
             else:
+                # 最後嘗試：完全不帶參數 (依賴 SDK 預設行為)
                 self.db = firestore.Client()
                 self.storage_client = storage.Client()
                 self.has_connection = True
@@ -98,94 +100,33 @@ class CloudManager:
             self.connection_error = str(e)
             print(f"Cloud 連線初始化失敗: {e}")
 
-
-import smart_importer
-
-st.set_page_config(page_title="物理題庫系統 (Pro)", layout="wide", page_icon="🧲")
-
-# ==========================================
-# 雲端資料庫與儲存模組
-# ==========================================
-class CloudManager:
-    def __init__(self):
-        # 1. 取得設定
-        self.bucket_name = os.getenv("GCS_BUCKET_NAME", "physics-exam-assets")
-        
-        # 嘗試讀取 Project ID
-        self.project_id = (
-            os.getenv("GCP_PROJECT_ID") or 
-            os.getenv("GOOGLE_CLOUD_PROJECT")
-        )
-        
-        self.db = None
-        self.storage_client = None
-        self.has_connection = False
-        self.connection_info = "初始化中..."
-        
-        try:
-            # 優先嘗試：Streamlit Secrets (僅適用於 Streamlit Cloud + 私人 Gmail)
-            if "gcp_service_account" in st.secrets:
-                try:
-                    service_account_info = st.secrets["gcp_service_account"]
-                    creds = service_account.Credentials.from_service_account_info(service_account_info)
-                    self.project_id = service_account_info.get("project_id")
-                    self.db = firestore.Client(credentials=creds, project=self.project_id)
-                    self.storage_client = storage.Client(credentials=creds, project=self.project_id)
-                    self.has_connection = True
-                    self.connection_info = "✅ 使用 Secrets 金鑰連線"
-                    return 
-                except Exception as e:
-                    print(f"Secrets 連線失敗: {e}")
-
-            # 其次嘗試：Cloud Run 自動偵測
-            if not self.project_id:
-                try:
-                    _, auth_project_id = google.auth.default()
-                    if auth_project_id:
-                        self.project_id = auth_project_id
-                except: pass
-
-            # 建立連線
-            if self.project_id:
-                self.db = firestore.Client(project=self.project_id)
-                self.storage_client = storage.Client(project=self.project_id)
-                self.has_connection = True
-                self.connection_info = f"✅ Cloud Run 自動連線 (Project: {self.project_id})"
-            else:
-                # 最後嘗試不帶參數
-                self.db = firestore.Client()
-                self.storage_client = storage.Client()
-                self.has_connection = True
-                self.connection_info = "✅ SDK 預設連線"
-                
-        except Exception as e:
-            self.connection_info = f"❌ 連線失敗: {str(e)}"
-            print(f"Cloud Init Error: {e}")
-
     def upload_bytes(self, file_bytes, filename, folder="uploads", content_type=None):
         if not self.storage_client: return None
         try:
-            # 支援 Secrets 設定 Bucket
-            target_bucket = self.bucket_name
-            if not target_bucket and "GCS_BUCKET_NAME" in st.secrets:
-                target_bucket = st.secrets["GCS_BUCKET_NAME"]
-                
-            if not target_bucket:
-                st.error("⚠️ 未設定 Bucket 名稱 (GCS_BUCKET_NAME)")
+            # 支援從 Secrets 讀取 Bucket 名稱
+            target_bucket_name = self.bucket_name
+            if not target_bucket_name and "GCS_BUCKET_NAME" in st.secrets:
+                target_bucket_name = st.secrets["GCS_BUCKET_NAME"]
+            
+            if not target_bucket_name:
+                st.error("未設定 Bucket 名稱 (GCS_BUCKET_NAME)")
                 return None
 
-            bucket = self.storage_client.bucket(target_bucket)
+            bucket = self.storage_client.bucket(target_bucket_name)
+            # 確保檔名安全並唯一
             unique_name = f"{folder}/{int(datetime.datetime.now().timestamp())}_{str(uuid.uuid4())[:8]}_{filename}"
             blob = bucket.blob(unique_name)
             blob.upload_from_string(file_bytes, content_type=content_type)
             return blob.public_url 
         except Exception as e:
-            st.error(f"上傳圖片失敗: {e}")
+            print(f"上傳 Storage 失敗: {e}")
+            # st.toast(f"上傳圖片失敗: {e}", icon="⚠️")
             return None
 
     def save_question(self, question_dict):
         if not self.db: return False
         try:
+            # 處理 Base64 圖片轉 URL
             if question_dict.get("image_data_b64"):
                 try:
                     img_bytes = base64.b64decode(question_dict["image_data_b64"])
@@ -195,12 +136,12 @@ class CloudManager:
                         question_dict["image_url"] = img_url
                         del question_dict["image_data_b64"]
                 except Exception as e:
-                    print(f"圖片處理錯誤: {e}")
+                    print(f"圖片轉存失敗: {e}")
             
             self.db.collection("questions").document(question_dict["id"]).set(question_dict)
             return True
         except Exception as e:
-            st.error(f"資料庫寫入失敗: {e}")
+            st.error(f"儲存題目失敗: {e}")
             return False
 
     def load_questions(self):
@@ -219,7 +160,7 @@ class CloudManager:
         if self.db:
             self.db.collection("questions").document(doc_id).delete()
 
-# 初始化
+# 初始化雲端管理員
 cloud_manager = CloudManager()
 
 # ==========================================
@@ -237,8 +178,8 @@ class Question:
         self.content = content
         self.options = options if options else []
         self.answer = answer
-        self.image_data = image_data 
-        self.image_url = image_url   
+        self.image_data = image_data # 二進位 (編輯時優先使用)
+        self.image_url = image_url   # 雲端連結 (顯示時使用)
         
         self.parent_id = parent_id 
         self.is_group_parent = is_group_parent 
@@ -259,7 +200,7 @@ class Question:
             "content": self.content,
             "options": self.options,
             "answer": self.answer,
-            "image_data_b64": img_str, 
+            "image_data_b64": img_str, # 暫存用，cloud_manager 會轉存成 URL
             "image_url": self.image_url,
             "parent_id": self.parent_id,
             "is_group_parent": self.is_group_parent,
@@ -270,6 +211,8 @@ class Question:
     def from_dict(data):
         img_bytes = None
         img_url = data.get("image_url")
+
+        # 若有 Base64 (舊資料或同步失敗殘留)，優先轉回 bytes
         if data.get("image_data_b64"):
             try:
                 img_bytes = base64.b64decode(data["image_data_b64"])
@@ -289,10 +232,13 @@ class Question:
             parent_id=data.get("parent_id"),
             is_group_parent=data.get("is_group_parent", False)
         )
+        
         if data.get("sub_questions"):
             q.sub_questions = [Question.from_dict(sub) for sub in data["sub_questions"]]
+            
         return q
 
+# === Session State 初始化 ===
 if 'question_pool' not in st.session_state:
     st.session_state['question_pool'] = []
     # 延遲載入，避免 UI 卡住
@@ -309,12 +255,16 @@ if 'file_queue' not in st.session_state:
 # 工具函式
 # ==========================================
 def get_image_bytes(q):
-    if q.image_data: return q.image_data
+    """取得圖片 Bytes (優先使用記憶體中的，若無則從 URL 下載)"""
+    if q.image_data:
+        return q.image_data
     if q.image_url:
         try:
             response = requests.get(q.image_url, timeout=3)
-            if response.status_code == 200: return response.content
-        except: return None
+            if response.status_code == 200:
+                return response.content
+        except:
+            return None
     return None
 
 def generate_word_files(selected_questions):
@@ -338,17 +288,18 @@ def generate_word_files(selected_questions):
         runner = p.add_run(f"{idx_str}. {src_label}{type_label} {q.content.strip()}")
         runner.bold = True
         
+        # 處理圖片顯示
         img_bytes = get_image_bytes(q)
         if img_bytes:
             try:
                 img_p = doc.add_paragraph()
                 run = img_p.add_run()
                 run.add_picture(io.BytesIO(img_bytes), width=Inches(2.5))
-            except: pass
+            except Exception as e:
+                print(f"Word 圖片寫入錯誤: {e}")
 
         if q.type in ['Single', 'Multi'] and q.options:
             opts = q.options
-            # 簡單排版判斷
             max_len = max([len(str(o)) for o in opts]) if opts else 0
             if max_len < 10 and len(opts) > 0:
                 doc.add_paragraph("　　".join(opts))
@@ -388,11 +339,14 @@ def generate_word_files(selected_questions):
     return exam_io, ans_io
 
 def process_single_file(filename, api_key):
+    """處理單一檔案的 AI 辨識"""
     if filename not in st.session_state['file_queue']: return
+    
     info = st.session_state['file_queue'][filename]
     info['status'] = 'processing'
     
     with st.spinner(f"正在分析 {filename}..."):
+        # 呼叫 smart_importer 進行解析
         res = smart_importer.parse_with_gemini(info['data'], info['type'], api_key)
     
     if isinstance(res, dict) and "error" in res:
@@ -403,6 +357,7 @@ def process_single_file(filename, api_key):
         info['status'] = 'done'
         info['result'] = res
         st.success(f"{filename} 辨識完成！")
+        
     st.rerun()
 
 # ==========================================
@@ -411,22 +366,28 @@ def process_single_file(filename, api_key):
 st.title("🧲 物理題庫系統 Pro (Cloud Storage)")
 
 with st.sidebar:
-    st.header("系統狀態")
-    # 顯示連線狀態，方便除錯
-    if cloud_manager.has_connection:
-        st.success(cloud_manager.connection_info)
-    else:
-        st.error(cloud_manager.connection_info)
-        st.info("請改用 Cloud Run 部署，並在設定中加入 GCP_PROJECT_ID 環境變數。")
-
-    st.divider()
-    
     st.header("設定")
+    # 嘗試從環境變數讀取 API Key (部署時)，若無則顯示輸入框
     env_api_key = os.getenv("GOOGLE_API_KEY", "")
     api_key_input = st.text_input("Gemini API Key", value=env_api_key, type="password")
     
+    # 檢查 Cloud 連線狀態
+    if cloud_manager.has_connection:
+        st.success("☁️ Cloud: 已連線")
+    else:
+        st.warning(f"☁️ Cloud: 未連線")
+        if cloud_manager.connection_error:
+            st.caption(f"錯誤: {cloud_manager.connection_error}")
+            # 提示使用者可能缺少的環境變數
+            if "Project was not passed" in cloud_manager.connection_error:
+                st.info("請到 Cloud Run 設定變數 GCP_PROJECT_ID")
+            elif "No secrets found" in cloud_manager.connection_error:
+                st.info("Secrets 未設定，請改用環境變數 GCP_SERVICE_ACCOUNT_JSON")
+
+    st.divider()
     st.metric("題庫總數", len(st.session_state['question_pool']))
     
+    # 強制備份按鈕
     if st.button("強制儲存至雲端"):
         if cloud_manager.has_connection:
             progress_bar = st.progress(0)
@@ -440,6 +401,7 @@ tab1, tab2, tab3 = st.tabs(["🧠 檔案管理與辨識", "📝 匯入校對", "
 
 # === Tab 1: 檔案管理與辨識 ===
 with tab1:
+    # 1. 上傳區
     st.markdown("### 📤 上傳檔案 (批次)")
     uploaded_files = st.file_uploader("支援 .pdf, .docx", type=['pdf', 'docx'], accept_multiple_files=True)
     
@@ -449,7 +411,7 @@ with tab1:
             if f.name not in st.session_state['file_queue']:
                 file_bytes = f.read()
                 
-                # 自動備份
+                # [核心功能] 自動備份原始檔案到 Cloud Storage
                 backup_url = cloud_manager.upload_bytes(
                     file_bytes, 
                     f.name, 
@@ -458,7 +420,8 @@ with tab1:
                 )
                 
                 status_msg = "uploaded"
-                if backup_url: status_msg += " (已備份)"
+                if backup_url:
+                    status_msg += " (已備份)"
                 
                 st.session_state['file_queue'][f.name] = {
                     "status": "uploaded", 
@@ -467,7 +430,7 @@ with tab1:
                     "result": [],
                     "error_msg": "",
                     "source_tag": "未分類",
-                    "backup_url": backup_url 
+                    "backup_url": backup_url # 記錄備份連結
                 }
                 new_count += 1
         if new_count > 0:
@@ -475,6 +438,7 @@ with tab1:
 
     st.divider()
     
+    # 2. 檔案列表 (分層顯示)
     queue = st.session_state['file_queue']
     imported_files = {} 
     ready_files = []    
@@ -490,6 +454,7 @@ with tab1:
         else: 
             pending_files.append(fname)
 
+    # 2.1 已匯入區
     st.subheader("📚 已匯入檔案庫")
     if not imported_files:
         st.caption("尚無已匯入的檔案")
@@ -499,17 +464,21 @@ with tab1:
                 for fname in fnames:
                     col_f1, col_f2, col_f3 = st.columns([3, 1, 1])
                     col_f1.text(f"📄 {fname}")
+                    
+                    # 顯示下載備份連結
                     info = queue.get(fname)
                     if info and info.get('backup_url'):
                         col_f2.link_button("下載原始檔", info['backup_url'])
                     else:
                         col_f2.caption("無備份")
+
                     if col_f3.button("移除", key=f"del_imp_{fname}"):
                         del st.session_state['file_queue'][fname]
                         st.rerun()
 
     st.divider()
 
+    # 2.2 待編輯區
     st.subheader("✏️ 待匯入/編輯 (辨識完成)")
     if not ready_files:
         st.caption("尚無等待編輯的檔案")
@@ -527,12 +496,14 @@ with tab1:
 
     st.divider()
 
+    # 2.3 待辨識區
     st.subheader("⏳ 待辨識檔案 (需執行 AI)")
     if not pending_files:
         st.info("目前沒有等待辨識的檔案。")
     else:
         if st.button("🚀 全部執行辨識"):
-            if not api_key_input: st.error("請輸入 API Key")
+            if not api_key_input:
+                st.error("請輸入 API Key")
             else:
                 progress_bar = st.progress(0)
                 for idx, fname in enumerate(pending_files):
@@ -543,6 +514,7 @@ with tab1:
             info = queue[fname]
             with st.container():
                 c1, c2, c3 = st.columns([3, 2, 1])
+                
                 status_display = "等待中"
                 if info.get('backup_url'): status_display += " | ☁️ 已備份"
                 
@@ -553,17 +525,20 @@ with tab1:
                 c2.caption(status_display)
                 
                 if c3.button("▶️ 執行", key=f"run_{fname}", disabled=(info['status']=='processing')):
-                    if not api_key_input: st.error("請輸入 API Key")
-                    else: process_single_file(fname, api_key_input)
+                    if not api_key_input:
+                        st.error("請輸入 API Key")
+                    else:
+                        process_single_file(fname, api_key_input)
             st.divider()
 
 # === Tab 2: 匯入校對 ===
 with tab2:
     st.subheader("匯入校對與截圖")
+    
     ready_files = [f for f, info in st.session_state['file_queue'].items() if info['status'] == 'done']
     
     if not ready_files:
-        st.warning("沒有已完成辨識的檔案。")
+        st.warning("沒有已完成辨識的檔案。請先至 Tab 1 上傳並執行。")
     else:
         selected_file = st.selectbox("選擇要處理的檔案", ready_files)
         file_info = st.session_state['file_queue'][selected_file]
@@ -582,15 +557,17 @@ with tab2:
             for i, cand in enumerate(candidates):
                 st.markdown(f"**第 {cand.number} 題**")
                 c1, c2 = st.columns([1, 1])
+                
                 with c1:
                     cand.content = st.text_area(f"題目內容 #{i}", cand.content, height=100, key=f"{selected_file}_c_{i}")
+                    
                     opts_text = "\n".join(cand.options)
                     new_opts = st.text_area(f"選項 #{i}", opts_text, height=80, key=f"{selected_file}_o_{i}")
                     cand.options = new_opts.split('\n') if new_opts else []
                     
                     type_idx = ["Single", "Multi", "Fill"].index(cand.q_type) if cand.q_type in ["Single", "Multi", "Fill"] else 0
                     cand.q_type = st.selectbox(f"題型 #{i}", ["Single", "Multi", "Fill"], index=type_idx, key=f"{selected_file}_t_{i}")
-                    
+
                     ans_key = f"{selected_file}_ans_{i}"
                     default_ans = st.session_state.get(ans_key, "")
                     st.text_input(f"答案 (可留空) #{i}", value=default_ans, key=ans_key)
@@ -600,8 +577,10 @@ with tab2:
                         chap_idx = smart_importer.PHYSICS_CHAPTERS_LIST.index(cand.predicted_chapter)
                     cand.predicted_chapter = st.selectbox(f"章節分類 #{i}", smart_importer.PHYSICS_CHAPTERS_LIST, index=chap_idx, key=f"{selected_file}_ch_{i}")
                     
-                    if cand.image_bytes: st.image(cand.image_bytes, caption="目前附圖", width=200)
-                    else: st.caption("🚫 目前無附圖")
+                    if cand.image_bytes:
+                        st.image(cand.image_bytes, caption="目前附圖", width=200)
+                    else:
+                        st.caption("🚫 目前無附圖")
 
                 with c2:
                     st.markdown("✂️ **截圖工具**")
@@ -610,8 +589,11 @@ with tab2:
                         try:
                             pil_ref = Image.open(io.BytesIO(image_to_crop))
                             st_cropper(
-                                pil_ref, realtime_update=True, box_color='#FF0000',
-                                key=f"{selected_file}_cropper_{i}", aspect_ratio=None
+                                pil_ref, 
+                                realtime_update=True, 
+                                box_color='#FF0000',
+                                key=f"{selected_file}_cropper_{i}",
+                                aspect_ratio=None
                             )
                             st.caption("提示：截圖需在 Form 提交後或獨立操作")
                         except: st.error("截圖載入失敗")
@@ -621,12 +603,14 @@ with tab2:
             
             st.form_submit_button("💾 暫存所有修改 (不會上傳)")
         
+        # 確認匯入按鈕
         if st.button(f"✅ 確認匯入 [{selected_file}] 至雲端", type="primary"):
             progress_bar = st.progress(0)
             count = 0
             total = len(candidates)
             for i, cand in enumerate(candidates):
                 ans_val = st.session_state.get(f"{selected_file}_ans_{i}", "")
+                
                 new_q = Question(
                     q_type=cand.q_type,
                     content=cand.content,
@@ -636,11 +620,16 @@ with tab2:
                     image_data=cand.image_bytes,
                     answer=ans_val 
                 )
+                
+                # 自動儲存至雲端 (含圖片轉存)
                 cloud_manager.save_question(new_q.to_dict())
+                
                 st.session_state['question_pool'].append(new_q)
                 count += 1
                 progress_bar.progress((i + 1) / total)
+            
             st.success(f"成功匯入 {count} 題！")
+            
             st.session_state['file_queue'][selected_file]['status'] = 'imported'
             st.session_state['file_queue'][selected_file]['source_tag'] = source_tag 
             st.rerun()
@@ -652,18 +641,27 @@ with tab3:
         st.info("目前沒有題目。")
     else:
         all_sources = sorted(list(set([q.source for q in st.session_state['question_pool']])))
+        
         selected_questions_for_export = []
+        
         for src in all_sources:
             qs_in_src = [q for q in st.session_state['question_pool'] if q.source == src]
+            
             with st.expander(f"📁 {src} ({len(qs_in_src)} 題)"):
                 if st.checkbox(f"選取全套 [{src}] 進行匯出", key=f"sel_src_{src}"):
                     selected_questions_for_export.extend(qs_in_src)
+
                 for i, q in enumerate(qs_in_src):
                     type_badge = {'Single': '單', 'Multi': '多', 'Fill': '填', 'Group': '題組'}.get(q.type, '未知')
                     if q.parent_id: continue 
+                    
                     st.markdown(f"**[{type_badge}] {q.content[:30]}...**")
-                    if q.image_url: st.caption("🖼️ 雲端圖片")
-                    elif q.image_data: st.caption("💾 本機圖片 (未同步)")
+                    
+                    if q.image_url:
+                        st.caption("🖼️ 雲端圖片")
+                    elif q.image_data:
+                        st.caption("💾 本機圖片 (未同步)")
+                        
                     with st.popover("編輯"):
                         q.content = st.text_area("題目", q.content, key=f"edt_c_{q.id}")
                         q.answer = st.text_input("答案", q.answer, key=f"edt_a_{q.id}")
