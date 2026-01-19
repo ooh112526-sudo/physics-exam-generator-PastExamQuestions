@@ -15,6 +15,7 @@ import datetime
 import uuid
 from google.cloud import firestore
 from google.cloud import storage
+import google.auth # 新增: 用於自動偵測專案 ID
 
 import smart_importer
 
@@ -27,32 +28,42 @@ class CloudManager:
     def __init__(self):
         self.bucket_name = os.getenv("GCS_BUCKET_NAME", "physics-exam-assets")
         
-        # [修正邏輯] 嘗試從多種來源讀取 Project ID，增加相容性
+        # 1. 嘗試從環境變數讀取 Project ID
         self.project_id = (
             os.getenv("GCP_PROJECT_ID") or 
             os.getenv("GOOGLE_CLOUD_PROJECT") or 
             st.secrets.get("GCP_PROJECT_ID")
         )
         
+        # 2. 如果環境變數沒設，嘗試使用 Google Auth 自動偵測 (適用於 Cloud Run)
+        if not self.project_id:
+            try:
+                #這會嘗試從環境憑證中獲取專案ID
+                _, project_id_from_auth = google.auth.default()
+                if project_id_from_auth:
+                    self.project_id = project_id_from_auth
+                    print(f"已透過 Google Auth 自動偵測到 Project ID: {self.project_id}")
+            except Exception as e:
+                print(f"Google Auth 自動偵測失敗: {e}")
+
         self.db = None
         self.storage_client = None
         self.has_connection = False
         self.connection_error = ""
         
         try:
-            # 明確指定 project 參數，避免自動偵測失敗
+            # 初始化 Client，明確傳入 project 參數
             if self.project_id:
                 self.db = firestore.Client(project=self.project_id)
                 self.storage_client = storage.Client(project=self.project_id)
             else:
-                # 若真的沒設定，讓 SDK 嘗試最後一次自動偵測 (通常在本機有 gcloud login 時有效)
+                # 最後嘗試：不帶參數初始化 (依賴 SDK 內部預設行為)
                 self.db = firestore.Client()
                 self.storage_client = storage.Client()
                 
             self.has_connection = True
         except Exception as e:
             self.connection_error = str(e)
-            # 在 Log 中印出詳細錯誤以便除錯
             print(f"Cloud 連線初始化失敗: {e}")
 
     def upload_bytes(self, file_bytes, filename, folder="uploads", content_type=None):
@@ -67,13 +78,13 @@ class CloudManager:
             return blob.public_url 
         except Exception as e:
             print(f"上傳 Storage 失敗: {e}")
-            st.toast(f"上傳圖片失敗，請檢查 Bucket 權限: {e}", icon="⚠️")
+            st.toast(f"上傳圖片失敗: {e}", icon="⚠️")
             return None
 
     def save_question(self, question_dict):
         if not self.db: return False
         try:
-            # 處理 Base64 圖片轉 URL (減少資料庫負擔)
+            # 處理 Base64 圖片轉 URL
             if question_dict.get("image_data_b64"):
                 try:
                     img_bytes = base64.b64decode(question_dict["image_data_b64"])
@@ -81,7 +92,6 @@ class CloudManager:
                     img_url = self.upload_bytes(img_bytes, fname, folder="question_images", content_type="image/png")
                     if img_url:
                         question_dict["image_url"] = img_url
-                        # 移除肥大的 Base64 字串
                         del question_dict["image_data_b64"]
                 except Exception as e:
                     print(f"圖片轉存失敗: {e}")
@@ -327,7 +337,7 @@ with st.sidebar:
             
             # 提示使用者可能缺少的環境變數
             if "Project was not passed" in cloud_manager.connection_error:
-                st.info("請到 Cloud Run 設定環境變數 'GCP_PROJECT_ID'")
+                st.error("⚠️ 請至 Cloud Run 設定變數: GCP_PROJECT_ID")
             else:
                 st.info("請確認 Cloud Run 權限或本機憑證")
 
