@@ -39,27 +39,15 @@ class CloudManager:
         self.project_id = None
         self.credentials = None 
 
+        # ---------------------------------------------------------
+        # 修正：調整連線策略順序，優先檢查環境變數以避免 Cloud Run 報錯
+        # ---------------------------------------------------------
         try:
-            # Strategy 1: Try reading from Streamlit Secrets (for Streamlit Cloud)
-            if "gcp_service_account" in st.secrets:
-                try:
-                    service_account_info = st.secrets["gcp_service_account"]
-                    self.credentials = service_account.Credentials.from_service_account_info(service_account_info)
-                    
-                    self.project_id = service_account_info.get("project_id")
-                    self.db = firestore.Client(credentials=self.credentials, project=self.project_id)
-                    self.storage_client = storage.Client(credentials=self.credentials, project=self.project_id)
-                    self.has_connection = True
-                    if self.has_connection: self._ensure_bucket_exists()
-                    return 
-                except Exception as e:
-                    print(f"Streamlit Secrets connection failed: {e}")
-
-            # Strategy 2: Try reading JSON string from environment variable (for Cloud Run)
+            # Strategy 1: Try reading JSON string from environment variable (Priority for Cloud Run)
             service_account_json = os.getenv("GCP_SERVICE_ACCOUNT_JSON")
             if service_account_json:
                 try:
-                    # Clean up potential formatting issues from copy-paste
+                    # Clean up potential formatting issues
                     service_account_json = service_account_json.strip()
                     if service_account_json.startswith("'") and service_account_json.endswith("'"):
                          service_account_json = service_account_json[1:-1]
@@ -74,12 +62,34 @@ class CloudManager:
                     self.db = firestore.Client(credentials=self.credentials, project=self.project_id)
                     self.storage_client = storage.Client(credentials=self.credentials, project=self.project_id)
                     self.has_connection = True
-                    if self.has_connection: self._ensure_bucket_exists()
-                    return
+                    # If connected via Env Var, we skip st.secrets to avoid "No secrets found" error
+                    if self.has_connection: 
+                        self._ensure_bucket_exists()
+                        return 
                 except Exception as e:
                     print(f"Environment variable JSON connection failed: {e}")
 
-            # Strategy 3: Cloud Run Automatic Detection (Workload Identity)
+            # Strategy 2: Try reading from Streamlit Secrets (Secondary, for Streamlit Cloud)
+            # Wrap in try-except because accessing st.secrets raises error if file missing
+            try:
+                if "gcp_service_account" in st.secrets:
+                    try:
+                        service_account_info = st.secrets["gcp_service_account"]
+                        self.credentials = service_account.Credentials.from_service_account_info(service_account_info)
+                        
+                        self.project_id = service_account_info.get("project_id")
+                        self.db = firestore.Client(credentials=self.credentials, project=self.project_id)
+                        self.storage_client = storage.Client(credentials=self.credentials, project=self.project_id)
+                        self.has_connection = True
+                        if self.has_connection: self._ensure_bucket_exists()
+                        return 
+                    except Exception as e:
+                        print(f"Streamlit Secrets connection failed: {e}")
+            except (FileNotFoundError, Exception):
+                # Ignore if secrets file is missing (expected on Cloud Run)
+                pass
+
+            # Strategy 3: Cloud Run Automatic Detection (Workload Identity / Default Creds)
             self.project_id = (
                 os.getenv("GCP_PROJECT_ID") or 
                 os.getenv("GOOGLE_CLOUD_PROJECT")
@@ -102,9 +112,11 @@ class CloudManager:
                 self.has_connection = True
             else:
                 # Last resort: Try default client
-                self.db = firestore.Client()
-                self.storage_client = storage.Client()
-                self.has_connection = True
+                try:
+                    self.db = firestore.Client()
+                    self.storage_client = storage.Client()
+                    self.has_connection = True
+                except: pass
             
             if self.has_connection: self._ensure_bucket_exists()
 
@@ -117,8 +129,12 @@ class CloudManager:
         if not self.storage_client: return
         try:
             target_bucket_name = self.bucket_name
-            if not target_bucket_name and "GCS_BUCKET_NAME" in st.secrets:
-                target_bucket_name = st.secrets["GCS_BUCKET_NAME"]
+            # Fallback to secrets if env var not set
+            if not target_bucket_name:
+                try:
+                    if "GCS_BUCKET_NAME" in st.secrets:
+                        target_bucket_name = st.secrets["GCS_BUCKET_NAME"]
+                except: pass
             
             if target_bucket_name:
                 bucket = self.storage_client.bucket(target_bucket_name)
@@ -134,8 +150,11 @@ class CloudManager:
         if not self.storage_client: return None
         try:
             target_bucket_name = self.bucket_name
-            if not target_bucket_name and "GCS_BUCKET_NAME" in st.secrets:
-                target_bucket_name = st.secrets["GCS_BUCKET_NAME"]
+            if not target_bucket_name:
+                try:
+                    if "GCS_BUCKET_NAME" in st.secrets:
+                        target_bucket_name = st.secrets["GCS_BUCKET_NAME"]
+                except: pass
             
             if not target_bucket_name:
                 st.error("Bucket name (GCS_BUCKET_NAME) not set")
@@ -408,9 +427,7 @@ with st.sidebar:
         st.warning(f"☁️ Cloud: 未連線")
         if cloud_manager.connection_error:
             st.caption(f"錯誤: {cloud_manager.connection_error}")
-            if "Project was not passed" in cloud_manager.connection_error:
-                st.error("⚠️ 請至 Cloud Run 設定變數: GCP_PROJECT_ID")
-            elif "No secrets found" in cloud_manager.connection_error:
+            if "No secrets found" in cloud_manager.connection_error:
                 st.info("Secrets 未設定，請改用環境變數 GCP_SERVICE_ACCOUNT_JSON")
 
     st.divider()
