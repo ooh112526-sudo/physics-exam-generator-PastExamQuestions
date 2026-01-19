@@ -376,6 +376,7 @@ def process_single_file(filename, api_key):
     info['status'] = 'processing'
     
     with st.spinner(f"正在分析 {filename}..."):
+        # 呼叫 smart_importer 進行解析
         res = smart_importer.parse_with_gemini(info['data'], info['type'], api_key)
     
     if isinstance(res, dict) and "error" in res:
