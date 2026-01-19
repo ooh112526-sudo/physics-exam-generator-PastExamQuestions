@@ -69,9 +69,9 @@ class SmartQuestionCandidate:
         self.predicted_chapter = chapter if chapter in PHYSICS_CHAPTERS_LIST else "未分類"
         self.is_physics_likely = is_likely
         self.status_reason = status_reason
-        self.image_bytes = image_bytes      # 這是題目本身附圖 (已裁切)
-        self.ref_image_bytes = ref_image_bytes # 這是題目區域截圖 (供參考)
-        self.full_page_bytes = full_page_bytes # [新增] 這是整頁原始圖 (供手動裁切用)
+        self.image_bytes = image_bytes      # 題目附圖 (已裁切)
+        self.ref_image_bytes = ref_image_bytes # 題目區域截圖 (供參考)
+        self.full_page_bytes = full_page_bytes # [新增] 整頁原始圖 (供手動裁切用)
         self.q_type = q_type
         self.subject = subject
 
@@ -91,25 +91,18 @@ def clean_json_string(json_str):
     return json_str.strip()
 
 def crop_image(original_img, box_2d, force_full_width=False, padding_y=10):
-    """
-    裁切圖片
-    force_full_width: 是否強制寬度為整張圖片 (解決右側被切掉的問題)
-    """
     if not box_2d or len(box_2d) != 4: return None
     
     width, height = original_img.size
     ymin, xmin, ymax, xmax = box_2d
     
-    # 應用 padding (上下擴展)
     ymin = max(0, ymin - padding_y)
     ymax = min(1000, ymax + padding_y)
     
-    # 決定左右範圍
     if force_full_width:
         left = 0
         right = width
     else:
-        # 一般附圖裁切，稍微加點 padding
         xmin = max(0, xmin - 10)
         xmax = min(1000, xmax + 10)
         left = (xmin / 1000) * width
@@ -134,7 +127,6 @@ def img_to_bytes(pil_img):
     """將 PIL Image 轉為 bytes"""
     if pil_img is None: return None
     img_byte_arr = io.BytesIO()
-    # 轉為 RGB 避免 RGBA 存成 JPEG 報錯
     if pil_img.mode in ("RGBA", "P"): 
         pil_img = pil_img.convert("RGB")
     pil_img.save(img_byte_arr, format='JPEG')
@@ -214,25 +206,6 @@ def parse_with_gemini(file_bytes, file_type, api_key):
         
         輸出格式：JSON List
         {extra_instruction}
-        
-        JSON 格式範例：
-        [
-            {{
-                "number": 1,
-                "subject": "Physics", 
-                "type": "Single",
-                "content": "題目敘述...",
-                "options": ["(A)...", "(B)..."],
-                "answer": "A",
-                "chapter": "從此清單選擇: {chapters_str}",
-                "full_question_box_2d": [100, 0, 300, 1000],
-                "box_2d": [200, 500, 300, 700],
-                "page_index": 0 
-            }}
-        ]
-        注意：
-        - page_index 代表該題目在「這批圖片」中的索引(從 0 開始)。
-        - 即使是非物理題也要列出，但標記正確科目，方便後端過濾。
         """
 
         input_parts = [prompt]
@@ -241,7 +214,7 @@ def parse_with_gemini(file_bytes, file_type, api_key):
         
         input_parts.extend(batch_imgs)
 
-        # 2026年模型清單設定
+        # 優先使用 2.5 系列
         candidate_models = [
             "gemini-2.5-flash",    
             "gemini-2.5-pro",      
@@ -289,7 +262,7 @@ def parse_with_gemini(file_bytes, file_type, api_key):
 
                 diagram_bytes = None
                 ref_bytes = None
-                full_page_bytes = None # 儲存整頁圖片
+                full_page_bytes = None 
                 
                 if file_type == 'pdf' and 'page_index' in item:
                     try:
@@ -299,7 +272,7 @@ def parse_with_gemini(file_bytes, file_type, api_key):
                         if 0 <= absolute_idx < len(source_images):
                             src_img = source_images[absolute_idx]
                             
-                            # 儲存整頁，供前端裁切使用
+                            # 保存整頁圖，作為截圖的 Fallback
                             full_page_bytes = img_to_bytes(src_img)
                             
                             if 'box_2d' in item:
@@ -308,8 +281,7 @@ def parse_with_gemini(file_bytes, file_type, api_key):
                             if 'full_question_box_2d' in item:
                                 ref_bytes = crop_image(src_img, item['full_question_box_2d'], force_full_width=True, padding_y=50)
                             else:
-                                # 如果沒有回傳範圍，預設使用整頁
-                                ref_bytes = full_page_bytes
+                                ref_bytes = full_page_bytes # 若 AI 沒給座標，就給整頁
                                 
                     except Exception as e:
                         print(f"Image crop error: {e}")
@@ -323,7 +295,7 @@ def parse_with_gemini(file_bytes, file_type, api_key):
                     status_reason=f"Batch {batch_idx+1}",
                     image_bytes=diagram_bytes,      
                     ref_image_bytes=ref_bytes,
-                    full_page_bytes=full_page_bytes, # 傳遞整頁圖片
+                    full_page_bytes=full_page_bytes, # [關鍵] 傳遞整頁圖片
                     q_type=item.get('type', 'Single'),
                     subject='Physics' 
                 )
