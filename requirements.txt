@@ -8,5 +8,5 @@ pdf2image
 pillow
 google-cloud-firestore
 google-cloud-storage
+google-auth
 streamlit-cropper
-requests
