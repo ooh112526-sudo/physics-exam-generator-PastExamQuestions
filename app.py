@@ -13,18 +13,21 @@ from streamlit_cropper import st_cropper
 import os
 import datetime
 import uuid
-import json  # 新增 json 模組
+import json  # Import json module
 from google.cloud import firestore
 from google.cloud import storage
 import google.auth 
-from google.oauth2 import service_account # 新增: 用於讀取 Secrets 金鑰
+from google.oauth2 import service_account # Import for reading Secrets keys
 
 import smart_importer
+
+# Remove external firebase_db import to prevent ModuleNotFoundError
+# import firebase_db 
 
 st.set_page_config(page_title="物理題庫系統 (Pro)", layout="wide", page_icon="🧲")
 
 # ==========================================
-# 雲端資料庫與儲存模組 (內建)
+# Cloud Database & Storage Module (Built-in)
 # ==========================================
 class CloudManager:
     def __init__(self):
@@ -34,10 +37,10 @@ class CloudManager:
         self.has_connection = False
         self.connection_error = ""
         self.project_id = None
-        self.credentials = None # 新增：儲存憑證以便簽署 URL
+        self.credentials = None 
 
         try:
-            # 策略 1：優先嘗試從 Streamlit Secrets 讀取 (適用於 Streamlit Cloud)
+            # Strategy 1: Try reading from Streamlit Secrets (for Streamlit Cloud)
             if "gcp_service_account" in st.secrets:
                 try:
                     service_account_info = st.secrets["gcp_service_account"]
@@ -47,16 +50,20 @@ class CloudManager:
                     self.db = firestore.Client(credentials=self.credentials, project=self.project_id)
                     self.storage_client = storage.Client(credentials=self.credentials, project=self.project_id)
                     self.has_connection = True
-                    # print("已透過 Streamlit Secrets 連線至 Google Cloud")
                     if self.has_connection: self._ensure_bucket_exists()
                     return 
                 except Exception as e:
-                    print(f"Streamlit Secrets 連線失敗: {e}")
+                    print(f"Streamlit Secrets connection failed: {e}")
 
-            # 策略 2：嘗試從環境變數讀取 JSON 字串 (適用於 Cloud Run 繞過檔案限制)
+            # Strategy 2: Try reading JSON string from environment variable (for Cloud Run)
             service_account_json = os.getenv("GCP_SERVICE_ACCOUNT_JSON")
             if service_account_json:
                 try:
+                    # Clean up potential formatting issues from copy-paste
+                    service_account_json = service_account_json.strip()
+                    if service_account_json.startswith("'") and service_account_json.endswith("'"):
+                         service_account_json = service_account_json[1:-1]
+                    
                     service_account_info = json.loads(service_account_json)
                     self.credentials = service_account.Credentials.from_service_account_info(service_account_info)
                     self.project_id = service_account_info.get("project_id")
@@ -67,13 +74,12 @@ class CloudManager:
                     self.db = firestore.Client(credentials=self.credentials, project=self.project_id)
                     self.storage_client = storage.Client(credentials=self.credentials, project=self.project_id)
                     self.has_connection = True
-                    # print("已透過環境變數 JSON 連線至 Google Cloud")
                     if self.has_connection: self._ensure_bucket_exists()
                     return
                 except Exception as e:
-                    print(f"環境變數 JSON 連線失敗: {e}")
+                    print(f"Environment variable JSON connection failed: {e}")
 
-            # 策略 3：備用嘗試 Cloud Run 自動偵測 (Workload Identity)
+            # Strategy 3: Cloud Run Automatic Detection (Workload Identity)
             self.project_id = (
                 os.getenv("GCP_PROJECT_ID") or 
                 os.getenv("GOOGLE_CLOUD_PROJECT")
@@ -81,14 +87,12 @@ class CloudManager:
             
             if not self.project_id:
                 try:
-                    # 這裡會自動抓取預設憑證
                     self.credentials, project_id_from_auth = google.auth.default()
                     if project_id_from_auth:
                         self.project_id = project_id_from_auth
                 except: pass
 
             if self.project_id:
-                # 若有 credentials 就傳入，否則只傳 project_id
                 if self.credentials:
                     self.db = firestore.Client(credentials=self.credentials, project=self.project_id)
                     self.storage_client = storage.Client(credentials=self.credentials, project=self.project_id)
@@ -97,7 +101,7 @@ class CloudManager:
                     self.storage_client = storage.Client(project=self.project_id)
                 self.has_connection = True
             else:
-                # 最後嘗試：不帶參數 (依賴 SDK 預設行為)
+                # Last resort: Try default client
                 self.db = firestore.Client()
                 self.storage_client = storage.Client()
                 self.has_connection = True
@@ -106,10 +110,10 @@ class CloudManager:
 
         except Exception as e:
             self.connection_error = str(e)
-            print(f"Cloud 連線初始化失敗: {e}")
+            print(f"Cloud connection initialization failed: {e}")
 
     def _ensure_bucket_exists(self):
-        """檢查 Bucket 是否存在，不存在則嘗試建立"""
+        """Check if Bucket exists, if not try to create it"""
         if not self.storage_client: return
         try:
             target_bucket_name = self.bucket_name
@@ -119,12 +123,12 @@ class CloudManager:
             if target_bucket_name:
                 bucket = self.storage_client.bucket(target_bucket_name)
                 if not bucket.exists():
-                    print(f"Bucket {target_bucket_name} 不存在，嘗試建立...")
-                    # 預設建立在 us-central1 (免費額度區)
+                    print(f"Bucket {target_bucket_name} does not exist, attempting to create...")
+                    # Default to us-central1
                     bucket.create(location="us-central1") 
-                    print(f"Bucket {target_bucket_name} 建立成功")
+                    print(f"Bucket {target_bucket_name} created successfully")
         except Exception as e:
-            print(f"自動建立 Bucket 失敗 (可能是權限不足或名稱重複): {e}")
+            print(f"Failed to auto-create bucket (permission or name conflict): {e}")
 
     def upload_bytes(self, file_bytes, filename, folder="uploads", content_type=None):
         if not self.storage_client: return None
@@ -134,7 +138,7 @@ class CloudManager:
                 target_bucket_name = st.secrets["GCS_BUCKET_NAME"]
             
             if not target_bucket_name:
-                st.error("未設定 Bucket 名稱 (GCS_BUCKET_NAME)")
+                st.error("Bucket name (GCS_BUCKET_NAME) not set")
                 return None
 
             bucket = self.storage_client.bucket(target_bucket_name)
@@ -142,10 +146,8 @@ class CloudManager:
             blob = bucket.blob(unique_name)
             blob.upload_from_string(file_bytes, content_type=content_type)
             
-            # [關鍵] 針對私有 Bucket 產生簽名 URL (有效期限 7 天)
-            # 這需要 Service Account Token Creator 權限
+            # Generate Signed URL for private buckets
             try:
-                # 如果有明確的 credentials 或是預設憑證支援簽署
                 url = blob.generate_signed_url(
                     version="v4",
                     expiration=datetime.timedelta(days=7),
@@ -155,18 +157,17 @@ class CloudManager:
                 )
                 return url
             except Exception as sign_err:
-                # print(f"無法產生 Signed URL (嘗試公開 URL): {sign_err}")
-                # Fallback: 如果無法簽署，回傳 public_url (若 Bucket 非公開則會失效)
+                print(f"Could not generate Signed URL (fallback to public): {sign_err}")
                 return blob.public_url 
 
         except Exception as e:
-            print(f"上傳 Storage 失敗: {e}")
+            print(f"Storage upload failed: {e}")
             return None
 
     def save_question(self, question_dict):
         if not self.db: return False
         try:
-            # 處理 Base64 圖片轉 URL
+            # Handle Base64 Image to URL conversion
             if question_dict.get("image_data_b64"):
                 try:
                     img_bytes = base64.b64decode(question_dict["image_data_b64"])
@@ -176,12 +177,12 @@ class CloudManager:
                         question_dict["image_url"] = img_url
                         del question_dict["image_data_b64"]
                 except Exception as e:
-                    print(f"圖片轉存失敗: {e}")
+                    print(f"Image transfer failed: {e}")
             
             self.db.collection("questions").document(question_dict["id"]).set(question_dict)
             return True
         except Exception as e:
-            st.error(f"儲存題目失敗: {e}")
+            st.error(f"Database write failed: {e}")
             return False
 
     def load_questions(self):
@@ -193,18 +194,18 @@ class CloudManager:
                 questions.append(doc.to_dict())
             return questions
         except Exception as e:
-            st.error(f"讀取題庫失敗: {e}")
+            st.error(f"Failed to load question bank: {e}")
             return []
 
     def delete_question(self, doc_id):
         if self.db:
             self.db.collection("questions").document(doc_id).delete()
 
-# 初始化雲端管理員
+# Initialize Cloud Manager
 cloud_manager = CloudManager()
 
 # ==========================================
-# 資料結構與狀態初始化
+# Data Structures & State Initialization
 # ==========================================
 class Question:
     def __init__(self, q_type, content, options=None, answer=None, original_id=0, image_data=None, 
@@ -286,7 +287,7 @@ if 'file_queue' not in st.session_state:
     st.session_state['file_queue'] = {}
 
 # ==========================================
-# 工具函式
+# Utility Functions
 # ==========================================
 def get_image_bytes(q):
     if q.image_data: return q.image_data
@@ -324,7 +325,8 @@ def generate_word_files(selected_questions):
                 img_p = doc.add_paragraph()
                 run = img_p.add_run()
                 run.add_picture(io.BytesIO(img_bytes), width=Inches(2.5))
-            except: pass
+            except Exception as e:
+                print(f"Word picture error: {e}")
 
         if q.type in ['Single', 'Multi'] and q.options:
             opts = q.options
@@ -367,7 +369,9 @@ def generate_word_files(selected_questions):
     return exam_io, ans_io
 
 def process_single_file(filename, api_key):
+    """處理單一檔案的 AI 辨識"""
     if filename not in st.session_state['file_queue']: return
+    
     info = st.session_state['file_queue'][filename]
     info['status'] = 'processing'
     
@@ -382,10 +386,11 @@ def process_single_file(filename, api_key):
         info['status'] = 'done'
         info['result'] = res
         st.success(f"{filename} 辨識完成！")
+        
     st.rerun()
 
 # ==========================================
-# 介面
+# Interface
 # ==========================================
 st.title("🧲 物理題庫系統 Pro (Cloud Storage)")
 
@@ -396,11 +401,12 @@ with st.sidebar:
     
     if cloud_manager.has_connection:
         st.success("☁️ Cloud: 已連線")
+        if cloud_manager.bucket_name:
+            st.caption(f"Bucket: {cloud_manager.bucket_name}")
     else:
         st.warning(f"☁️ Cloud: 未連線")
         if cloud_manager.connection_error:
             st.caption(f"錯誤: {cloud_manager.connection_error}")
-            
             if "Project was not passed" in cloud_manager.connection_error:
                 st.error("⚠️ 請至 Cloud Run 設定變數: GCP_PROJECT_ID")
             elif "No secrets found" in cloud_manager.connection_error:
@@ -420,7 +426,7 @@ with st.sidebar:
 
 tab1, tab2, tab3 = st.tabs(["🧠 檔案管理與辨識", "📝 匯入校對", "📚 題庫管理"])
 
-# === Tab 1: 檔案管理與辨識 ===
+# === Tab 1: File Management ===
 with tab1:
     st.markdown("### 📤 上傳檔案 (批次)")
     uploaded_files = st.file_uploader("支援 .pdf, .docx", type=['pdf', 'docx'], accept_multiple_files=True)
@@ -431,6 +437,7 @@ with tab1:
             if f.name not in st.session_state['file_queue']:
                 file_bytes = f.read()
                 
+                # Auto Backup
                 backup_url = cloud_manager.upload_bytes(
                     file_bytes, 
                     f.name, 
@@ -439,7 +446,8 @@ with tab1:
                 )
                 
                 status_msg = "uploaded"
-                if backup_url: status_msg += " (已備份)"
+                if backup_url:
+                    status_msg += " (已備份)"
                 
                 st.session_state['file_queue'][f.name] = {
                     "status": "uploaded", 
@@ -513,7 +521,8 @@ with tab1:
         st.info("目前沒有等待辨識的檔案。")
     else:
         if st.button("🚀 全部執行辨識"):
-            if not api_key_input: st.error("請輸入 API Key")
+            if not api_key_input:
+                st.error("請輸入 API Key")
             else:
                 progress_bar = st.progress(0)
                 for idx, fname in enumerate(pending_files):
@@ -534,17 +543,19 @@ with tab1:
                 c2.caption(status_display)
                 
                 if c3.button("▶️ 執行", key=f"run_{fname}", disabled=(info['status']=='processing')):
-                    if not api_key_input: st.error("請輸入 API Key")
-                    else: process_single_file(fname, api_key_input)
+                    if not api_key_input:
+                        st.error("請輸入 API Key")
+                    else:
+                        process_single_file(fname, api_key_input)
             st.divider()
 
-# === Tab 2: 匯入校對 ===
+# === Tab 2: Edit & Review ===
 with tab2:
     st.subheader("匯入校對與截圖")
     ready_files = [f for f, info in st.session_state['file_queue'].items() if info['status'] == 'done']
     
     if not ready_files:
-        st.warning("沒有已完成辨識的檔案。")
+        st.warning("沒有已完成辨識的檔案。請先至 Tab 1 上傳並執行。")
     else:
         selected_file = st.selectbox("選擇要處理的檔案", ready_files)
         file_info = st.session_state['file_queue'][selected_file]
@@ -621,7 +632,7 @@ with tab2:
             st.session_state['file_queue'][selected_file]['source_tag'] = source_tag 
             st.rerun()
 
-# === Tab 3: 題庫管理 ===
+# === Tab 3: Question Bank ===
 with tab3:
     st.subheader("題庫總覽與試卷輸出")
     if not st.session_state['question_pool']:
