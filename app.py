@@ -16,7 +16,88 @@ import uuid
 from google.cloud import firestore
 from google.cloud import storage
 import google.auth 
-from google.oauth2 import service_account
+from google.oauth2 import service_account # 新增: 用於讀取 Secrets 金鑰
+import json # 新增 json 模組
+
+import smart_importer
+
+st.set_page_config(page_title="物理題庫系統 (Pro)", layout="wide", page_icon="🧲")
+
+# ==========================================
+# 雲端資料庫與儲存模組 (內建)
+# ==========================================
+class CloudManager:
+    def __init__(self):
+        self.bucket_name = os.getenv("GCS_BUCKET_NAME", "physics-exam-assets")
+        self.db = None
+        self.storage_client = None
+        self.has_connection = False
+        self.connection_error = ""
+        self.project_id = None
+
+        try:
+            # 優先嘗試：從 Streamlit Secrets 讀取 (適用於 Streamlit Cloud)
+            if "gcp_service_account" in st.secrets:
+                try:
+                    service_account_info = st.secrets["gcp_service_account"]
+                    creds = service_account.Credentials.from_service_account_info(service_account_info)
+                    
+                    self.project_id = service_account_info.get("project_id")
+                    self.db = firestore.Client(credentials=creds, project=self.project_id)
+                    self.storage_client = storage.Client(credentials=creds, project=self.project_id)
+                    self.has_connection = True
+                    print("已透過 Streamlit Secrets 連線至 Google Cloud")
+                    return 
+                except Exception as e:
+                    print(f"Streamlit Secrets 連線失敗: {e}")
+
+            # 嘗試：從環境變數讀取 JSON 字串 (適用於 Cloud Run)
+            # 我們將整個 JSON 內容壓縮成一行字串放在 GCP_SERVICE_ACCOUNT_JSON 環境變數中
+            service_account_json = os.getenv("GCP_SERVICE_ACCOUNT_JSON")
+            if service_account_json:
+                try:
+                    service_account_info = json.loads(service_account_json)
+                    creds = service_account.Credentials.from_service_account_info(service_account_info)
+                    self.project_id = service_account_info.get("project_id")
+                    
+                    # 強制設定 Project ID，避免自動偵測失敗
+                    if not self.project_id:
+                         self.project_id = os.getenv("GCP_PROJECT_ID")
+
+                    self.db = firestore.Client(credentials=creds, project=self.project_id)
+                    self.storage_client = storage.Client(credentials=creds, project=self.project_id)
+                    self.has_connection = True
+                    print("已透過環境變數 JSON 連線至 Google Cloud")
+                    return
+                except Exception as e:
+                    print(f"環境變數 JSON 連線失敗: {e}")
+
+            # 備用嘗試：Cloud Run 自動偵測 (Workload Identity Federation)
+            self.project_id = (
+                os.getenv("GCP_PROJECT_ID") or 
+                os.getenv("GOOGLE_CLOUD_PROJECT")
+            )
+            
+            if not self.project_id:
+                try:
+                    _, project_id_from_auth = google.auth.default()
+                    if project_id_from_auth:
+                        self.project_id = project_id_from_auth
+                except: pass
+
+            if self.project_id:
+                self.db = firestore.Client(project=self.project_id)
+                self.storage_client = storage.Client(project=self.project_id)
+                self.has_connection = True
+            else:
+                self.db = firestore.Client()
+                self.storage_client = storage.Client()
+                self.has_connection = True
+            
+        except Exception as e:
+            self.connection_error = str(e)
+            print(f"Cloud 連線初始化失敗: {e}")
+
 
 import smart_importer
 
