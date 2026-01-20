@@ -162,17 +162,15 @@ class CloudManager:
 
     # --- 檔案庫管理功能 ---
     
-    # [新增] 檢查檔案是否已存在
     def check_file_exists(self, filename):
         """檢查 Firestore 中是否有同名檔案"""
         if not self.db: return None
         try:
-            # 查詢 exam_files 集合中 filename 欄位等於 filename 的文件
             docs = self.db.collection("exam_files").where("filename", "==", filename).limit(1).stream()
             for doc in docs:
                 data = doc.to_dict()
                 data['id'] = doc.id
-                return data # 回傳已存在的檔案資料
+                return data 
             return None
         except Exception as e:
             print(f"檢查檔案失敗: {e}")
@@ -182,7 +180,6 @@ class CloudManager:
         """儲存或更新檔案記錄"""
         if not self.db: return False
         try:
-            # 如果是覆蓋，使用舊 ID；否則生成新 ID
             doc_id = overwrite_id if overwrite_id else str(uuid.uuid4())
             file_info["id"] = doc_id
             file_info["updated_at"] = datetime.datetime.now()
@@ -535,117 +532,156 @@ with tab_files:
                     st.rerun()
             st.divider()
 
-# === Tab 2: 上傳與辨識 (含重複檢查) ===
+# === Tab 2: 上傳與辨識 (含重複檢查與個別重新命名) ===
 with tab_upload_process:
     st.markdown("### 📤 上傳新考古題")
+    st.info("請先選擇檔案，設定各自的標籤後，系統將自動重新命名並上傳。")
     
-    # 使用 Form 之前，先上傳檔案以檢查重複
-    # 為了實現「上傳前檢查」，我們不能把 file_uploader 放在 form 裡面，因為 form 只在 submit 時傳送
-    # 所以這裡將流程拆開：先上傳 -> 檢查 -> 填寫資料 -> 確認儲存
-    
+    # 這裡只負責「選擇檔案」，還不真正上傳到雲端
     uploaded_files = st.file_uploader("支援 .pdf, .docx", type=['pdf', 'docx'], accept_multiple_files=True)
     
-    # 檢查是否有重複檔案
-    duplicate_files = []
     if uploaded_files:
-        for f in uploaded_files:
-            existing = cloud_manager.check_file_exists(f.name)
-            if existing:
-                duplicate_files.append((f, existing))
-    
-    # 顯示重複警告與操作選項
-    files_to_process = []
-    if duplicate_files:
-        st.warning(f"⚠️ 發現 {len(duplicate_files)} 個檔名重複的檔案！")
-        
-        # 讓使用者決定每個重複檔案的處理方式
-        overwrite_decisions = {} # {filename: True/False}
-        
-        for f, existing_record in duplicate_files:
-            col_warn, col_opt = st.columns([3, 1])
-            with col_warn:
-                st.markdown(f"**{f.name}** (上次上傳：{existing_record.get('updated_at', '未知時間')})")
-            with col_opt:
-                # 預設不覆蓋 (False)
-                decision = st.radio(f"處理方式 ({f.name})", ["跳過", "覆蓋"], key=f"dup_{f.name}")
-                if decision == "覆蓋":
-                    files_to_process.append((f, existing_record['id'])) # 傳入舊 ID 以便更新
-                else:
-                    st.caption("將略過此檔案")
-    
-    # 加入非重複的檔案
-    if uploaded_files:
-        for f in uploaded_files:
-            is_dup = False
-            for dup_f, _ in duplicate_files:
-                if f.name == dup_f.name:
-                    is_dup = True
-                    break
-            if not is_dup:
-                files_to_process.append((f, None)) # None 代表新檔案
-
-    # 顯示 metadata 表單 (只有當有檔案要處理時)
-    if files_to_process:
         st.divider()
-        st.info(f"準備處理 {len(files_to_process)} 個檔案")
+        st.subheader("設定檔案資訊")
         
-        with st.form("upload_meta_form"):
-            col_m1, col_m2, col_m3 = st.columns(3)
-            with col_m1:
-                u_type = st.selectbox("考試類型", ["學測", "分科", "北模", "中模", "全模", "其他"])
-            with col_m2:
-                u_year = st.text_input("年度 (例如 112)", value="112")
-            with col_m3:
-                u_exam_no = st.selectbox("考試次別", ["第一次", "第二次", "第三次", "正式考試"])
+        # 暫存使用者設定的參數，用檔名當 Key
+        # 如果 session_state 裡還沒初始化，先初始化
+        if 'upload_configs' not in st.session_state:
+            st.session_state['upload_configs'] = {}
+
+        # 批次套用工具
+        with st.expander("批次設定 (一次套用給下方所有檔案)"):
+            c_batch1, c_batch2, c_batch3, c_batch4 = st.columns(4)
+            with c_batch1: b_type = st.selectbox("統一類型", ["學測", "分科", "北模", "中模", "全模", "其他"], key="batch_type")
+            with c_batch2: b_year = st.text_input("統一年度", value="112", key="batch_year")
+            with c_batch3: b_exam_no = st.selectbox("統一考試次別", ["第一次", "第二次", "第三次", "正式考試"], key="batch_no")
+            with c_batch4: 
+                if st.button("全部套用"):
+                    for uf in uploaded_files:
+                        st.session_state['upload_configs'][uf.name] = {
+                            "type": b_type,
+                            "year": b_year,
+                            "exam_no": b_exam_no
+                        }
+                    st.success("已套用！請檢查下方設定。")
+
+        # 逐一顯示檔案設定列
+        files_to_upload = [] # 準備打包上傳的清單 [(file_obj, new_filename, type, year, no)]
+        
+        for i, f in enumerate(uploaded_files):
+            # 取得目前的設定 (若無則給預設值)
+            current_config = st.session_state['upload_configs'].get(f.name, {
+                "type": "學測", "year": "112", "exam_no": "正式考試"
+            })
             
-            submitted = st.form_submit_button("確認上傳")
-            
-            if submitted:
-                success_count = 0
-                progress_bar = st.progress(0)
+            with st.container():
+                c1, c2, c3, c4 = st.columns([3, 2, 2, 2])
+                with c1: 
+                    st.markdown(f"**{i+1}. {f.name}**")
+                    # 預覽新檔名
+                    ext = f.name.split('.')[-1]
+                    new_name = f"{current_config['year']}-{current_config['type']}-{current_config['exam_no']}.{ext}"
+                    st.caption(f"➝ 將命名為: `{new_name}`")
                 
-                for idx, (f, old_id) in enumerate(files_to_process):
-                    file_bytes = f.read()
-                    f.seek(0) # 重置指標，確保讀取正確
+                with c2: 
+                    new_type = st.selectbox("類型", ["學測", "分科", "北模", "中模", "全模", "其他"], 
+                                          index=["學測", "分科", "北模", "中模", "全模", "其他"].index(current_config['type']),
+                                          key=f"type_{f.name}")
+                with c3: 
+                    new_year = st.text_input("年度", value=current_config['year'], key=f"year_{f.name}")
+                with c4: 
+                    new_no = st.selectbox("次別", ["第一次", "第二次", "第三次", "正式考試"], 
+                                        index=["第一次", "第二次", "第三次", "正式考試"].index(current_config['exam_no']),
+                                        key=f"no_{f.name}")
+                
+                # 更新 session_state
+                st.session_state['upload_configs'][f.name] = {
+                    "type": new_type, "year": new_year, "exam_no": new_no
+                }
+                
+                # 加入待處理清單
+                # 生成新檔名
+                final_new_name = f"{new_year}-{new_type}-{new_no}.{f.name.split('.')[-1]}"
+                files_to_upload.append({
+                    "file_obj": f,
+                    "new_filename": final_new_name,
+                    "type": new_type,
+                    "year": new_year,
+                    "exam_no": new_no
+                })
+            st.divider()
+
+        # 確認上傳按鈕
+        if st.button("確認並上傳所有檔案", type="primary"):
+            # 1. 先檢查是否有新檔名重複
+            duplicate_warnings = []
+            for item in files_to_upload:
+                existing = cloud_manager.check_file_exists(item['new_filename'])
+                if existing:
+                    duplicate_warnings.append(f"{item['new_filename']} (原: {item['file_obj'].name})")
+            
+            if duplicate_warnings:
+                st.error(f"發現雲端已有重複檔名，請修改年度或次別：\n" + "\n".join(duplicate_warnings))
+            else:
+                # 2. 開始上傳
+                progress_bar = st.progress(0)
+                success_count = 0
+                
+                for idx, item in enumerate(files_to_upload):
+                    f = item['file_obj']
+                    new_fname = item['new_filename']
                     
-                    # 1. 上傳 Storage (覆蓋同名檔案)
+                    # 讀取檔案內容
+                    f.seek(0)
+                    file_bytes = f.read()
+                    
+                    # 上傳到 Storage (使用新檔名)
                     backup_url = cloud_manager.upload_bytes(
                         file_bytes, 
-                        f.name, 
+                        new_fname, 
                         folder="raw_uploads", 
                         content_type=f.type
                     )
                     
-                    # 2. 寫入/更新 Firestore
+                    # 寫入 Firestore
                     file_record = {
-                        "filename": f.name,
+                        "filename": new_fname,
+                        "original_filename": f.name, # 保留原始檔名記錄
                         "url": backup_url,
-                        "exam_type": u_type,
-                        "year": u_year,
-                        "exam_no": u_exam_no,
-                        "ai_status": "未辨識", # 重新上傳後狀態重置
+                        "exam_type": item['type'],
+                        "year": item['year'],
+                        "exam_no": item['exam_no'],
+                        "ai_status": "未辨識",
+                        "created_at": datetime.datetime.now()
                     }
+                    cloud_manager.save_file_record(file_record)
                     
-                    # 如果是覆蓋，save_file_record 會使用 old_id
-                    cloud_manager.save_file_record(file_record, overwrite_id=old_id)
-                    
-                    # 3. 加入本地暫存
-                    st.session_state['file_queue'][f.name] = {
+                    # 加入本地暫存
+                    st.session_state['file_queue'][new_fname] = {
                         "status": "uploaded", 
                         "data": file_bytes,
-                        "type": f.name.split('.')[-1].lower(),
+                        "type": f.type.split('/')[-1] if '/' in f.type else 'pdf',
                         "result": [],
                         "error_msg": "",
-                        "source_tag": f"{u_type}-{u_year}",
+                        "source_tag": f"{item['type']}-{item['year']}",
                         "backup_url": backup_url,
                     }
+                    
                     success_count += 1
-                    progress_bar.progress((idx + 1) / len(files_to_process))
+                    progress_bar.progress((idx + 1) / len(files_to_upload))
                 
                 if success_count > 0:
-                    st.success(f"已成功處理 {success_count} 個檔案！")
+                    st.success(f"成功上傳 {success_count} 個檔案！")
+                    # 清空暫存設定
+                    st.session_state['upload_configs'] = {}
                     time.sleep(1)
                     st.rerun()
+
+    # 顯示目前暫存佇列
+    if st.session_state['file_queue']:
+        with st.expander(f"查看目前工作階段暫存 ({len(st.session_state['file_queue'])})"):
+            for fname in st.session_state['file_queue']:
+                st.write(fname)
 
 # === Tab 3: 匯入校對 ===
 with tab_review:
