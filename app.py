@@ -39,9 +39,6 @@ class CloudManager:
         self.project_id = None
         self.credentials = None 
 
-        # ---------------------------------------------------------
-        # 修正：調整連線策略順序，優先檢查環境變數以避免 Cloud Run 報錯
-        # ---------------------------------------------------------
         try:
             # Strategy 1: Try reading JSON string from environment variable (Priority for Cloud Run)
             service_account_json = os.getenv("GCP_SERVICE_ACCOUNT_JSON")
@@ -62,7 +59,6 @@ class CloudManager:
                     self.db = firestore.Client(credentials=self.credentials, project=self.project_id)
                     self.storage_client = storage.Client(credentials=self.credentials, project=self.project_id)
                     self.has_connection = True
-                    # If connected via Env Var, we skip st.secrets to avoid "No secrets found" error
                     if self.has_connection: 
                         self._ensure_bucket_exists()
                         return 
@@ -70,7 +66,6 @@ class CloudManager:
                     print(f"Environment variable JSON connection failed: {e}")
 
             # Strategy 2: Try reading from Streamlit Secrets (Secondary, for Streamlit Cloud)
-            # Wrap in try-except because accessing st.secrets raises error if file missing
             try:
                 if "gcp_service_account" in st.secrets:
                     try:
@@ -86,7 +81,6 @@ class CloudManager:
                     except Exception as e:
                         print(f"Streamlit Secrets connection failed: {e}")
             except (FileNotFoundError, Exception):
-                # Ignore if secrets file is missing (expected on Cloud Run)
                 pass
 
             # Strategy 3: Cloud Run Automatic Detection (Workload Identity / Default Creds)
@@ -176,13 +170,55 @@ class CloudManager:
                 )
                 return url
             except Exception as sign_err:
-                print(f"Could not generate Signed URL (fallback to public): {sign_err}")
+                # print(f"Could not generate Signed URL (fallback to public): {sign_err}")
                 return blob.public_url 
 
         except Exception as e:
             print(f"Storage upload failed: {e}")
             return None
 
+    # --- File Record Management ---
+    def save_file_record(self, file_info):
+        """Save metadata of an uploaded file to 'exam_files' collection"""
+        if not self.db: return False
+        try:
+            # Generate ID if not present
+            if not file_info.get("id"):
+                file_info["id"] = str(uuid.uuid4())
+            
+            file_info["updated_at"] = datetime.datetime.now()
+            
+            self.db.collection("exam_files").document(file_info["id"]).set(file_info)
+            return True
+        except Exception as e:
+            st.error(f"Failed to save file record: {e}")
+            return False
+
+    def load_file_records(self):
+        """Load all file records"""
+        if not self.db: return []
+        try:
+            files = []
+            docs = self.db.collection("exam_files").order_by("updated_at", direction=firestore.Query.DESCENDING).stream()
+            for doc in docs:
+                files.append(doc.to_dict())
+            return files
+        except Exception as e:
+            st.error(f"Failed to load file records: {e}")
+            return []
+
+    def delete_file_record(self, file_id):
+        """Delete a file record (and ideally its associated questions - simplified here)"""
+        if self.db:
+            self.db.collection("exam_files").document(file_id).delete()
+            # TODO: Also delete associated questions where source_file_id == file_id
+
+    def update_file_status(self, file_id, status):
+        """Update the AI status of a file"""
+        if self.db:
+            self.db.collection("exam_files").document(file_id).update({"ai_status": status})
+
+    # --- Question Management ---
     def save_question(self, question_dict):
         if not self.db: return False
         try:
@@ -229,7 +265,8 @@ cloud_manager = CloudManager()
 class Question:
     def __init__(self, q_type, content, options=None, answer=None, original_id=0, image_data=None, 
                  source="一般試題", chapter="未分類", unit="", db_id=None, 
-                 parent_id=None, is_group_parent=False, sub_questions=None, image_url=None):
+                 parent_id=None, is_group_parent=False, sub_questions=None, image_url=None,
+                 source_file_id=None): # Added source_file_id link
         self.id = db_id if db_id else str(int(time.time()*1000)) + str(random.randint(0, 999))
         self.type = q_type 
         self.source = source
@@ -244,6 +281,7 @@ class Question:
         self.parent_id = parent_id 
         self.is_group_parent = is_group_parent 
         self.sub_questions = sub_questions if sub_questions else [] 
+        self.source_file_id = source_file_id
 
     def to_dict(self):
         img_str = None
@@ -264,7 +302,8 @@ class Question:
             "image_url": self.image_url,
             "parent_id": self.parent_id,
             "is_group_parent": self.is_group_parent,
-            "sub_questions": subs
+            "sub_questions": subs,
+            "source_file_id": self.source_file_id
         }
 
     @staticmethod
@@ -288,12 +327,14 @@ class Question:
             chapter=data.get("chapter", "未分類"),
             db_id=data.get("id"),
             parent_id=data.get("parent_id"),
-            is_group_parent=data.get("is_group_parent", False)
+            is_group_parent=data.get("is_group_parent", False),
+            source_file_id=data.get("source_file_id")
         )
         if data.get("sub_questions"):
             q.sub_questions = [Question.from_dict(sub) for sub in data["sub_questions"]]
         return q
 
+# Load data into session state
 if 'question_pool' not in st.session_state:
     st.session_state['question_pool'] = []
     try:
@@ -303,7 +344,7 @@ if 'question_pool' not in st.session_state:
     except: pass
 
 if 'file_queue' not in st.session_state:
-    st.session_state['file_queue'] = {}
+    st.session_state['file_queue'] = {} # Keep for local processing logic
 
 # ==========================================
 # Utility Functions
@@ -387,7 +428,7 @@ def generate_word_files(selected_questions):
     ans_io.seek(0)
     return exam_io, ans_io
 
-def process_single_file(filename, api_key):
+def process_single_file(filename, api_key, file_id_in_db=None):
     """處理單一檔案的 AI 辨識"""
     if filename not in st.session_state['file_queue']: return
     
@@ -395,7 +436,6 @@ def process_single_file(filename, api_key):
     info['status'] = 'processing'
     
     with st.spinner(f"正在分析 {filename}..."):
-        # 呼叫 smart_importer 進行解析
         res = smart_importer.parse_with_gemini(info['data'], info['type'], api_key)
     
     if isinstance(res, dict) and "error" in res:
@@ -405,6 +445,9 @@ def process_single_file(filename, api_key):
     else:
         info['status'] = 'done'
         info['result'] = res
+        # Update file record in cloud to "已辨識"
+        if file_id_in_db:
+            cloud_manager.update_file_status(file_id_in_db, "已辨識")
         st.success(f"{filename} 辨識完成！")
         
     st.rerun()
@@ -421,8 +464,6 @@ with st.sidebar:
     
     if cloud_manager.has_connection:
         st.success("☁️ Cloud: 已連線")
-        if cloud_manager.bucket_name:
-            st.caption(f"Bucket: {cloud_manager.bucket_name}")
     else:
         st.warning(f"☁️ Cloud: 未連線")
         if cloud_manager.connection_error:
@@ -442,20 +483,110 @@ with st.sidebar:
                 progress_bar.progress((i + 1) / total)
             st.success("儲存完成！")
 
-tab1, tab2, tab3 = st.tabs(["🧠 檔案管理與辨識", "📝 匯入校對", "📚 題庫管理"])
+# Tabs
+tab_files, tab_upload_process, tab_review, tab_bank = st.tabs(["📂 檔案庫管理", "🧠 上傳與辨識", "📝 匯入校對", "📚 題庫管理"])
 
-# === Tab 1: File Management ===
-with tab1:
-    st.markdown("### 📤 上傳檔案 (批次)")
-    uploaded_files = st.file_uploader("支援 .pdf, .docx", type=['pdf', 'docx'], accept_multiple_files=True)
+# === Tab 1: File Library Management (New Feature) ===
+with tab_files:
+    st.subheader("已上傳考古題檔案庫")
     
-    if uploaded_files:
-        new_count = 0
-        for f in uploaded_files:
-            if f.name not in st.session_state['file_queue']:
+    # 1. Load File Records from Cloud
+    cloud_files = cloud_manager.load_file_records()
+    
+    if not cloud_files:
+        st.info("目前沒有已上傳的檔案記錄。請至「上傳與辨識」分頁新增。")
+    else:
+        # Display as a table-like structure
+        col_header1, col_header2, col_header3, col_header4, col_header5 = st.columns([2, 1, 1, 1, 2])
+        col_header1.markdown("**檔案名稱**")
+        col_header2.markdown("**考試類型**")
+        col_header3.markdown("**年度**")
+        col_header4.markdown("**AI 狀態**")
+        col_header5.markdown("**操作**")
+        st.divider()
+
+        for f_record in cloud_files:
+            c1, c2, c3, c4, c5 = st.columns([2, 1, 1, 1, 2])
+            with c1:
+                st.write(f"📄 {f_record.get('filename', '未知')}")
+                if f_record.get('url'):
+                    st.caption(f"[下載原始檔]({f_record.get('url')})")
+            with c2:
+                st.write(f_record.get('exam_type', '-'))
+            with c3:
+                st.write(f_record.get('year', '-'))
+            with c4:
+                status = f_record.get('ai_status', '未辨識')
+                if status == '已辨識':
+                    st.success("已辨識")
+                elif status == '處理中':
+                    st.warning("處理中")
+                else:
+                    st.info("未辨識")
+            with c5:
+                # Actions
+                if st.button("AI 辨識", key=f"ai_{f_record['id']}", disabled=(status=='已辨識')):
+                    # Re-trigger identification logic
+                    # We need to load the file back into queue if not present
+                    fname = f_record['filename']
+                    
+                    # Try to fetch content from URL if not in local queue
+                    if fname not in st.session_state['file_queue']:
+                        try:
+                            # If we have the signed URL/public URL
+                            file_url = f_record.get('url')
+                            if file_url:
+                                resp = requests.get(file_url)
+                                if resp.status_code == 200:
+                                    st.session_state['file_queue'][fname] = {
+                                        "status": "uploaded", 
+                                        "data": resp.content,
+                                        "type": fname.split('.')[-1].lower(),
+                                        "result": [],
+                                        "error_msg": "",
+                                        "source_tag": f"{f_record.get('exam_type','')}-{f_record.get('year','')}",
+                                        "backup_url": file_url,
+                                        "db_id": f_record['id']
+                                    }
+                                    # Trigger processing
+                                    process_single_file(fname, api_key_input, f_record['id'])
+                                else:
+                                    st.error("無法從雲端下載檔案")
+                        except Exception as e:
+                            st.error(f"下載失敗: {e}")
+                    else:
+                        # Already in queue
+                        process_single_file(fname, api_key_input, f_record['id'])
+
+                if st.button("刪除", key=f"del_f_{f_record['id']}", type="primary"):
+                    cloud_manager.delete_file_record(f_record['id'])
+                    st.rerun()
+            st.divider()
+
+# === Tab 2: Upload & Identify ===
+with tab_upload_process:
+    st.markdown("### 📤 上傳新考古題")
+    
+    with st.form("upload_form"):
+        uploaded_files = st.file_uploader("支援 .pdf, .docx", type=['pdf', 'docx'], accept_multiple_files=True)
+        
+        # Meta data inputs
+        col_m1, col_m2, col_m3 = st.columns(3)
+        with col_m1:
+            u_type = st.selectbox("考試類型", ["學測", "分科", "北模", "中模", "全模", "其他"])
+        with col_m2:
+            u_year = st.text_input("年度 (例如 112)", value="112")
+        with col_m3:
+            u_exam_no = st.selectbox("考試次別", ["第一次", "第二次", "第三次", "正式考試"])
+            
+        submitted = st.form_submit_button("確認上傳並建立檔案庫記錄")
+        
+        if submitted and uploaded_files:
+            new_count = 0
+            for f in uploaded_files:
                 file_bytes = f.read()
                 
-                # Auto Backup
+                # 1. Upload to Storage
                 backup_url = cloud_manager.upload_bytes(
                     file_bytes, 
                     f.name, 
@@ -463,117 +594,50 @@ with tab1:
                     content_type=f.type
                 )
                 
-                status_msg = "uploaded"
-                if backup_url:
-                    status_msg += " (已備份)"
+                # 2. Save Record to Firestore
+                file_record = {
+                    "filename": f.name,
+                    "url": backup_url,
+                    "exam_type": u_type,
+                    "year": u_year,
+                    "exam_no": u_exam_no,
+                    "ai_status": "未辨識",
+                    "created_at": datetime.datetime.now()
+                }
+                cloud_manager.save_file_record(file_record)
                 
+                # 3. Add to local queue for immediate processing option
                 st.session_state['file_queue'][f.name] = {
                     "status": "uploaded", 
                     "data": file_bytes,
                     "type": f.name.split('.')[-1].lower(),
                     "result": [],
                     "error_msg": "",
-                    "source_tag": "未分類",
-                    "backup_url": backup_url 
+                    "source_tag": f"{u_type}-{u_year}",
+                    "backup_url": backup_url,
+                    # We might need to fetch the ID we just created, but for simplicity:
+                    # Ideally save_file_record returns the ID or we generate it before
                 }
                 new_count += 1
-        if new_count > 0:
-            st.toast(f"已加入 {new_count} 個新檔案", icon="☁️")
-
-    st.divider()
-    
-    queue = st.session_state['file_queue']
-    imported_files = {} 
-    ready_files = []    
-    pending_files = []  
-    
-    for fname, info in queue.items():
-        if info['status'] == 'imported':
-            tag = info.get('source_tag', '未分類')
-            if tag not in imported_files: imported_files[tag] = []
-            imported_files[tag].append(fname)
-        elif info['status'] == 'done':
-            ready_files.append(fname)
-        else: 
-            pending_files.append(fname)
-
-    st.subheader("📚 已匯入檔案庫")
-    if not imported_files:
-        st.caption("尚無已匯入的檔案")
-    else:
-        for tag, fnames in imported_files.items():
-            with st.expander(f"📁 {tag} ({len(fnames)} 份試卷)"):
-                for fname in fnames:
-                    col_f1, col_f2, col_f3 = st.columns([3, 1, 1])
-                    col_f1.text(f"📄 {fname}")
-                    info = queue.get(fname)
-                    if info and info.get('backup_url'):
-                        col_f2.link_button("下載原始檔", info['backup_url'])
-                    else:
-                        col_f2.caption("無備份")
-                    if col_f3.button("移除", key=f"del_imp_{fname}"):
-                        del st.session_state['file_queue'][fname]
-                        st.rerun()
-
-    st.divider()
-
-    st.subheader("✏️ 待匯入/編輯 (辨識完成)")
-    if not ready_files:
-        st.caption("尚無等待編輯的檔案")
-    else:
-        for fname in ready_files:
-            info = queue[fname]
-            with st.container():
-                c1, c2, c3 = st.columns([3, 2, 1])
-                c1.markdown(f"**✅ {fname}** ({len(info['result'])} 題)")
-                c2.info("請至「匯入校對」分頁進行編輯")
-                if c3.button("🗑️", key=f"del_rdy_{fname}"):
-                    del st.session_state['file_queue'][fname]
-                    st.rerun()
-            st.divider()
-
-    st.divider()
-
-    st.subheader("⏳ 待辨識檔案 (需執行 AI)")
-    if not pending_files:
-        st.info("目前沒有等待辨識的檔案。")
-    else:
-        if st.button("🚀 全部執行辨識"):
-            if not api_key_input:
-                st.error("請輸入 API Key")
-            else:
-                progress_bar = st.progress(0)
-                for idx, fname in enumerate(pending_files):
-                    process_single_file(fname, api_key_input)
+            
+            if new_count > 0:
+                st.success(f"已成功上傳 {new_count} 個檔案至檔案庫！")
+                time.sleep(1)
                 st.rerun()
 
-        for fname in pending_files:
-            info = queue[fname]
-            with st.container():
-                c1, c2, c3 = st.columns([3, 2, 1])
-                status_display = "等待中"
-                if info.get('backup_url'): status_display += " | ☁️ 已備份"
-                
-                if info['status'] == 'processing': status_display = "🔄 分析中..."
-                elif info['status'] == 'error': status_display = f"❌ 失敗: {info['error_msg']}"
-                
-                c1.markdown(f"**📄 {fname}**")
-                c2.caption(status_display)
-                
-                if c3.button("▶️ 執行", key=f"run_{fname}", disabled=(info['status']=='processing')):
-                    if not api_key_input:
-                        st.error("請輸入 API Key")
-                    else:
-                        process_single_file(fname, api_key_input)
-            st.divider()
+    st.divider()
+    
+    # Simple list of current session queue (just for quick check)
+    if st.session_state['file_queue']:
+        st.info(f"目前工作階段暫存檔案數: {len(st.session_state['file_queue'])}")
 
-# === Tab 2: Edit & Review ===
-with tab2:
+# === Tab 3: Edit & Review ===
+with tab_review:
     st.subheader("匯入校對與截圖")
     ready_files = [f for f, info in st.session_state['file_queue'].items() if info['status'] == 'done']
     
     if not ready_files:
-        st.warning("沒有已完成辨識的檔案。請先至 Tab 1 上傳並執行。")
+        st.warning("沒有已完成辨識的檔案。請先至「檔案庫管理」點擊辨識，或上傳新檔案。")
     else:
         selected_file = st.selectbox("選擇要處理的檔案", ready_files)
         file_info = st.session_state['file_queue'][selected_file]
@@ -582,7 +646,7 @@ with tab2:
         st.markdown(f"**正在編輯：{selected_file} (共 {len(candidates)} 題)**")
         col_src1, col_src2 = st.columns(2)
         with col_src1:
-            default_tag = selected_file.split('.')[0]
+            default_tag = file_info.get("source_tag", "未分類")
             source_tag = st.text_input("設定此批試卷來源標籤", value=default_tag)
         
         st.divider()
@@ -591,6 +655,7 @@ with tab2:
             for i, cand in enumerate(candidates):
                 st.markdown(f"**第 {cand.number} 題**")
                 c1, c2 = st.columns([1, 1])
+                
                 with c1:
                     cand.content = st.text_area(f"題目內容 #{i}", cand.content, height=100, key=f"{selected_file}_c_{i}")
                     opts_text = "\n".join(cand.options)
@@ -630,6 +695,9 @@ with tab2:
             progress_bar = st.progress(0)
             count = 0
             total = len(candidates)
+            # Try to get DB file ID if available
+            db_file_id = file_info.get("db_id")
+
             for i, cand in enumerate(candidates):
                 ans_val = st.session_state.get(f"{selected_file}_ans_{i}", "")
                 new_q = Question(
@@ -639,19 +707,24 @@ with tab2:
                     source=source_tag, 
                     chapter=cand.predicted_chapter,
                     image_data=cand.image_bytes,
-                    answer=ans_val 
+                    answer=ans_val,
+                    source_file_id=db_file_id # Link to file record
                 )
                 cloud_manager.save_question(new_q.to_dict())
                 st.session_state['question_pool'].append(new_q)
                 count += 1
                 progress_bar.progress((i + 1) / total)
+            
             st.success(f"成功匯入 {count} 題！")
             st.session_state['file_queue'][selected_file]['status'] = 'imported'
-            st.session_state['file_queue'][selected_file]['source_tag'] = source_tag 
+            # Update cloud status if possible
+            if db_file_id:
+                cloud_manager.update_file_status(db_file_id, "已匯入")
+            
             st.rerun()
 
-# === Tab 3: Question Bank ===
-with tab3:
+# === Tab 4: Question Bank ===
+with tab_bank:
     st.subheader("題庫總覽與試卷輸出")
     if not st.session_state['question_pool']:
         st.info("目前沒有題目。")
