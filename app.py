@@ -13,21 +13,18 @@ from streamlit_cropper import st_cropper
 import os
 import datetime
 import uuid
-import json  # Import json module
+import json
 from google.cloud import firestore
 from google.cloud import storage
 import google.auth 
-from google.oauth2 import service_account # Import for reading Secrets keys
+from google.oauth2 import service_account
 
 import smart_importer
-
-# Remove external firebase_db import to prevent ModuleNotFoundError
-# import firebase_db 
 
 st.set_page_config(page_title="物理題庫系統 (Pro)", layout="wide", page_icon="🧲")
 
 # ==========================================
-# Cloud Database & Storage Module (Built-in)
+# 雲端資料庫與儲存模組 (內建)
 # ==========================================
 class CloudManager:
     def __init__(self):
@@ -40,11 +37,10 @@ class CloudManager:
         self.credentials = None 
 
         try:
-            # Strategy 1: Try reading JSON string from environment variable (Priority for Cloud Run)
+            # 策略 1：環境變數 JSON (Cloud Run 優先)
             service_account_json = os.getenv("GCP_SERVICE_ACCOUNT_JSON")
             if service_account_json:
                 try:
-                    # Clean up potential formatting issues
                     service_account_json = service_account_json.strip()
                     if service_account_json.startswith("'") and service_account_json.endswith("'"):
                          service_account_json = service_account_json[1:-1]
@@ -59,13 +55,12 @@ class CloudManager:
                     self.db = firestore.Client(credentials=self.credentials, project=self.project_id)
                     self.storage_client = storage.Client(credentials=self.credentials, project=self.project_id)
                     self.has_connection = True
-                    if self.has_connection: 
-                        self._ensure_bucket_exists()
-                        return 
+                    if self.has_connection: self._ensure_bucket_exists()
+                    return
                 except Exception as e:
-                    print(f"Environment variable JSON connection failed: {e}")
+                    print(f"環境變數 JSON 連線失敗: {e}")
 
-            # Strategy 2: Try reading from Streamlit Secrets (Secondary, for Streamlit Cloud)
+            # 策略 2：Streamlit Secrets (Streamlit Cloud)
             try:
                 if "gcp_service_account" in st.secrets:
                     try:
@@ -79,15 +74,11 @@ class CloudManager:
                         if self.has_connection: self._ensure_bucket_exists()
                         return 
                     except Exception as e:
-                        print(f"Streamlit Secrets connection failed: {e}")
-            except (FileNotFoundError, Exception):
-                pass
+                        print(f"Secrets 連線失敗: {e}")
+            except: pass
 
-            # Strategy 3: Cloud Run Automatic Detection (Workload Identity / Default Creds)
-            self.project_id = (
-                os.getenv("GCP_PROJECT_ID") or 
-                os.getenv("GOOGLE_CLOUD_PROJECT")
-            )
+            # 策略 3：自動偵測
+            self.project_id = (os.getenv("GCP_PROJECT_ID") or os.getenv("GOOGLE_CLOUD_PROJECT"))
             
             if not self.project_id:
                 try:
@@ -105,7 +96,6 @@ class CloudManager:
                     self.storage_client = storage.Client(project=self.project_id)
                 self.has_connection = True
             else:
-                # Last resort: Try default client
                 try:
                     self.db = firestore.Client()
                     self.storage_client = storage.Client()
@@ -116,14 +106,12 @@ class CloudManager:
 
         except Exception as e:
             self.connection_error = str(e)
-            print(f"Cloud connection initialization failed: {e}")
+            print(f"Cloud 連線初始化失敗: {e}")
 
     def _ensure_bucket_exists(self):
-        """Check if Bucket exists, if not try to create it"""
         if not self.storage_client: return
         try:
             target_bucket_name = self.bucket_name
-            # Fallback to secrets if env var not set
             if not target_bucket_name:
                 try:
                     if "GCS_BUCKET_NAME" in st.secrets:
@@ -133,12 +121,8 @@ class CloudManager:
             if target_bucket_name:
                 bucket = self.storage_client.bucket(target_bucket_name)
                 if not bucket.exists():
-                    print(f"Bucket {target_bucket_name} does not exist, attempting to create...")
-                    # Default to us-central1
                     bucket.create(location="us-central1") 
-                    print(f"Bucket {target_bucket_name} created successfully")
-        except Exception as e:
-            print(f"Failed to auto-create bucket (permission or name conflict): {e}")
+        except: pass
 
     def upload_bytes(self, file_bytes, filename, folder="uploads", content_type=None):
         if not self.storage_client: return None
@@ -151,15 +135,15 @@ class CloudManager:
                 except: pass
             
             if not target_bucket_name:
-                st.error("Bucket name (GCS_BUCKET_NAME) not set")
+                st.error("未設定 Bucket 名稱")
                 return None
 
             bucket = self.storage_client.bucket(target_bucket_name)
+            # 使用固定檔名邏輯或加蓋 UUID 視需求而定，這裡維持不變以確保唯一性
             unique_name = f"{folder}/{int(datetime.datetime.now().timestamp())}_{str(uuid.uuid4())[:8]}_{filename}"
             blob = bucket.blob(unique_name)
             blob.upload_from_string(file_bytes, content_type=content_type)
             
-            # Generate Signed URL for private buckets
             try:
                 url = blob.generate_signed_url(
                     version="v4",
@@ -169,33 +153,47 @@ class CloudManager:
                     access_token=self.credentials.token if hasattr(self.credentials, 'token') else None
                 )
                 return url
-            except Exception as sign_err:
-                # print(f"Could not generate Signed URL (fallback to public): {sign_err}")
+            except:
                 return blob.public_url 
 
         except Exception as e:
-            print(f"Storage upload failed: {e}")
+            print(f"上傳失敗: {e}")
             return None
 
-    # --- File Record Management ---
-    def save_file_record(self, file_info):
-        """Save metadata of an uploaded file to 'exam_files' collection"""
+    # --- 檔案庫管理功能 ---
+    
+    # [新增] 檢查檔案是否已存在
+    def check_file_exists(self, filename):
+        """檢查 Firestore 中是否有同名檔案"""
+        if not self.db: return None
+        try:
+            # 查詢 exam_files 集合中 filename 欄位等於 filename 的文件
+            docs = self.db.collection("exam_files").where("filename", "==", filename).limit(1).stream()
+            for doc in docs:
+                data = doc.to_dict()
+                data['id'] = doc.id
+                return data # 回傳已存在的檔案資料
+            return None
+        except Exception as e:
+            print(f"檢查檔案失敗: {e}")
+            return None
+
+    def save_file_record(self, file_info, overwrite_id=None):
+        """儲存或更新檔案記錄"""
         if not self.db: return False
         try:
-            # Generate ID if not present
-            if not file_info.get("id"):
-                file_info["id"] = str(uuid.uuid4())
-            
+            # 如果是覆蓋，使用舊 ID；否則生成新 ID
+            doc_id = overwrite_id if overwrite_id else str(uuid.uuid4())
+            file_info["id"] = doc_id
             file_info["updated_at"] = datetime.datetime.now()
             
-            self.db.collection("exam_files").document(file_info["id"]).set(file_info)
+            self.db.collection("exam_files").document(doc_id).set(file_info)
             return True
         except Exception as e:
-            st.error(f"Failed to save file record: {e}")
+            st.error(f"儲存檔案記錄失敗: {e}")
             return False
 
     def load_file_records(self):
-        """Load all file records"""
         if not self.db: return []
         try:
             files = []
@@ -204,25 +202,21 @@ class CloudManager:
                 files.append(doc.to_dict())
             return files
         except Exception as e:
-            st.error(f"Failed to load file records: {e}")
+            st.error(f"讀取檔案列表失敗: {e}")
             return []
 
     def delete_file_record(self, file_id):
-        """Delete a file record (and ideally its associated questions - simplified here)"""
         if self.db:
             self.db.collection("exam_files").document(file_id).delete()
-            # TODO: Also delete associated questions where source_file_id == file_id
 
     def update_file_status(self, file_id, status):
-        """Update the AI status of a file"""
         if self.db:
             self.db.collection("exam_files").document(file_id).update({"ai_status": status})
 
-    # --- Question Management ---
+    # --- 題庫管理功能 ---
     def save_question(self, question_dict):
         if not self.db: return False
         try:
-            # Handle Base64 Image to URL conversion
             if question_dict.get("image_data_b64"):
                 try:
                     img_bytes = base64.b64decode(question_dict["image_data_b64"])
@@ -232,12 +226,12 @@ class CloudManager:
                         question_dict["image_url"] = img_url
                         del question_dict["image_data_b64"]
                 except Exception as e:
-                    print(f"Image transfer failed: {e}")
+                    print(f"圖片轉存失敗: {e}")
             
             self.db.collection("questions").document(question_dict["id"]).set(question_dict)
             return True
         except Exception as e:
-            st.error(f"Database write failed: {e}")
+            st.error(f"儲存題目失敗: {e}")
             return False
 
     def load_questions(self):
@@ -249,24 +243,24 @@ class CloudManager:
                 questions.append(doc.to_dict())
             return questions
         except Exception as e:
-            st.error(f"Failed to load question bank: {e}")
+            st.error(f"讀取題庫失敗: {e}")
             return []
 
     def delete_question(self, doc_id):
         if self.db:
             self.db.collection("questions").document(doc_id).delete()
 
-# Initialize Cloud Manager
+# 初始化 Cloud Manager
 cloud_manager = CloudManager()
 
 # ==========================================
-# Data Structures & State Initialization
+# 資料結構與狀態初始化
 # ==========================================
 class Question:
     def __init__(self, q_type, content, options=None, answer=None, original_id=0, image_data=None, 
                  source="一般試題", chapter="未分類", unit="", db_id=None, 
                  parent_id=None, is_group_parent=False, sub_questions=None, image_url=None,
-                 source_file_id=None): # Added source_file_id link
+                 source_file_id=None):
         self.id = db_id if db_id else str(int(time.time()*1000)) + str(random.randint(0, 999))
         self.type = q_type 
         self.source = source
@@ -334,7 +328,6 @@ class Question:
             q.sub_questions = [Question.from_dict(sub) for sub in data["sub_questions"]]
         return q
 
-# Load data into session state
 if 'question_pool' not in st.session_state:
     st.session_state['question_pool'] = []
     try:
@@ -344,10 +337,10 @@ if 'question_pool' not in st.session_state:
     except: pass
 
 if 'file_queue' not in st.session_state:
-    st.session_state['file_queue'] = {} # Keep for local processing logic
+    st.session_state['file_queue'] = {}
 
 # ==========================================
-# Utility Functions
+# 工具函式
 # ==========================================
 def get_image_bytes(q):
     if q.image_data: return q.image_data
@@ -385,8 +378,7 @@ def generate_word_files(selected_questions):
                 img_p = doc.add_paragraph()
                 run = img_p.add_run()
                 run.add_picture(io.BytesIO(img_bytes), width=Inches(2.5))
-            except Exception as e:
-                print(f"Word picture error: {e}")
+            except: pass
 
         if q.type in ['Single', 'Multi'] and q.options:
             opts = q.options
@@ -429,9 +421,7 @@ def generate_word_files(selected_questions):
     return exam_io, ans_io
 
 def process_single_file(filename, api_key, file_id_in_db=None):
-    """處理單一檔案的 AI 辨識"""
     if filename not in st.session_state['file_queue']: return
-    
     info = st.session_state['file_queue'][filename]
     info['status'] = 'processing'
     
@@ -445,7 +435,6 @@ def process_single_file(filename, api_key, file_id_in_db=None):
     else:
         info['status'] = 'done'
         info['result'] = res
-        # Update file record in cloud to "已辨識"
         if file_id_in_db:
             cloud_manager.update_file_status(file_id_in_db, "已辨識")
         st.success(f"{filename} 辨識完成！")
@@ -464,6 +453,8 @@ with st.sidebar:
     
     if cloud_manager.has_connection:
         st.success("☁️ Cloud: 已連線")
+        if cloud_manager.bucket_name:
+            st.caption(f"Bucket: {cloud_manager.bucket_name}")
     else:
         st.warning(f"☁️ Cloud: 未連線")
         if cloud_manager.connection_error:
@@ -483,20 +474,16 @@ with st.sidebar:
                 progress_bar.progress((i + 1) / total)
             st.success("儲存完成！")
 
-# Tabs
 tab_files, tab_upload_process, tab_review, tab_bank = st.tabs(["📂 檔案庫管理", "🧠 上傳與辨識", "📝 匯入校對", "📚 題庫管理"])
 
-# === Tab 1: File Library Management (New Feature) ===
+# === Tab 1: 檔案庫管理 ===
 with tab_files:
     st.subheader("已上傳考古題檔案庫")
-    
-    # 1. Load File Records from Cloud
     cloud_files = cloud_manager.load_file_records()
     
     if not cloud_files:
         st.info("目前沒有已上傳的檔案記錄。請至「上傳與辨識」分頁新增。")
     else:
-        # Display as a table-like structure
         col_header1, col_header2, col_header3, col_header4, col_header5 = st.columns([2, 1, 1, 1, 2])
         col_header1.markdown("**檔案名稱**")
         col_header2.markdown("**考試類型**")
@@ -511,29 +498,18 @@ with tab_files:
                 st.write(f"📄 {f_record.get('filename', '未知')}")
                 if f_record.get('url'):
                     st.caption(f"[下載原始檔]({f_record.get('url')})")
-            with c2:
-                st.write(f_record.get('exam_type', '-'))
-            with c3:
-                st.write(f_record.get('year', '-'))
+            with c2: st.write(f_record.get('exam_type', '-'))
+            with c3: st.write(f_record.get('year', '-'))
             with c4:
                 status = f_record.get('ai_status', '未辨識')
-                if status == '已辨識':
-                    st.success("已辨識")
-                elif status == '處理中':
-                    st.warning("處理中")
-                else:
-                    st.info("未辨識")
+                if status == '已辨識': st.success("已辨識")
+                elif status == '處理中': st.warning("處理中")
+                else: st.info("未辨識")
             with c5:
-                # Actions
-                if st.button("AI 辨識", key=f"ai_{f_record['id']}", disabled=(status=='已辨識')):
-                    # Re-trigger identification logic
-                    # We need to load the file back into queue if not present
+                if st.button("AI 辨識", key=f"ai_{f_record['id']}"):
                     fname = f_record['filename']
-                    
-                    # Try to fetch content from URL if not in local queue
                     if fname not in st.session_state['file_queue']:
                         try:
-                            # If we have the signed URL/public URL
                             file_url = f_record.get('url')
                             if file_url:
                                 resp = requests.get(file_url)
@@ -548,14 +524,10 @@ with tab_files:
                                         "backup_url": file_url,
                                         "db_id": f_record['id']
                                     }
-                                    # Trigger processing
                                     process_single_file(fname, api_key_input, f_record['id'])
-                                else:
-                                    st.error("無法從雲端下載檔案")
-                        except Exception as e:
-                            st.error(f"下載失敗: {e}")
+                                else: st.error("無法從雲端下載檔案")
+                        except Exception as e: st.error(f"下載失敗: {e}")
                     else:
-                        # Already in queue
                         process_single_file(fname, api_key_input, f_record['id'])
 
                 if st.button("刪除", key=f"del_f_{f_record['id']}", type="primary"):
@@ -563,75 +535,119 @@ with tab_files:
                     st.rerun()
             st.divider()
 
-# === Tab 2: Upload & Identify ===
+# === Tab 2: 上傳與辨識 (含重複檢查) ===
 with tab_upload_process:
     st.markdown("### 📤 上傳新考古題")
     
-    with st.form("upload_form"):
-        uploaded_files = st.file_uploader("支援 .pdf, .docx", type=['pdf', 'docx'], accept_multiple_files=True)
-        
-        # Meta data inputs
-        col_m1, col_m2, col_m3 = st.columns(3)
-        with col_m1:
-            u_type = st.selectbox("考試類型", ["學測", "分科", "北模", "中模", "全模", "其他"])
-        with col_m2:
-            u_year = st.text_input("年度 (例如 112)", value="112")
-        with col_m3:
-            u_exam_no = st.selectbox("考試次別", ["第一次", "第二次", "第三次", "正式考試"])
-            
-        submitted = st.form_submit_button("確認上傳並建立檔案庫記錄")
-        
-        if submitted and uploaded_files:
-            new_count = 0
-            for f in uploaded_files:
-                file_bytes = f.read()
-                
-                # 1. Upload to Storage
-                backup_url = cloud_manager.upload_bytes(
-                    file_bytes, 
-                    f.name, 
-                    folder="raw_uploads", 
-                    content_type=f.type
-                )
-                
-                # 2. Save Record to Firestore
-                file_record = {
-                    "filename": f.name,
-                    "url": backup_url,
-                    "exam_type": u_type,
-                    "year": u_year,
-                    "exam_no": u_exam_no,
-                    "ai_status": "未辨識",
-                    "created_at": datetime.datetime.now()
-                }
-                cloud_manager.save_file_record(file_record)
-                
-                # 3. Add to local queue for immediate processing option
-                st.session_state['file_queue'][f.name] = {
-                    "status": "uploaded", 
-                    "data": file_bytes,
-                    "type": f.name.split('.')[-1].lower(),
-                    "result": [],
-                    "error_msg": "",
-                    "source_tag": f"{u_type}-{u_year}",
-                    "backup_url": backup_url,
-                    # We might need to fetch the ID we just created, but for simplicity:
-                    # Ideally save_file_record returns the ID or we generate it before
-                }
-                new_count += 1
-            
-            if new_count > 0:
-                st.success(f"已成功上傳 {new_count} 個檔案至檔案庫！")
-                time.sleep(1)
-                st.rerun()
-
-    st.divider()
+    # 使用 Form 之前，先上傳檔案以檢查重複
+    # 為了實現「上傳前檢查」，我們不能把 file_uploader 放在 form 裡面，因為 form 只在 submit 時傳送
+    # 所以這裡將流程拆開：先上傳 -> 檢查 -> 填寫資料 -> 確認儲存
     
-    # Simple list of current session queue (just for quick check)
-    if st.session_state['file_queue']:
-        st.info(f"目前工作階段暫存檔案數: {len(st.session_state['file_queue'])}")
+    uploaded_files = st.file_uploader("支援 .pdf, .docx", type=['pdf', 'docx'], accept_multiple_files=True)
+    
+    # 檢查是否有重複檔案
+    duplicate_files = []
+    if uploaded_files:
+        for f in uploaded_files:
+            existing = cloud_manager.check_file_exists(f.name)
+            if existing:
+                duplicate_files.append((f, existing))
+    
+    # 顯示重複警告與操作選項
+    files_to_process = []
+    if duplicate_files:
+        st.warning(f"⚠️ 發現 {len(duplicate_files)} 個檔名重複的檔案！")
+        
+        # 讓使用者決定每個重複檔案的處理方式
+        overwrite_decisions = {} # {filename: True/False}
+        
+        for f, existing_record in duplicate_files:
+            col_warn, col_opt = st.columns([3, 1])
+            with col_warn:
+                st.markdown(f"**{f.name}** (上次上傳：{existing_record.get('updated_at', '未知時間')})")
+            with col_opt:
+                # 預設不覆蓋 (False)
+                decision = st.radio(f"處理方式 ({f.name})", ["跳過", "覆蓋"], key=f"dup_{f.name}")
+                if decision == "覆蓋":
+                    files_to_process.append((f, existing_record['id'])) # 傳入舊 ID 以便更新
+                else:
+                    st.caption("將略過此檔案")
+    
+    # 加入非重複的檔案
+    if uploaded_files:
+        for f in uploaded_files:
+            is_dup = False
+            for dup_f, _ in duplicate_files:
+                if f.name == dup_f.name:
+                    is_dup = True
+                    break
+            if not is_dup:
+                files_to_process.append((f, None)) # None 代表新檔案
 
-# === Tab 3: Edit & Review ===
+    # 顯示 metadata 表單 (只有當有檔案要處理時)
+    if files_to_process:
+        st.divider()
+        st.info(f"準備處理 {len(files_to_process)} 個檔案")
+        
+        with st.form("upload_meta_form"):
+            col_m1, col_m2, col_m3 = st.columns(3)
+            with col_m1:
+                u_type = st.selectbox("考試類型", ["學測", "分科", "北模", "中模", "全模", "其他"])
+            with col_m2:
+                u_year = st.text_input("年度 (例如 112)", value="112")
+            with col_m3:
+                u_exam_no = st.selectbox("考試次別", ["第一次", "第二次", "第三次", "正式考試"])
+            
+            submitted = st.form_submit_button("確認上傳")
+            
+            if submitted:
+                success_count = 0
+                progress_bar = st.progress(0)
+                
+                for idx, (f, old_id) in enumerate(files_to_process):
+                    file_bytes = f.read()
+                    f.seek(0) # 重置指標，確保讀取正確
+                    
+                    # 1. 上傳 Storage (覆蓋同名檔案)
+                    backup_url = cloud_manager.upload_bytes(
+                        file_bytes, 
+                        f.name, 
+                        folder="raw_uploads", 
+                        content_type=f.type
+                    )
+                    
+                    # 2. 寫入/更新 Firestore
+                    file_record = {
+                        "filename": f.name,
+                        "url": backup_url,
+                        "exam_type": u_type,
+                        "year": u_year,
+                        "exam_no": u_exam_no,
+                        "ai_status": "未辨識", # 重新上傳後狀態重置
+                    }
+                    
+                    # 如果是覆蓋，save_file_record 會使用 old_id
+                    cloud_manager.save_file_record(file_record, overwrite_id=old_id)
+                    
+                    # 3. 加入本地暫存
+                    st.session_state['file_queue'][f.name] = {
+                        "status": "uploaded", 
+                        "data": file_bytes,
+                        "type": f.name.split('.')[-1].lower(),
+                        "result": [],
+                        "error_msg": "",
+                        "source_tag": f"{u_type}-{u_year}",
+                        "backup_url": backup_url,
+                    }
+                    success_count += 1
+                    progress_bar.progress((idx + 1) / len(files_to_process))
+                
+                if success_count > 0:
+                    st.success(f"已成功處理 {success_count} 個檔案！")
+                    time.sleep(1)
+                    st.rerun()
+
+# === Tab 3: 匯入校對 ===
 with tab_review:
     st.subheader("匯入校對與截圖")
     ready_files = [f for f, info in st.session_state['file_queue'].items() if info['status'] == 'done']
@@ -655,7 +671,6 @@ with tab_review:
             for i, cand in enumerate(candidates):
                 st.markdown(f"**第 {cand.number} 題**")
                 c1, c2 = st.columns([1, 1])
-                
                 with c1:
                     cand.content = st.text_area(f"題目內容 #{i}", cand.content, height=100, key=f"{selected_file}_c_{i}")
                     opts_text = "\n".join(cand.options)
@@ -695,7 +710,6 @@ with tab_review:
             progress_bar = st.progress(0)
             count = 0
             total = len(candidates)
-            # Try to get DB file ID if available
             db_file_id = file_info.get("db_id")
 
             for i, cand in enumerate(candidates):
@@ -708,7 +722,7 @@ with tab_review:
                     chapter=cand.predicted_chapter,
                     image_data=cand.image_bytes,
                     answer=ans_val,
-                    source_file_id=db_file_id # Link to file record
+                    source_file_id=db_file_id
                 )
                 cloud_manager.save_question(new_q.to_dict())
                 st.session_state['question_pool'].append(new_q)
@@ -717,13 +731,11 @@ with tab_review:
             
             st.success(f"成功匯入 {count} 題！")
             st.session_state['file_queue'][selected_file]['status'] = 'imported'
-            # Update cloud status if possible
             if db_file_id:
                 cloud_manager.update_file_status(db_file_id, "已匯入")
-            
             st.rerun()
 
-# === Tab 4: Question Bank ===
+# === Tab 4: 題庫管理 ===
 with tab_bank:
     st.subheader("題庫總覽與試卷輸出")
     if not st.session_state['question_pool']:
