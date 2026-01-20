@@ -23,9 +23,7 @@ import smart_importer
 
 st.set_page_config(page_title="物理題庫系統 (Pro)", layout="wide", page_icon="🧲")
 
-# ==========================================
-# 雲端資料庫與儲存模組 (內建)
-# ==========================================
+# ... (CloudManager class remains the same) ...
 class CloudManager:
     def __init__(self):
         self.bucket_name = os.getenv("GCS_BUCKET_NAME", "physics-exam-assets")
@@ -41,6 +39,7 @@ class CloudManager:
             service_account_json = os.getenv("GCP_SERVICE_ACCOUNT_JSON")
             if service_account_json:
                 try:
+                    # Clean up potential formatting issues
                     service_account_json = service_account_json.strip()
                     if service_account_json.startswith("'") and service_account_json.endswith("'"):
                          service_account_json = service_account_json[1:-1]
@@ -139,7 +138,6 @@ class CloudManager:
                 return None
 
             bucket = self.storage_client.bucket(target_bucket_name)
-            # 使用固定檔名邏輯或加蓋 UUID 視需求而定，這裡維持不變以確保唯一性
             unique_name = f"{folder}/{int(datetime.datetime.now().timestamp())}_{str(uuid.uuid4())[:8]}_{filename}"
             blob = bucket.blob(unique_name)
             blob.upload_from_string(file_bytes, content_type=content_type)
@@ -250,9 +248,7 @@ class CloudManager:
 # 初始化 Cloud Manager
 cloud_manager = CloudManager()
 
-# ==========================================
-# 資料結構與狀態初始化
-# ==========================================
+# ... (Question class and init code remains the same) ...
 class Question:
     def __init__(self, q_type, content, options=None, answer=None, original_id=0, image_data=None, 
                  source="一般試題", chapter="未分類", unit="", db_id=None, 
@@ -336,9 +332,7 @@ if 'question_pool' not in st.session_state:
 if 'file_queue' not in st.session_state:
     st.session_state['file_queue'] = {}
 
-# ==========================================
-# 工具函式
-# ==========================================
+# ... (Utility Functions remain the same) ...
 def get_image_bytes(q):
     if q.image_data: return q.image_data
     if q.image_url:
