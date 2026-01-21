@@ -117,7 +117,7 @@ def crop_image(original_img, box_2d, force_full_width=False, padding_y=10):
         cropped = original_img.crop((left, top, right, bottom))
         img_byte_arr = io.BytesIO()
         if cropped.mode in ("RGBA", "P"): cropped = cropped.convert("RGB")
-        # 壓縮圖片以節省記憶體與傳輸
+        # 壓縮裁切圖以節省空間
         cropped.save(img_byte_arr, format='JPEG', quality=85)
         return img_byte_arr.getvalue()
     except Exception as e:
@@ -130,8 +130,8 @@ def img_to_bytes(pil_img):
     img_byte_arr = io.BytesIO()
     if pil_img.mode in ("RGBA", "P"): 
         pil_img = pil_img.convert("RGB")
-    # 壓縮整頁圖片以加速
-    pil_img.save(img_byte_arr, format='JPEG', quality=80) 
+    # 壓縮整頁圖片以加速傳輸
+    pil_img.save(img_byte_arr, format='JPEG', quality=85) 
     return img_byte_arr.getvalue()
 
 # ==========================================
@@ -151,7 +151,7 @@ def parse_with_gemini(file_bytes, file_type, api_key):
     if file_type == 'pdf':
         if not HAS_PDF2IMAGE: return {"error": "缺少 pdf2image (Poppler) 未安裝"}
         try:
-            # 優化：降低 DPI 至 150 以加速 (文字辨識通常 150 就夠了)
+            # 優化：降低 DPI 至 150 以加速處理與傳輸，文字辨識通常足夠
             source_images = convert_from_bytes(file_bytes, dpi=150, fmt='jpeg')
         except Exception as e:
             return {"error": f"PDF 轉圖片失敗: {str(e)}"}
@@ -172,8 +172,8 @@ def parse_with_gemini(file_bytes, file_type, api_key):
 
     if not source_images and file_type == 'pdf': return {"error": "PDF 頁面為空"}
 
-    # 優化：增加 Batch Size (一次處理更多頁)，減少 API 往返時間
-    BATCH_SIZE = 10 
+    # 優化：增加 Batch Size 減少 API 呼叫次數 (一次處理 10 頁)
+    BATCH_SIZE = 10
     total_pages = len(source_images)
     all_candidates = []
     errors = []
@@ -186,30 +186,13 @@ def parse_with_gemini(file_bytes, file_type, api_key):
     prompt_chapters = [c for c in PHYSICS_CHAPTERS_LIST if c != "未分類"]
     chapters_str = "\n".join(prompt_chapters)
     
-    # [需求修正] 固定 AI 模型優先順序
+    # [需求] 固定 AI 模型優先順序
     candidate_models = [
-        "gemini-2.5-flash",    
+        "gemini-2.5-flash",    # 最快優先
         "gemini-2.5-pro",      
         "gemini-2.0-flash",    
         "gemini-1.5-pro"       
     ]
-    
-    # 測試可用的模型
-    selected_model_name = None
-    for m in candidate_models:
-        try:
-            # 建立模型物件 (不實際呼叫，僅測試初始化)
-            genai.GenerativeModel(m)
-            selected_model_name = m
-            break
-        except: continue
-        
-    if not selected_model_name:
-        # Fallback 到最基礎的模型
-        selected_model_name = "gemini-1.5-flash"
-
-    # print(f"使用模型: {selected_model_name}") 
-    model = genai.GenerativeModel(selected_model_name)
 
     for batch_idx, batch_imgs in enumerate(batches):
         start_page_idx = batch_idx * BATCH_SIZE
@@ -250,9 +233,26 @@ def parse_with_gemini(file_bytes, file_type, api_key):
 
         generation_config = {"response_mime_type": "application/json"}
         
+        response = None
+        last_error = None
+        
+        # 嘗試模型列表
+        for model_name in candidate_models:
+            try:
+                model = genai.GenerativeModel(model_name)
+                response = model.generate_content(input_parts, generation_config=generation_config)
+                # print(f"Batch {batch_idx+1} 使用模型: {model_name} 成功")
+                break
+            except Exception as e:
+                # print(f"模型 {model_name} 失敗: {e}")
+                last_error = e
+                continue
+        
+        if not response:
+             errors.append(f"Batch {batch_idx+1} failed: {str(last_error)}")
+             continue
+
         try:
-            response = model.generate_content(input_parts, generation_config=generation_config)
-            
             if not response.text:
                 errors.append(f"Batch {batch_idx+1}: Empty response")
                 continue
@@ -279,7 +279,7 @@ def parse_with_gemini(file_bytes, file_type, api_key):
                         if 0 <= absolute_idx < len(source_images):
                             src_img = source_images[absolute_idx]
                             
-                            # 儲存整頁，供前端裁切使用
+                            # 儲存整頁 (壓縮後)
                             full_page_bytes = img_to_bytes(src_img)
                             
                             if 'box_2d' in item:
@@ -310,7 +310,7 @@ def parse_with_gemini(file_bytes, file_type, api_key):
                 all_candidates.append(cand)
                 
         except Exception as e:
-            errors.append(f"Batch {batch_idx+1} error: {str(e)}")
+            errors.append(f"Batch {batch_idx+1} processing error: {str(e)}")
             
         time.sleep(1) # 避免 Rate Limit
 
