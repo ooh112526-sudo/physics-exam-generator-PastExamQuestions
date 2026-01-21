@@ -41,7 +41,7 @@ class CloudManager:
             service_account_json = os.getenv("GCP_SERVICE_ACCOUNT_JSON")
             if service_account_json:
                 try:
-                    # Clean up
+                    # Clean up potential formatting issues
                     service_account_json = service_account_json.strip()
                     if service_account_json.startswith("'") and service_account_json.endswith("'"):
                          service_account_json = service_account_json[1:-1]
@@ -140,6 +140,8 @@ class CloudManager:
             if not target_bucket_name: return 0
 
             bucket = self.storage_client.bucket(target_bucket_name)
+            # list_blobs 可能需要一點時間，且屬於 Class A 操作
+            # 若檔案極多，建議搭配快取或定期更新
             blobs = bucket.list_blobs()
             total_bytes = sum(blob.size for blob in blobs if blob.size is not None)
             return total_bytes
@@ -454,9 +456,8 @@ def process_single_file(filename, api_key, file_id_in_db=None):
             cloud_manager.update_file_status(file_id_in_db, "已辨識")
         
         st.success(f"{filename} 辨識完成！")
-        # [優化] 設定標記，讓 Tab 3 自動選取該檔案
+        # [關鍵修改] 辨識完成後，設定 Session State 標記，以便提示跳轉
         st.session_state['just_processed_file'] = filename
-        st.info("💡 請切換至「📝 AI匯入校對」分頁開始編輯")
         
     st.rerun()
 
@@ -675,7 +676,7 @@ with tab_files:
             with st.expander(f"📁 {ftype}", expanded=False):
                 years_dict = files_tree[ftype]
                 
-                # 第二層：年度 (Year) - 遞減排序
+                # 第二層：年度 (Year) - 遞減排序 (大到小)
                 def year_sort_key(y_str):
                     return -int(y_str) if y_str.isdigit() else 0
                 
