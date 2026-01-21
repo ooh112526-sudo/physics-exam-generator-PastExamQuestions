@@ -125,6 +125,30 @@ class CloudManager:
                     bucket.create(location="us-central1") 
         except: pass
 
+    # --- 新增功能：取得儲存空間使用量 ---
+    def get_storage_usage(self):
+        """計算 Bucket 中所有檔案的總大小 (Bytes)"""
+        if not self.storage_client: return 0
+        try:
+            target_bucket_name = self.bucket_name
+            if not target_bucket_name:
+                try:
+                    if "GCS_BUCKET_NAME" in st.secrets:
+                        target_bucket_name = st.secrets["GCS_BUCKET_NAME"]
+                except: pass
+            
+            if not target_bucket_name: return 0
+
+            bucket = self.storage_client.bucket(target_bucket_name)
+            # list_blobs 可能需要一點時間，且屬於 Class A 操作
+            # 若檔案極多，建議搭配快取或定期更新
+            blobs = bucket.list_blobs()
+            total_bytes = sum(blob.size for blob in blobs if blob.size is not None)
+            return total_bytes
+        except Exception as e:
+            print(f"容量計算失敗: {e}")
+            return 0
+
     def upload_bytes(self, file_bytes, filename, folder="uploads", content_type=None):
         if not self.storage_client: return None
         try:
@@ -159,28 +183,6 @@ class CloudManager:
         except Exception as e:
             print(f"上傳失敗: {e}")
             return None
-
-    # --- 容量計算功能 (新) ---
-    def get_storage_usage(self):
-        """計算 Bucket 中所有檔案的總大小 (Bytes)"""
-        if not self.storage_client: return 0
-        try:
-            target_bucket_name = self.bucket_name
-            if not target_bucket_name:
-                try:
-                    if "GCS_BUCKET_NAME" in st.secrets:
-                        target_bucket_name = st.secrets["GCS_BUCKET_NAME"]
-                except: pass
-            
-            if not target_bucket_name: return 0
-
-            bucket = self.storage_client.bucket(target_bucket_name)
-            blobs = bucket.list_blobs()
-            total_bytes = sum(blob.size for blob in blobs if blob.size is not None)
-            return total_bytes
-        except Exception as e:
-            print(f"容量計算失敗: {e}")
-            return 0
 
     # --- 檔案庫管理功能 ---
     
