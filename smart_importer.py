@@ -117,7 +117,8 @@ def crop_image(original_img, box_2d, force_full_width=False, padding_y=10):
         cropped = original_img.crop((left, top, right, bottom))
         img_byte_arr = io.BytesIO()
         if cropped.mode in ("RGBA", "P"): cropped = cropped.convert("RGB")
-        cropped.save(img_byte_arr, format='JPEG')
+        # 壓縮圖片以節省記憶體與傳輸
+        cropped.save(img_byte_arr, format='JPEG', quality=85)
         return img_byte_arr.getvalue()
     except Exception as e:
         print(f"Crop failed: {e}")
@@ -129,7 +130,8 @@ def img_to_bytes(pil_img):
     img_byte_arr = io.BytesIO()
     if pil_img.mode in ("RGBA", "P"): 
         pil_img = pil_img.convert("RGB")
-    pil_img.save(img_byte_arr, format='JPEG')
+    # 壓縮整頁圖片以加速
+    pil_img.save(img_byte_arr, format='JPEG', quality=80) 
     return img_byte_arr.getvalue()
 
 # ==========================================
@@ -149,7 +151,8 @@ def parse_with_gemini(file_bytes, file_type, api_key):
     if file_type == 'pdf':
         if not HAS_PDF2IMAGE: return {"error": "缺少 pdf2image (Poppler) 未安裝"}
         try:
-            source_images = convert_from_bytes(file_bytes, dpi=200, fmt='jpeg')
+            # 優化：降低 DPI 至 150 以加速 (文字辨識通常 150 就夠了)
+            source_images = convert_from_bytes(file_bytes, dpi=150, fmt='jpeg')
         except Exception as e:
             return {"error": f"PDF 轉圖片失敗: {str(e)}"}
             
@@ -169,8 +172,8 @@ def parse_with_gemini(file_bytes, file_type, api_key):
 
     if not source_images and file_type == 'pdf': return {"error": "PDF 頁面為空"}
 
-    # 分批處理
-    BATCH_SIZE = 5 
+    # 優化：增加 Batch Size (一次處理更多頁)，減少 API 往返時間
+    BATCH_SIZE = 10 
     total_pages = len(source_images)
     all_candidates = []
     errors = []
@@ -183,66 +186,75 @@ def parse_with_gemini(file_bytes, file_type, api_key):
     prompt_chapters = [c for c in PHYSICS_CHAPTERS_LIST if c != "未分類"]
     chapters_str = "\n".join(prompt_chapters)
     
+    # [需求修正] 固定 AI 模型優先順序
+    candidate_models = [
+        "gemini-2.5-flash",    
+        "gemini-2.5-pro",      
+        "gemini-2.0-flash",    
+        "gemini-1.5-pro"       
+    ]
+    
+    # 測試可用的模型
+    selected_model_name = None
+    for m in candidate_models:
+        try:
+            # 建立模型物件 (不實際呼叫，僅測試初始化)
+            genai.GenerativeModel(m)
+            selected_model_name = m
+            break
+        except: continue
+        
+    if not selected_model_name:
+        # Fallback 到最基礎的模型
+        selected_model_name = "gemini-1.5-flash"
+
+    # print(f"使用模型: {selected_model_name}") 
+    model = genai.GenerativeModel(selected_model_name)
+
     for batch_idx, batch_imgs in enumerate(batches):
         start_page_idx = batch_idx * BATCH_SIZE
         
         extra_instruction = ""
         if file_type == 'pdf':
             extra_instruction = """
-            對於每一題，請回傳兩個座標範圍：
-            1. 'full_question_box_2d': 包含題號、題目文字、選項與圖片的完整區域。請盡量寬鬆，包含到上一題結束與下一題開始的空白處。
-            2. 'box_2d': 如果該題有附圖(diagram)，請標示圖片的範圍；若無則省略。
-            座標格式皆為 [ymin, xmin, ymax, xmax] (範圍 0-1000)。
+            回傳每題的座標範圍：
+            1. 'full_question_box_2d': 整題(含題號,文字,選項)的邊界 [ymin, xmin, ymax, xmax] (0-1000)。
+            2. 'box_2d': 若有圖片，標示圖片範圍。
             """
         
+        # 精簡 Prompt 以加速
         prompt = f"""
-        你是一個高中物理老師助理。這份試卷包含物理、化學、生物、地科試題。
-        請詳細分析這 {len(batch_imgs)} 頁考卷圖片。
+        分析考卷圖片。
+        只擷取【高中物理】試題。
         
-        【重要任務】：
-        1. **僅擷取物理科試題** (Physics)。
-        2. **嚴格過濾**：若題目屬於純化學 (Chemistry)、純生物 (Biology) 或純地球科學 (Earth Science)，請**絕對不要**寫入回傳的 JSON 清單中。直接忽略它們。
-        3. 若為「跨科題」且包含物理概念，則可以保留。
-        
-        輸出格式：JSON List
+        輸出 JSON List:
+        [
+            {{
+                "number": 1,
+                "type": "Single/Multi/Fill",
+                "content": "題目文字...",
+                "options": ["(A)...", "(B)..."],
+                "answer": "A",
+                "chapter": "從此選: {chapters_str}",
+                "full_question_box_2d": [ymin, xmin, ymax, xmax],
+                "box_2d": [ymin, xmin, ymax, xmax], 
+                "page_index": 0 
+            }}
+        ]
+        page_index 是圖片在批次中的索引(0開始)。
         {extra_instruction}
         """
 
         input_parts = [prompt]
-        if file_type == 'docx':
-            input_parts.append("請分析以下 Word 文件中的圖片與題目。")
-        
         input_parts.extend(batch_imgs)
 
-        # 優先使用 2.5 系列
-        candidate_models = [
-            "gemini-2.5-flash",    
-            "gemini-2.5-pro",      
-            "gemini-2.0-flash",    
-            "gemini-1.5-pro"       
-        ]
-        
         generation_config = {"response_mime_type": "application/json"}
-        response = None
-        last_error = None
         
-        for model_name in candidate_models:
-            try:
-                model = genai.GenerativeModel(model_name)
-                response = model.generate_content(input_parts, generation_config=generation_config)
-                break
-            except Exception as e:
-                last_error = e
-                continue
-
-        if not response:
-            error_msg = str(last_error) if last_error else "Unknown error"
-            errors.append(f"Batch {batch_idx+1} failed ({error_msg})")
-            continue
-
         try:
+            response = model.generate_content(input_parts, generation_config=generation_config)
+            
             if not response.text:
-                errors.append(f"Batch {batch_idx+1} blocked by safety filters.")
+                errors.append(f"Batch {batch_idx+1}: Empty response")
                 continue
 
             json_text = clean_json_string(response.text)
@@ -250,15 +262,10 @@ def parse_with_gemini(file_bytes, file_type, api_key):
             if isinstance(data, dict): data = [data]
             
             for item in data:
-                if 'subject' in item and item['subject'].lower() not in ['physics', '物理']:
-                    continue
-                
+                # 關鍵字過濾
                 content_text = (item.get('content', '') + " " + " ".join(item.get('options', []))).lower()
-                physics_keywords = ["牛頓", "速度", "加速度", "電路", "磁場", "光學", "焦耳"]
-                is_cross_subject = any(pk in content_text for pk in physics_keywords)
-                if not is_cross_subject:
-                    if any(ek in content_text for ek in EXCLUDE_KEYWORDS):
-                        continue 
+                if any(ek in content_text for ek in EXCLUDE_KEYWORDS):
+                    continue 
 
                 diagram_bytes = None
                 ref_bytes = None
@@ -272,7 +279,7 @@ def parse_with_gemini(file_bytes, file_type, api_key):
                         if 0 <= absolute_idx < len(source_images):
                             src_img = source_images[absolute_idx]
                             
-                            # 保存整頁圖，作為截圖的 Fallback
+                            # 儲存整頁，供前端裁切使用
                             full_page_bytes = img_to_bytes(src_img)
                             
                             if 'box_2d' in item:
@@ -281,7 +288,7 @@ def parse_with_gemini(file_bytes, file_type, api_key):
                             if 'full_question_box_2d' in item:
                                 ref_bytes = crop_image(src_img, item['full_question_box_2d'], force_full_width=True, padding_y=50)
                             else:
-                                ref_bytes = full_page_bytes # 若 AI 沒給座標，就給整頁
+                                ref_bytes = full_page_bytes
                                 
                     except Exception as e:
                         print(f"Image crop error: {e}")
@@ -295,7 +302,7 @@ def parse_with_gemini(file_bytes, file_type, api_key):
                     status_reason=f"Batch {batch_idx+1}",
                     image_bytes=diagram_bytes,      
                     ref_image_bytes=ref_bytes,
-                    full_page_bytes=full_page_bytes, # [關鍵] 傳遞整頁圖片
+                    full_page_bytes=full_page_bytes,
                     q_type=item.get('type', 'Single'),
                     subject='Physics' 
                 )
@@ -303,9 +310,9 @@ def parse_with_gemini(file_bytes, file_type, api_key):
                 all_candidates.append(cand)
                 
         except Exception as e:
-            errors.append(f"Batch {batch_idx+1} parsing error: {str(e)}")
+            errors.append(f"Batch {batch_idx+1} error: {str(e)}")
             
-        time.sleep(1)
+        time.sleep(1) # 避免 Rate Limit
 
     if not all_candidates and errors:
         return {"error": f"分析失敗詳情: {'; '.join(errors)}"}
