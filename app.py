@@ -125,7 +125,7 @@ class CloudManager:
                     bucket.create(location="us-central1") 
         except: pass
 
-    # --- 新增功能：取得儲存空間使用量 ---
+    # --- 容量計算功能 ---
     def get_storage_usage(self):
         """計算 Bucket 中所有檔案的總大小 (Bytes)"""
         if not self.storage_client: return 0
@@ -140,8 +140,6 @@ class CloudManager:
             if not target_bucket_name: return 0
 
             bucket = self.storage_client.bucket(target_bucket_name)
-            # list_blobs 可能需要一點時間，且屬於 Class A 操作
-            # 若檔案極多，建議搭配快取或定期更新
             blobs = bucket.list_blobs()
             total_bytes = sum(blob.size for blob in blobs if blob.size is not None)
             return total_bytes
@@ -442,7 +440,7 @@ def process_single_file(filename, api_key, file_id_in_db=None):
     info = st.session_state['file_queue'][filename]
     info['status'] = 'processing'
     
-    with st.spinner(f"正在分析 {filename}..."):
+    with st.spinner(f"正在分析 {filename}... (AI 思考中，請稍候)"):
         res = smart_importer.parse_with_gemini(info['data'], info['type'], api_key)
     
     if isinstance(res, dict) and "error" in res:
@@ -454,7 +452,11 @@ def process_single_file(filename, api_key, file_id_in_db=None):
         info['result'] = res
         if file_id_in_db:
             cloud_manager.update_file_status(file_id_in_db, "已辨識")
+        
         st.success(f"{filename} 辨識完成！")
+        # [優化] 設定標記，讓 Tab 3 自動選取該檔案
+        st.session_state['just_processed_file'] = filename
+        st.info("💡 請切換至「📝 AI匯入校對」分頁開始編輯")
         
     st.rerun()
 
@@ -643,6 +645,13 @@ with tab_upload_process:
 
 # === Tab 2: 檔案管理及AI辨識 ===
 with tab_files:
+    # 檢查是否有剛辨識完成的檔案
+    if 'just_processed_file' in st.session_state:
+        st.success(f"🎉 **{st.session_state['just_processed_file']}** 辨識完成！")
+        st.info("👉 請點選上方 **「📝 AI匯入校對」** 分頁進行檢查。")
+        # 清除標記
+        del st.session_state['just_processed_file']
+
     st.subheader("已上傳考古題檔案庫")
     cloud_files = cloud_manager.load_file_records()
     
@@ -666,7 +675,7 @@ with tab_files:
             with st.expander(f"📁 {ftype}", expanded=False):
                 years_dict = files_tree[ftype]
                 
-                # 第二層：年度 (Year) - 遞減排序 (大到小)
+                # 第二層：年度 (Year) - 遞減排序
                 def year_sort_key(y_str):
                     return -int(y_str) if y_str.isdigit() else 0
                 
@@ -687,7 +696,7 @@ with tab_files:
                         # 第三層：檔案列表 (單行顯示：檔名 | 狀態 | 按鈕)
                         for f_record in sorted_files:
                             # 佈局：檔案資訊 | AI 狀態 | 操作按鈕
-                            # 加入 vertical_alignment="center" 確保垂直置中
+                            # vertical_alignment="center" 讓文字按鈕水平對齊
                             c_name, c_status, c_action = st.columns([5, 2, 3], vertical_alignment="center")
                             
                             with c_name:
@@ -695,7 +704,7 @@ with tab_files:
                             
                             with c_status:
                                 status = f_record.get('ai_status', '未辨識')
-                                # 使用 disabled button 模擬狀態標籤，確保高度一致
+                                # 使用 disabled button 模擬標籤
                                 if status == '已辨識':
                                     st.button("✅ 已辨識", key=f"status_{f_record['id']}", disabled=True, use_container_width=True)
                                 else:
@@ -741,7 +750,12 @@ with tab_review:
     if not ready_files:
         st.warning("沒有已完成辨識的檔案。請先至「檔案管理及AI辨識」點擊辨識，或上傳新檔案。")
     else:
-        selected_file = st.selectbox("選擇要處理的檔案", ready_files)
+        # 自動選擇最後一個完成的檔案 (提升 UX)
+        default_idx = 0
+        if 'just_processed_file' in st.session_state and st.session_state['just_processed_file'] in ready_files:
+             default_idx = ready_files.index(st.session_state['just_processed_file'])
+
+        selected_file = st.selectbox("選擇要處理的檔案", ready_files, index=default_idx)
         file_info = st.session_state['file_queue'][selected_file]
         candidates = file_info['result']
         
