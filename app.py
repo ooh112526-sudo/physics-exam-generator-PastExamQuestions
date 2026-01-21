@@ -41,7 +41,6 @@ class CloudManager:
             service_account_json = os.getenv("GCP_SERVICE_ACCOUNT_JSON")
             if service_account_json:
                 try:
-                    # Clean up
                     service_account_json = service_account_json.strip()
                     if service_account_json.startswith("'") and service_account_json.endswith("'"):
                          service_account_json = service_account_json[1:-1]
@@ -193,7 +192,6 @@ class CloudManager:
         if not self.db: return []
         try:
             files = []
-            # 取得所有檔案記錄
             docs = self.db.collection("exam_files").order_by("updated_at", direction=firestore.Query.DESCENDING).stream()
             for doc in docs:
                 files.append(doc.to_dict())
@@ -469,7 +467,7 @@ with st.sidebar:
 
 tab_files, tab_upload_process, tab_review, tab_bank = st.tabs(["📂 檔案庫管理", "🧠 上傳與辨識", "📝 匯入校對", "📚 題庫管理"])
 
-# === Tab 1: 檔案庫管理 (階層式顯示 - 優化版) ===
+# === Tab 1: 檔案庫管理 (修正為兩層顯示) ===
 with tab_files:
     st.subheader("已上傳考古題檔案庫")
     cloud_files = cloud_manager.load_file_records()
@@ -496,12 +494,12 @@ with tab_files:
         # 第一層：類別 (學測、北模...)
         for ftype in sorted(files_tree.keys()):
             with st.expander(f"📁 {ftype}", expanded=True):
-                # 第二層：年度+次別 (遞增排序)
-                # 自定義排序 Key：年份(數字) + 次別順序
+                # 第二層：年度+次別 (遞減排序：年份由大到小)
                 def sort_key(key_str):
                     parts = key_str.split()
                     if len(parts) >= 1 and parts[0].isdigit():
-                        return int(parts[0]), parts[1:] # (112, ['第一次'])
+                        # 年份負數代表遞減排序，次別字串遞增排序
+                        return -int(parts[0]), parts[1:] 
                     return 0, parts
 
                 sorted_keys = sorted(files_tree[ftype].keys(), key=sort_key)
@@ -562,7 +560,7 @@ with tab_files:
                                     st.rerun()
                     st.markdown("---") # 分隔線
 
-# === Tab 2: 上傳與辨識 (含重複檢查與個別重新命名) ===
+# === Tab 2: 上傳與辨識 (個別設定版) ===
 with tab_upload_process:
     st.markdown("### 📤 上傳新考古題")
     st.info("請先選擇檔案，設定各自的標籤後，系統將自動重新命名並上傳。")
