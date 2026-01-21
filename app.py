@@ -41,6 +41,7 @@ class CloudManager:
             service_account_json = os.getenv("GCP_SERVICE_ACCOUNT_JSON")
             if service_account_json:
                 try:
+                    # Clean up
                     service_account_json = service_account_json.strip()
                     if service_account_json.startswith("'") and service_account_json.endswith("'"):
                          service_account_json = service_account_json[1:-1]
@@ -467,7 +468,7 @@ with st.sidebar:
 
 tab_files, tab_upload_process, tab_review, tab_bank = st.tabs(["📂 檔案庫管理", "🧠 上傳與辨識", "📝 匯入校對", "📚 題庫管理"])
 
-# === Tab 1: 檔案庫管理 (修正為兩層顯示) ===
+# === Tab 1: 檔案庫管理 (階層式顯示：類型 -> 年度 -> 次別 -> 檔案列表) ===
 with tab_files:
     st.subheader("已上傳考古題檔案庫")
     cloud_files = cloud_manager.load_file_records()
@@ -475,60 +476,54 @@ with tab_files:
     if not cloud_files:
         st.info("目前沒有已上傳的檔案記錄。")
     else:
-        # 1. 整理資料結構： {type: {year_no: [file_records]}}
+        # 1. 整理資料結構： {type: {year: {exam_no: [file_records]}}}
         files_tree = {}
         for f in cloud_files:
             ftype = f.get('exam_type', '未分類')
             fyear = f.get('year', '未知年份')
             fno = f.get('exam_no', '未知次別')
             
-            # 組合第二層的 Key: "112 第一次", "112 第二次"
-            year_no_key = f"{fyear} {fno}"
-            
             if ftype not in files_tree: files_tree[ftype] = {}
-            if year_no_key not in files_tree[ftype]: files_tree[ftype][year_no_key] = []
+            if fyear not in files_tree[ftype]: files_tree[ftype][fyear] = {}
+            if fno not in files_tree[ftype][fyear]: files_tree[ftype][fyear][fno] = []
             
-            files_tree[ftype][year_no_key].append(f)
+            files_tree[ftype][fyear][fno].append(f)
 
-        # 2. 顯示
-        # 第一層：類別 (學測、北模...)
+        # 2. 顯示：第一層 類型 (Type)
         for ftype in sorted(files_tree.keys()):
             with st.expander(f"📁 {ftype}", expanded=True):
-                # 第二層：年度+次別 (遞減排序：年份由大到小)
-                def sort_key(key_str):
-                    parts = key_str.split()
-                    if len(parts) >= 1 and parts[0].isdigit():
-                        # 年份負數代表遞減排序，次別字串遞增排序
-                        return -int(parts[0]), parts[1:] 
-                    return 0, parts
-
-                sorted_keys = sorted(files_tree[ftype].keys(), key=sort_key)
+                years_dict = files_tree[ftype]
                 
-                for yn_key in sorted_keys:
-                    st.markdown(f"**📌 {yn_key}**")
+                # 第二層：年度 (Year) - 遞減排序 (大到小)
+                def year_sort_key(y_str):
+                    return -int(y_str) if y_str.isdigit() else 0
+                
+                for fyear in sorted(years_dict.keys(), key=year_sort_key):
+                    st.markdown(f"**📅 {fyear} 年度**")
+                    nos_dict = years_dict[fyear]
                     
-                    files_list = files_tree[ftype][yn_key]
-                    
-                    # 第三層：檔案列表 (精簡單行顯示)
-                    for f_record in files_list:
-                        # 使用 columns 將內容擠在同一行
-                        # 比例分配：檔名(5) | 狀態(2) | 動作按鈕(3)
-                        c_name, c_status, c_action = st.columns([5, 2, 3])
+                    # 第三層：次別 (Exam No) - 遞增排序 (第一次 -> 第二次)
+                    # 簡單字典排序通常符合需求
+                    for fno in sorted(nos_dict.keys()):
+                        st.caption(f"📌 {fno}")
+                        files_list = nos_dict[fno]
                         
-                        with c_name:
-                            st.write(f"📄 {f_record.get('filename')}")
-                        
-                        with c_status:
-                            status = f_record.get('ai_status', '未辨識')
-                            if status == '已辨識':
-                                st.success("已辨識", icon="✅")
-                            else:
-                                st.info("未辨識", icon="⬜")
-                        
-                        with c_action:
-                            # 使用 columns 再細分按鈕，讓它們並排
-                            b1, b2 = st.columns(2)
-                            with b1:
+                        # 第四層：檔案列表 (單行顯示)
+                        for f_record in files_list:
+                            # 佈局：檔案名稱 | AI 狀態 | 重新辨識 | 刪除
+                            c_name, c_status, c_btn1, c_btn2 = st.columns([5, 2, 2, 1])
+                            
+                            with c_name:
+                                st.write(f"📄 {f_record.get('filename')}")
+                            
+                            with c_status:
+                                status = f_record.get('ai_status', '未辨識')
+                                if status == '已辨識':
+                                    st.success("✅ 已辨識")
+                                else:
+                                    st.info("⬜ 未辨識")
+                            
+                            with c_btn1:
                                 btn_label = "重新辨識" if status == '已辨識' else "AI 辨識"
                                 if st.button(btn_label, key=f"ai_{f_record['id']}", use_container_width=True):
                                     fname = f_record['filename']
@@ -544,7 +539,7 @@ with tab_files:
                                                         "type": fname.split('.')[-1].lower(),
                                                         "result": [],
                                                         "error_msg": "",
-                                                        "source_tag": f"{ftype}-{yn_key}",
+                                                        "source_tag": f"{ftype}-{fyear}",
                                                         "backup_url": file_url,
                                                         "db_id": f_record['id']
                                                     }
@@ -554,13 +549,13 @@ with tab_files:
                                     else:
                                         process_single_file(fname, api_key_input, f_record['id'])
                             
-                            with b2:
-                                if st.button("🗑️", key=f"del_f_{f_record['id']}", type="primary", use_container_width=True, help="刪除檔案"):
+                            with c_btn2:
+                                if st.button("🗑️", key=f"del_f_{f_record['id']}", type="primary", use_container_width=True):
                                     cloud_manager.delete_file_record(f_record['id'])
                                     st.rerun()
-                    st.markdown("---") # 分隔線
+                        st.divider() # 每個次別結束加個分隔線，或可省略
 
-# === Tab 2: 上傳與辨識 (個別設定版) ===
+# === Tab 2: 上傳與辨識 (含重複檢查與個別重新命名) ===
 with tab_upload_process:
     st.markdown("### 📤 上傳新考古題")
     st.info("請先選擇檔案，設定各自的標籤後，系統將自動重新命名並上傳。")
