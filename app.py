@@ -469,7 +469,7 @@ with st.sidebar:
 
 tab_files, tab_upload_process, tab_review, tab_bank = st.tabs(["📂 檔案庫管理", "🧠 上傳與辨識", "📝 匯入校對", "📚 題庫管理"])
 
-# === Tab 1: 檔案庫管理 (依照新需求修改) ===
+# === Tab 1: 檔案庫管理 (修正版：三層結構 + 高度對齊) ===
 with tab_files:
     st.subheader("已上傳考古題檔案庫")
     cloud_files = cloud_manager.load_file_records()
@@ -478,7 +478,6 @@ with tab_files:
         st.info("目前沒有已上傳的檔案記錄。")
     else:
         # 1. 整理資料結構： {type: {year: [file_records]}}
-        # 我們將「次別」包含在 file_records 列表中，不作為獨立的第三層資料夾
         files_tree = {}
         for f in cloud_files:
             ftype = f.get('exam_type', '未分類')
@@ -513,23 +512,23 @@ with tab_files:
                         
                         sorted_files = sorted(files_list, key=file_sort_key)
                         
-                        # 第三層：直接顯示檔案列表
+                        # 第三層：檔案列表
                         for f_record in sorted_files:
-                            # 檔名處理：如果使用者有設定次別，檔名通常已經包含
-                            # 這裡單純顯示檔名
-                            
-                            # 單行佈局： 檔名 | 狀態 | 按鈕
-                            c_name, c_status, c_action = st.columns([5, 2, 3])
+                            # 佈局：檔案資訊 | AI 狀態 | 操作按鈕
+                            # 加入 vertical_alignment="center" 確保垂直置中
+                            c_name, c_status, c_action = st.columns([5, 2, 3], vertical_alignment="center")
                             
                             with c_name:
+                                # 直接顯示檔名 (例如：112-中模-第一次.pdf)
                                 st.write(f"📄 {f_record.get('filename')}")
                             
                             with c_status:
                                 status = f_record.get('ai_status', '未辨識')
+                                # 使用 disabled button 來模擬標籤，確保高度與右邊按鈕一致
                                 if status == '已辨識':
-                                    st.success("✅ 已辨識")
+                                    st.button("✅ 已辨識", key=f"status_{f_record['id']}", disabled=True, use_container_width=True)
                                 else:
-                                    st.info("⬜ 未辨識")
+                                    st.button("⬜ 未辨識", key=f"status_{f_record['id']}", disabled=True, use_container_width=True)
                             
                             with c_action:
                                 b1, b2 = st.columns(2)
