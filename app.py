@@ -469,7 +469,7 @@ with st.sidebar:
 
 tab_files, tab_upload_process, tab_review, tab_bank = st.tabs(["📂 檔案庫管理", "🧠 上傳與辨識", "📝 匯入校對", "📚 題庫管理"])
 
-# === Tab 1: 檔案庫管理 (巢狀結構優化) ===
+# === Tab 1: 檔案庫管理 (依照新需求修改) ===
 with tab_files:
     st.subheader("已上傳考古題檔案庫")
     cloud_files = cloud_manager.load_file_records()
@@ -478,6 +478,7 @@ with tab_files:
         st.info("目前沒有已上傳的檔案記錄。")
     else:
         # 1. 整理資料結構： {type: {year: [file_records]}}
+        # 我們將「次別」包含在 file_records 列表中，不作為獨立的第三層資料夾
         files_tree = {}
         for f in cloud_files:
             ftype = f.get('exam_type', '未分類')
@@ -488,7 +489,8 @@ with tab_files:
             
             files_tree[ftype][fyear].append(f)
 
-        # 2. 顯示：第一層 類型 (Type) (例如：北模、學測)
+        # 2. 顯示邏輯
+        # 第一層：類別 (Type)
         for ftype in sorted(files_tree.keys()):
             with st.expander(f"📁 {ftype}", expanded=False):
                 years_dict = files_tree[ftype]
@@ -498,14 +500,12 @@ with tab_files:
                     return -int(y_str) if y_str.isdigit() else 0
                 
                 for fyear in sorted(years_dict.keys(), key=year_sort_key):
-                    # 使用巢狀 expander 顯示年度
-                    with st.expander(f"📅 {fyear} 年度", expanded=False):
+                    # 將「年度」做成第二層的資料夾按鈕 (expander)
+                    with st.expander(f"📁 {fyear} 年度", expanded=False):
                         
-                        # 取得該年度下的所有檔案
                         files_list = years_dict[fyear]
                         
-                        # 依照次別 (Exam No) 遞增排序
-                        # 為了排序，我們可以定義一個 mapping
+                        # 在這層依照「次別」排序檔案：第一次 -> 第二次 -> 第三次
                         exam_no_order = {"第一次": 1, "第二次": 2, "第三次": 3, "正式考試": 4, "其他": 99}
                         def file_sort_key(f):
                             no = f.get('exam_no', '其他')
@@ -513,13 +513,15 @@ with tab_files:
                         
                         sorted_files = sorted(files_list, key=file_sort_key)
                         
-                        # 第三層：檔案列表 (單行顯示：檔名 | 狀態 | 按鈕)
+                        # 第三層：直接顯示檔案列表
                         for f_record in sorted_files:
-                            # 佈局：檔案資訊 | AI 狀態 | 操作按鈕
-                            c_info, c_status, c_action = st.columns([5, 2, 3])
+                            # 檔名處理：如果使用者有設定次別，檔名通常已經包含
+                            # 這裡單純顯示檔名
                             
-                            with c_info:
-                                # 顯示：112-中模-第一次.pdf
+                            # 單行佈局： 檔名 | 狀態 | 按鈕
+                            c_name, c_status, c_action = st.columns([5, 2, 3])
+                            
+                            with c_name:
                                 st.write(f"📄 {f_record.get('filename')}")
                             
                             with c_status:
@@ -535,33 +537,33 @@ with tab_files:
                                     btn_label = "重新辨識" if status == '已辨識' else "AI 辨識"
                                     if st.button(btn_label, key=f"ai_{f_record['id']}", use_container_width=True):
                                         fname = f_record['filename']
-                                        # 嘗試從雲端下載檔案並開始辨識
-                                        try:
-                                            file_url = f_record.get('url')
-                                            if file_url:
-                                                resp = requests.get(file_url)
-                                                if resp.status_code == 200:
-                                                    st.session_state['file_queue'][fname] = {
-                                                        "status": "uploaded", 
-                                                        "data": resp.content,
-                                                        "type": fname.split('.')[-1].lower(),
-                                                        "result": [],
-                                                        "error_msg": "",
-                                                        "source_tag": f"{ftype}-{fyear}",
-                                                        "backup_url": file_url,
-                                                        "db_id": f_record['id']
-                                                    }
-                                                    process_single_file(fname, api_key_input, f_record['id'])
-                                                else: st.error("下載失敗")
-                                        except: st.error("下載異常")
-                                
+                                        if fname not in st.session_state['file_queue']:
+                                            try:
+                                                file_url = f_record.get('url')
+                                                if file_url:
+                                                    resp = requests.get(file_url)
+                                                    if resp.status_code == 200:
+                                                        st.session_state['file_queue'][fname] = {
+                                                            "status": "uploaded", 
+                                                            "data": resp.content,
+                                                            "type": fname.split('.')[-1].lower(),
+                                                            "result": [],
+                                                            "error_msg": "",
+                                                            "source_tag": f"{ftype}-{fyear}",
+                                                            "backup_url": file_url,
+                                                            "db_id": f_record['id']
+                                                        }
+                                                        process_single_file(fname, api_key_input, f_record['id'])
+                                                    else: st.error("下載失敗")
+                                            except: st.error("下載異常")
+                                        else:
+                                            process_single_file(fname, api_key_input, f_record['id'])
                                 with b2:
                                     if st.button("🗑️", key=f"del_f_{f_record['id']}", type="primary", use_container_width=True):
                                         cloud_manager.delete_file_record(f_record['id'])
                                         st.rerun()
-                            st.markdown("---") 
 
-# === Tab 2: 上傳與辨識 (個別設定版) ===
+# === Tab 2: 上傳與辨識 (含重複檢查與個別重新命名) ===
 with tab_upload_process:
     st.markdown("### 📤 上傳新考古題")
     st.info("請先選擇檔案，設定各自的標籤後，系統將自動重新命名並上傳。")
