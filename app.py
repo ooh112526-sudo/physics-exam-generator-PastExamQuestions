@@ -41,7 +41,7 @@ class CloudManager:
             service_account_json = os.getenv("GCP_SERVICE_ACCOUNT_JSON")
             if service_account_json:
                 try:
-                    # Clean up potential formatting issues
+                    # Clean up
                     service_account_json = service_account_json.strip()
                     if service_account_json.startswith("'") and service_account_json.endswith("'"):
                          service_account_json = service_account_json[1:-1]
@@ -175,7 +175,6 @@ class CloudManager:
             if not target_bucket_name: return 0
 
             bucket = self.storage_client.bucket(target_bucket_name)
-            # list_blobs 屬於 Class A 操作，頻繁呼叫可能會有些微費用，但在小量檔案下可忽略
             blobs = bucket.list_blobs()
             total_bytes = sum(blob.size for blob in blobs if blob.size is not None)
             return total_bytes
