@@ -41,7 +41,7 @@ class CloudManager:
             service_account_json = os.getenv("GCP_SERVICE_ACCOUNT_JSON")
             if service_account_json:
                 try:
-                    # Clean up
+                    # Clean up potential formatting issues
                     service_account_json = service_account_json.strip()
                     if service_account_json.startswith("'") and service_account_json.endswith("'"):
                          service_account_json = service_account_json[1:-1]
@@ -159,6 +159,29 @@ class CloudManager:
         except Exception as e:
             print(f"上傳失敗: {e}")
             return None
+
+    # --- 容量計算功能 (新) ---
+    def get_storage_usage(self):
+        """計算 Bucket 中所有檔案的總大小 (Bytes)"""
+        if not self.storage_client: return 0
+        try:
+            target_bucket_name = self.bucket_name
+            if not target_bucket_name:
+                try:
+                    if "GCS_BUCKET_NAME" in st.secrets:
+                        target_bucket_name = st.secrets["GCS_BUCKET_NAME"]
+                except: pass
+            
+            if not target_bucket_name: return 0
+
+            bucket = self.storage_client.bucket(target_bucket_name)
+            # list_blobs 屬於 Class A 操作，頻繁呼叫可能會有些微費用，但在小量檔案下可忽略
+            blobs = bucket.list_blobs()
+            total_bytes = sum(blob.size for blob in blobs if blob.size is not None)
+            return total_bytes
+        except Exception as e:
+            print(f"容量計算失敗: {e}")
+            return 0
 
     # --- 檔案庫管理功能 ---
     
@@ -458,6 +481,24 @@ with st.sidebar:
     st.divider()
     st.metric("題庫總數", len(st.session_state['question_pool']))
     
+    # 顯示雲端空間使用量
+    if cloud_manager.has_connection:
+        st.divider()
+        try:
+            total_bytes = cloud_manager.get_storage_usage()
+            total_mb = total_bytes / (1024 * 1024)
+            limit_mb = 1024.0 # 1GB
+            percentage = min(total_mb / limit_mb, 1.0)
+            
+            st.write("📊 **雲端儲存空間**")
+            st.progress(percentage)
+            st.caption(f"已使用: {total_mb:.2f} MB / 1 GB")
+            
+            if percentage > 0.9:
+                st.warning("⚠️ 容量即將額滿！")
+        except:
+            st.caption("無法取得容量資訊")
+
     if st.button("強制儲存至雲端"):
         if cloud_manager.has_connection:
             progress_bar = st.progress(0)
