@@ -23,7 +23,9 @@ import smart_importer
 
 st.set_page_config(page_title="物理題庫系統 (Pro)", layout="wide", page_icon="🧲")
 
-# ... (CloudManager class remains the same) ...
+# ==========================================
+# 雲端資料庫與儲存模組 (內建)
+# ==========================================
 class CloudManager:
     def __init__(self):
         self.bucket_name = os.getenv("GCS_BUCKET_NAME", "physics-exam-assets")
@@ -39,7 +41,7 @@ class CloudManager:
             service_account_json = os.getenv("GCP_SERVICE_ACCOUNT_JSON")
             if service_account_json:
                 try:
-                    # Clean up potential formatting issues
+                    # Clean up
                     service_account_json = service_account_json.strip()
                     if service_account_json.startswith("'") and service_account_json.endswith("'"):
                          service_account_json = service_account_json[1:-1]
@@ -161,7 +163,6 @@ class CloudManager:
     # --- 檔案庫管理功能 ---
     
     def check_file_exists(self, filename):
-        """檢查 Firestore 中是否有同名檔案"""
         if not self.db: return None
         try:
             docs = self.db.collection("exam_files").where("filename", "==", filename).limit(1).stream()
@@ -175,13 +176,11 @@ class CloudManager:
             return None
 
     def save_file_record(self, file_info, overwrite_id=None):
-        """儲存或更新檔案記錄"""
         if not self.db: return False
         try:
             doc_id = overwrite_id if overwrite_id else str(uuid.uuid4())
             file_info["id"] = doc_id
             file_info["updated_at"] = datetime.datetime.now()
-            
             self.db.collection("exam_files").document(doc_id).set(file_info)
             return True
         except Exception as e:
@@ -192,6 +191,7 @@ class CloudManager:
         if not self.db: return []
         try:
             files = []
+            # 取得所有檔案記錄
             docs = self.db.collection("exam_files").order_by("updated_at", direction=firestore.Query.DESCENDING).stream()
             for doc in docs:
                 files.append(doc.to_dict())
@@ -248,7 +248,7 @@ class CloudManager:
 # 初始化 Cloud Manager
 cloud_manager = CloudManager()
 
-# ... (Question class and init code remains the same) ...
+# ... (Question class remains same) ...
 class Question:
     def __init__(self, q_type, content, options=None, answer=None, original_id=0, image_data=None, 
                  source="一般試題", chapter="未分類", unit="", db_id=None, 
@@ -332,7 +332,7 @@ if 'question_pool' not in st.session_state:
 if 'file_queue' not in st.session_state:
     st.session_state['file_queue'] = {}
 
-# ... (Utility Functions remain the same) ...
+# ... (Utility Functions remain same) ...
 def get_image_bytes(q):
     if q.image_data: return q.image_data
     if q.image_url:
@@ -467,79 +467,105 @@ with st.sidebar:
 
 tab_files, tab_upload_process, tab_review, tab_bank = st.tabs(["📂 檔案庫管理", "🧠 上傳與辨識", "📝 匯入校對", "📚 題庫管理"])
 
-# === Tab 1: 檔案庫管理 ===
+# === Tab 1: 檔案庫管理 (階層式顯示) ===
 with tab_files:
     st.subheader("已上傳考古題檔案庫")
     cloud_files = cloud_manager.load_file_records()
     
     if not cloud_files:
-        st.info("目前沒有已上傳的檔案記錄。請至「上傳與辨識」分頁新增。")
+        st.info("目前沒有已上傳的檔案記錄。")
     else:
-        col_header1, col_header2, col_header3, col_header4, col_header5 = st.columns([2, 1, 1, 1, 2])
-        col_header1.markdown("**檔案名稱**")
-        col_header2.markdown("**考試類型**")
-        col_header3.markdown("**年度**")
-        col_header4.markdown("**AI 狀態**")
-        col_header5.markdown("**操作**")
-        st.divider()
+        # 1. 整理資料結構： {type: {year: {exam_no: [file_records]}}}
+        files_tree = {}
+        for f in cloud_files:
+            ftype = f.get('exam_type', '未分類')
+            fyear = f.get('year', '未知年份')
+            fno = f.get('exam_no', '未知次別')
+            
+            if ftype not in files_tree: files_tree[ftype] = {}
+            if fyear not in files_tree[ftype]: files_tree[ftype][fyear] = {}
+            if fno not in files_tree[ftype][fyear]: files_tree[ftype][fyear][fno] = []
+            
+            files_tree[ftype][fyear][fno].append(f)
 
-        for f_record in cloud_files:
-            c1, c2, c3, c4, c5 = st.columns([2, 1, 1, 1, 2])
-            with c1:
-                st.write(f"📄 {f_record.get('filename', '未知')}")
-                if f_record.get('url'):
-                    st.caption(f"[下載原始檔]({f_record.get('url')})")
-            with c2: st.write(f_record.get('exam_type', '-'))
-            with c3: st.write(f_record.get('year', '-'))
-            with c4:
-                status = f_record.get('ai_status', '未辨識')
-                if status == '已辨識': st.success("已辨識")
-                elif status == '處理中': st.warning("處理中")
-                else: st.info("未辨識")
-            with c5:
-                if st.button("AI 辨識", key=f"ai_{f_record['id']}"):
-                    fname = f_record['filename']
-                    if fname not in st.session_state['file_queue']:
-                        try:
-                            file_url = f_record.get('url')
-                            if file_url:
-                                resp = requests.get(file_url)
-                                if resp.status_code == 200:
-                                    st.session_state['file_queue'][fname] = {
-                                        "status": "uploaded", 
-                                        "data": resp.content,
-                                        "type": fname.split('.')[-1].lower(),
-                                        "result": [],
-                                        "error_msg": "",
-                                        "source_tag": f"{f_record.get('exam_type','')}-{f_record.get('year','')}",
-                                        "backup_url": file_url,
-                                        "db_id": f_record['id']
-                                    }
-                                    process_single_file(fname, api_key_input, f_record['id'])
-                                else: st.error("無法從雲端下載檔案")
-                        except Exception as e: st.error(f"下載失敗: {e}")
-                    else:
-                        process_single_file(fname, api_key_input, f_record['id'])
+        # 2. 遞迴顯示 (Type -> Year -> No -> Files)
+        # 第一層：類別 (學測、北模...)
+        for ftype in sorted(files_tree.keys()):
+            with st.expander(f"📁 {ftype}", expanded=True):
+                years_dict = files_tree[ftype]
+                
+                # 第二層：年度
+                for fyear in sorted(years_dict.keys(), reverse=True): # 年份通常倒序
+                    st.markdown(f"**📅 {fyear} 年度**")
+                    nos_dict = years_dict[fyear]
+                    
+                    # 第三層：次別
+                    for fno in sorted(nos_dict.keys()):
+                        st.caption(f"📌 {fno}")
+                        files_list = nos_dict[fno]
+                        
+                        # 第四層：檔案列表 (表格呈現)
+                        for f_record in files_list:
+                            # 每一行檔案顯示
+                            c1, c2, c3 = st.columns([4, 2, 2])
+                            with c1:
+                                st.write(f"📄 {f_record.get('filename')}")
+                                if f_record.get('url'):
+                                    st.caption(f"[下載原始檔]({f_record.get('url')})")
+                            
+                            with c2:
+                                status = f_record.get('ai_status', '未辨識')
+                                if status == '已辨識':
+                                    st.success("✅ 已辨識")
+                                elif status == '處理中':
+                                    st.warning("🔄 處理中")
+                                else:
+                                    st.info("⬜ 未辨識")
+                            
+                            with c3:
+                                # 操作按鈕群
+                                btn_label = "重新辨識" if status == '已辨識' else "AI 辨識"
+                                if st.button(btn_label, key=f"ai_{f_record['id']}"):
+                                    # 觸發 AI 辨識邏輯
+                                    fname = f_record['filename']
+                                    if fname not in st.session_state['file_queue']:
+                                        try:
+                                            file_url = f_record.get('url')
+                                            if file_url:
+                                                resp = requests.get(file_url)
+                                                if resp.status_code == 200:
+                                                    st.session_state['file_queue'][fname] = {
+                                                        "status": "uploaded", 
+                                                        "data": resp.content,
+                                                        "type": fname.split('.')[-1].lower(),
+                                                        "result": [],
+                                                        "error_msg": "",
+                                                        "source_tag": f"{ftype}-{fyear}",
+                                                        "backup_url": file_url,
+                                                        "db_id": f_record['id']
+                                                    }
+                                                    process_single_file(fname, api_key_input, f_record['id'])
+                                                else: st.error("無法下載檔案")
+                                        except: st.error("下載失敗")
+                                    else:
+                                        process_single_file(fname, api_key_input, f_record['id'])
 
-                if st.button("刪除", key=f"del_f_{f_record['id']}", type="primary"):
-                    cloud_manager.delete_file_record(f_record['id'])
-                    st.rerun()
-            st.divider()
+                                if st.button("刪除檔案", key=f"del_f_{f_record['id']}", type="primary"):
+                                    cloud_manager.delete_file_record(f_record['id'])
+                                    st.rerun()
+                        st.divider()
 
-# === Tab 2: 上傳與辨識 (含重複檢查與個別重新命名) ===
+# === Tab 2: 上傳與辨識 (個別設定版) ===
 with tab_upload_process:
     st.markdown("### 📤 上傳新考古題")
     st.info("請先選擇檔案，設定各自的標籤後，系統將自動重新命名並上傳。")
     
-    # 這裡只負責「選擇檔案」，還不真正上傳到雲端
     uploaded_files = st.file_uploader("支援 .pdf, .docx", type=['pdf', 'docx'], accept_multiple_files=True)
     
     if uploaded_files:
         st.divider()
         st.subheader("設定檔案資訊")
         
-        # 暫存使用者設定的參數，用檔名當 Key
-        # 如果 session_state 裡還沒初始化，先初始化
         if 'upload_configs' not in st.session_state:
             st.session_state['upload_configs'] = {}
 
@@ -557,13 +583,10 @@ with tab_upload_process:
                             "year": b_year,
                             "exam_no": b_exam_no
                         }
-                    st.success("已套用！請檢查下方設定。")
+                    st.success("已套用！")
 
-        # 逐一顯示檔案設定列
-        files_to_upload = [] # 準備打包上傳的清單 [(file_obj, new_filename, type, year, no)]
-        
+        files_to_upload = []
         for i, f in enumerate(uploaded_files):
-            # 取得目前的設定 (若無則給預設值)
             current_config = st.session_state['upload_configs'].get(f.name, {
                 "type": "學測", "year": "112", "exam_no": "正式考試"
             })
@@ -572,10 +595,9 @@ with tab_upload_process:
                 c1, c2, c3, c4 = st.columns([3, 2, 2, 2])
                 with c1: 
                     st.markdown(f"**{i+1}. {f.name}**")
-                    # 預覽新檔名
                     ext = f.name.split('.')[-1]
                     new_name = f"{current_config['year']}-{current_config['type']}-{current_config['exam_no']}.{ext}"
-                    st.caption(f"➝ 將命名為: `{new_name}`")
+                    st.caption(f"➝ `{new_name}`")
                 
                 with c2: 
                     new_type = st.selectbox("類型", ["學測", "分科", "北模", "中模", "全模", "其他"], 
@@ -588,13 +610,10 @@ with tab_upload_process:
                                         index=["第一次", "第二次", "第三次", "正式考試"].index(current_config['exam_no']),
                                         key=f"no_{f.name}")
                 
-                # 更新 session_state
                 st.session_state['upload_configs'][f.name] = {
                     "type": new_type, "year": new_year, "exam_no": new_no
                 }
                 
-                # 加入待處理清單
-                # 生成新檔名
                 final_new_name = f"{new_year}-{new_type}-{new_no}.{f.name.split('.')[-1]}"
                 files_to_upload.append({
                     "file_obj": f,
@@ -605,9 +624,7 @@ with tab_upload_process:
                 })
             st.divider()
 
-        # 確認上傳按鈕
         if st.button("確認並上傳所有檔案", type="primary"):
-            # 1. 先檢查是否有新檔名重複
             duplicate_warnings = []
             for item in files_to_upload:
                 existing = cloud_manager.check_file_exists(item['new_filename'])
@@ -617,19 +634,14 @@ with tab_upload_process:
             if duplicate_warnings:
                 st.error(f"發現雲端已有重複檔名，請修改年度或次別：\n" + "\n".join(duplicate_warnings))
             else:
-                # 2. 開始上傳
                 progress_bar = st.progress(0)
                 success_count = 0
-                
                 for idx, item in enumerate(files_to_upload):
                     f = item['file_obj']
                     new_fname = item['new_filename']
-                    
-                    # 讀取檔案內容
                     f.seek(0)
                     file_bytes = f.read()
                     
-                    # 上傳到 Storage (使用新檔名)
                     backup_url = cloud_manager.upload_bytes(
                         file_bytes, 
                         new_fname, 
@@ -637,10 +649,9 @@ with tab_upload_process:
                         content_type=f.type
                     )
                     
-                    # 寫入 Firestore
                     file_record = {
                         "filename": new_fname,
-                        "original_filename": f.name, # 保留原始檔名記錄
+                        "original_filename": f.name,
                         "url": backup_url,
                         "exam_type": item['type'],
                         "year": item['year'],
@@ -650,7 +661,6 @@ with tab_upload_process:
                     }
                     cloud_manager.save_file_record(file_record)
                     
-                    # 加入本地暫存
                     st.session_state['file_queue'][new_fname] = {
                         "status": "uploaded", 
                         "data": file_bytes,
@@ -660,18 +670,15 @@ with tab_upload_process:
                         "source_tag": f"{item['type']}-{item['year']}",
                         "backup_url": backup_url,
                     }
-                    
                     success_count += 1
                     progress_bar.progress((idx + 1) / len(files_to_upload))
                 
                 if success_count > 0:
                     st.success(f"成功上傳 {success_count} 個檔案！")
-                    # 清空暫存設定
                     st.session_state['upload_configs'] = {}
                     time.sleep(1)
                     st.rerun()
 
-    # 顯示目前暫存佇列
     if st.session_state['file_queue']:
         with st.expander(f"查看目前工作階段暫存 ({len(st.session_state['file_queue'])})"):
             for fname in st.session_state['file_queue']:
