@@ -520,7 +520,8 @@ with st.sidebar:
         except:
             st.caption("無法取得容量資訊")
 
-    if st.button("強制儲存至雲端"):
+    # [修正] 加入 key="sidebar_force_save" 以避免 DuplicateElementId 錯誤
+    if st.button("強制儲存至雲端", key="sidebar_force_save"):
         if cloud_manager.has_connection:
             progress_bar = st.progress(0)
             total = len(st.session_state['question_pool'])
