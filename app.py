@@ -9,10 +9,15 @@ import time
 import base64
 import requests 
 from PIL import Image
+
+# [修正] 安全載入 streamlit_cropper，避免 Cloud Run 崩潰
 try:
     from streamlit_cropper import st_cropper 
 except ImportError:
     st_cropper = None 
+except Exception:
+    st_cropper = None
+
 import os
 import datetime
 import uuid
@@ -49,7 +54,7 @@ class CloudManager:
             service_account_json = os.getenv("GCP_SERVICE_ACCOUNT_JSON")
             if service_account_json:
                 try:
-                    # Clean up
+                    # Clean up potential formatting issues
                     service_account_json = service_account_json.strip()
                     if service_account_json.startswith("'") and service_account_json.endswith("'"):
                          service_account_json = service_account_json[1:-1]
@@ -133,6 +138,7 @@ class CloudManager:
                     bucket.create(location="us-central1") 
         except: pass
 
+    # --- 容量計算功能 ---
     def get_storage_usage(self):
         if not self.storage_client: return 0
         try:
@@ -389,6 +395,7 @@ def generate_word_files(selected_questions):
     
     def write_single_question(doc, q, idx_str):
         p = doc.add_paragraph()
+        # 中文題型顯示
         type_badge_zh = TYPE_MAP_EN_TO_ZH.get(q.type, q.type)
         type_label = f"【{type_badge_zh}】"
         src_label = f"[{q.source}] " if q.source and not q.parent_id else "" 
@@ -424,6 +431,7 @@ def generate_word_files(selected_questions):
 
     for q in selected_questions:
         if q.is_group_parent:
+            # 處理題組
             write_single_question(exam_doc, q, f"{q_counter}-{q_counter + len(q.sub_questions) - 1} 為題組")
             for sub_q in q.sub_questions:
                 write_single_question(exam_doc, sub_q, str(q_counter))
@@ -463,6 +471,7 @@ def process_single_file(filename, api_key, file_id_in_db=None):
             cloud_manager.update_file_status(file_id_in_db, "已辨識")
         
         st.success(f"{filename} 辨識完成！")
+        # [優化] 設定標記，讓 Tab 3 自動選取該檔案
         st.session_state['just_processed_file'] = filename
         st.info("💡 請切換至「📝 AI匯入校對」分頁開始編輯")
         
@@ -476,7 +485,8 @@ st.title("🧲 物理題庫系統 Pro (Cloud Storage)")
 with st.sidebar:
     st.header("設定")
     env_api_key = os.getenv("GOOGLE_API_KEY", "")
-    api_key_input = st.text_input("Gemini API Key", value=env_api_key, type="password")
+    # [修正] 加入 key 參數以避免 StreamlitDuplicateElementId 錯誤
+    api_key_input = st.text_input("Gemini API Key", value=env_api_key, type="password", key="sidebar_api_key")
     
     if cloud_manager.has_connection:
         st.success("☁️ Cloud: 已連線")
@@ -492,6 +502,7 @@ with st.sidebar:
     st.divider()
     st.metric("題庫總數", len(st.session_state['question_pool']))
     
+    # 顯示雲端空間使用量
     if cloud_manager.has_connection:
         st.divider()
         try:
@@ -518,7 +529,7 @@ with st.sidebar:
                 progress_bar.progress((i + 1) / total)
             st.success("儲存完成！")
 
-# Tabs
+# 調整 Tabs 順序與名稱
 tab_upload_process, tab_files, tab_review, tab_bank = st.tabs(["🧠 考古題上傳", "📂 檔案管理及AI辨識", "📝 AI匯入校對", "📚 題庫管理與試卷輸出"])
 
 # === Tab 1: 考古題上傳 ===
@@ -775,6 +786,7 @@ with tab_review:
                         new_opts = st.text_area(f"選項 #{i}", opts_text, height=80, key=f"{selected_file}_o_{i}")
                         cand.options = new_opts.split('\n') if new_opts else []
                     
+                    # 題型選擇 (中文)
                     current_type_zh = TYPE_MAP_EN_TO_ZH.get(cand.q_type, "單選")
                     new_type_zh = st.selectbox(f"題型 #{i}", TYPE_OPTIONS, index=TYPE_OPTIONS.index(current_type_zh), key=f"{selected_file}_t_{i}")
                     cand.q_type = TYPE_MAP_ZH_TO_EN[new_type_zh]
@@ -798,10 +810,12 @@ with tab_review:
 
                 with c2:
                     st.markdown("✂️ **截圖工具**")
+                    # [重點] 優先使用 AI 截的 ref_image，若無則使用整頁 full_page_bytes
                     image_to_crop = cand.ref_image_bytes if cand.ref_image_bytes else cand.full_page_bytes
                     
                     if image_to_crop:
                         try:
+                            # 顯示裁切器
                             if st_cropper:
                                 pil_ref = Image.open(io.BytesIO(image_to_crop))
                                 st_cropper(
@@ -814,6 +828,7 @@ with tab_review:
                                 st.image(image_to_crop, caption="原始圖片 (無法裁切)")
                         except: 
                             st.error("截圖載入失敗")
+                            # 萬一載入失敗，至少顯示靜態圖
                             st.image(image_to_crop, caption="靜態預覽", width=300)
                     else:
                         st.info("無法取得此題的參考圖片 (也無整頁圖片)")
