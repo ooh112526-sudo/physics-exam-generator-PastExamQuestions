@@ -71,7 +71,7 @@ class SmartQuestionCandidate:
         self.status_reason = status_reason
         self.image_bytes = image_bytes      # 題目附圖 (已裁切)
         self.ref_image_bytes = ref_image_bytes # 題目區域截圖 (供參考)
-        self.full_page_bytes = full_page_bytes # [新增] 整頁原始圖 (供手動裁切用)
+        self.full_page_bytes = full_page_bytes # [關鍵] 整頁原始圖 (供手動裁切用)
         self.q_type = q_type
         self.subject = subject
 
@@ -130,8 +130,8 @@ def img_to_bytes(pil_img):
     img_byte_arr = io.BytesIO()
     if pil_img.mode in ("RGBA", "P"): 
         pil_img = pil_img.convert("RGB")
-    # 壓縮整頁圖片以加速傳輸
-    pil_img.save(img_byte_arr, format='JPEG', quality=85) 
+    # 壓縮整頁圖片以加速傳輸，避免 Session State 過大
+    pil_img.save(img_byte_arr, format='JPEG', quality=80) 
     return img_byte_arr.getvalue()
 
 # ==========================================
@@ -151,7 +151,7 @@ def parse_with_gemini(file_bytes, file_type, api_key):
     if file_type == 'pdf':
         if not HAS_PDF2IMAGE: return {"error": "缺少 pdf2image (Poppler) 未安裝"}
         try:
-            # 優化：降低 DPI 至 150 以加速處理與傳輸，文字辨識通常足夠
+            # 解析度 150 dpi 對 AI 來說足夠且快速
             source_images = convert_from_bytes(file_bytes, dpi=150, fmt='jpeg')
         except Exception as e:
             return {"error": f"PDF 轉圖片失敗: {str(e)}"}
@@ -172,8 +172,8 @@ def parse_with_gemini(file_bytes, file_type, api_key):
 
     if not source_images and file_type == 'pdf': return {"error": "PDF 頁面為空"}
 
-    # 優化：增加 Batch Size 減少 API 呼叫次數 (一次處理 10 頁)
-    BATCH_SIZE = 10
+    # 設定 Batch Size
+    BATCH_SIZE = 10 
     total_pages = len(source_images)
     all_candidates = []
     errors = []
@@ -186,9 +186,9 @@ def parse_with_gemini(file_bytes, file_type, api_key):
     prompt_chapters = [c for c in PHYSICS_CHAPTERS_LIST if c != "未分類"]
     chapters_str = "\n".join(prompt_chapters)
     
-    # [需求] 固定 AI 模型優先順序
+    # 2026年模型清單
     candidate_models = [
-        "gemini-2.5-flash",    # 最快優先
+        "gemini-2.5-flash",    
         "gemini-2.5-pro",      
         "gemini-2.0-flash",    
         "gemini-1.5-pro"       
@@ -200,15 +200,14 @@ def parse_with_gemini(file_bytes, file_type, api_key):
         extra_instruction = ""
         if file_type == 'pdf':
             extra_instruction = """
-            回傳每題的座標範圍：
+            【必須】回傳每題的座標範圍：
             1. 'full_question_box_2d': 整題(含題號,文字,選項)的邊界 [ymin, xmin, ymax, xmax] (0-1000)。
             2. 'box_2d': 若有圖片，標示圖片範圍。
+            3. 'page_index': 該題目位於本批次圖片的第幾頁 (0, 1, ...)。
             """
         
-        # 精簡 Prompt 以加速
         prompt = f"""
-        分析考卷圖片。
-        只擷取【高中物理】試題。
+        分析考卷圖片。只擷取【高中物理】試題。
         
         輸出 JSON List:
         [
@@ -224,7 +223,6 @@ def parse_with_gemini(file_bytes, file_type, api_key):
                 "page_index": 0 
             }}
         ]
-        page_index 是圖片在批次中的索引(0開始)。
         {extra_instruction}
         """
 
@@ -232,19 +230,15 @@ def parse_with_gemini(file_bytes, file_type, api_key):
         input_parts.extend(batch_imgs)
 
         generation_config = {"response_mime_type": "application/json"}
-        
         response = None
         last_error = None
         
-        # 嘗試模型列表
         for model_name in candidate_models:
             try:
                 model = genai.GenerativeModel(model_name)
                 response = model.generate_content(input_parts, generation_config=generation_config)
-                # print(f"Batch {batch_idx+1} 使用模型: {model_name} 成功")
                 break
             except Exception as e:
-                # print(f"模型 {model_name} 失敗: {e}")
                 last_error = e
                 continue
         
@@ -271,15 +265,22 @@ def parse_with_gemini(file_bytes, file_type, api_key):
                 ref_bytes = None
                 full_page_bytes = None 
                 
-                if file_type == 'pdf' and 'page_index' in item:
+                # 針對 PDF 進行截圖
+                if file_type == 'pdf':
                     try:
-                        local_idx = item['page_index']
+                        # 預設使用 page_index，若無則使用 0 (Batch 第一頁) 確保有圖
+                        local_idx = item.get('page_index', 0)
+                        
+                        # 邊界檢查
+                        if not isinstance(local_idx, int) or local_idx < 0: local_idx = 0
+                        if local_idx >= len(batch_imgs): local_idx = 0
+
                         absolute_idx = start_page_idx + local_idx
                         
                         if 0 <= absolute_idx < len(source_images):
                             src_img = source_images[absolute_idx]
                             
-                            # 儲存整頁 (壓縮後)
+                            # [修正] 無論如何都儲存整頁，作為手動截圖的底圖
                             full_page_bytes = img_to_bytes(src_img)
                             
                             if 'box_2d' in item:
@@ -288,6 +289,7 @@ def parse_with_gemini(file_bytes, file_type, api_key):
                             if 'full_question_box_2d' in item:
                                 ref_bytes = crop_image(src_img, item['full_question_box_2d'], force_full_width=True, padding_y=50)
                             else:
+                                # 若 AI 沒回傳精準邊界，預設使用整頁作為參考圖
                                 ref_bytes = full_page_bytes
                                 
                     except Exception as e:
@@ -302,7 +304,7 @@ def parse_with_gemini(file_bytes, file_type, api_key):
                     status_reason=f"Batch {batch_idx+1}",
                     image_bytes=diagram_bytes,      
                     ref_image_bytes=ref_bytes,
-                    full_page_bytes=full_page_bytes,
+                    full_page_bytes=full_page_bytes, # 確保這裡傳入了圖片資料
                     q_type=item.get('type', 'Single'),
                     subject='Physics' 
                 )
@@ -312,7 +314,7 @@ def parse_with_gemini(file_bytes, file_type, api_key):
         except Exception as e:
             errors.append(f"Batch {batch_idx+1} processing error: {str(e)}")
             
-        time.sleep(1) # 避免 Rate Limit
+        time.sleep(1) 
 
     if not all_candidates and errors:
         return {"error": f"分析失敗詳情: {'; '.join(errors)}"}
