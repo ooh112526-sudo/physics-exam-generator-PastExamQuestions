@@ -1,4 +1,3 @@
-# ... (前段 imports 與 CloudManager 類別保持不變，略) ...
 import streamlit as st
 import docx
 from docx.shared import Pt, Inches
@@ -10,7 +9,10 @@ import time
 import base64
 import requests 
 from PIL import Image
-from streamlit_cropper import st_cropper 
+try:
+    from streamlit_cropper import st_cropper 
+except ImportError:
+    st_cropper = None # Handle missing dependency
 import os
 import datetime
 import uuid
@@ -29,16 +31,8 @@ TYPE_MAP_ZH_TO_EN = {"單選": "Single", "多選": "Multi", "填充": "Fill", "�
 TYPE_MAP_EN_TO_ZH = {v: k for k, v in TYPE_MAP_ZH_TO_EN.items()}
 TYPE_OPTIONS = ["單選", "多選", "填充", "題組"]
 
-# ... (CloudManager class 與其他部分保持不變，直接複製上方完整的 app.py 內容即可，只需注意 Tab 3 部分的修改) ...
-
-# 為了節省篇幅，我只列出 Tab 3 關鍵修改的部分，請您替換到您的 app.py 中
-# 或者您直接使用下方的完整 app.py (我會重新生成完整的以防萬一)
-
-# ==========================================
-# 雲端資料庫與儲存模組 (內建)
-# ==========================================
+# ... (CloudManager 類別保持不變，直接複製前面的版本) ...
 class CloudManager:
-    # ... (程式碼同上，無需變動) ...
     def __init__(self):
         self.bucket_name = os.getenv("GCS_BUCKET_NAME", "physics-exam-assets")
         self.db = None
@@ -197,6 +191,7 @@ class CloudManager:
     # --- 檔案庫管理功能 ---
     
     def check_file_exists(self, filename):
+        """檢查 Firestore 中是否有同名檔案"""
         if not self.db: return None
         try:
             docs = self.db.collection("exam_files").where("filename", "==", filename).limit(1).stream()
@@ -210,6 +205,7 @@ class CloudManager:
             return None
 
     def save_file_record(self, file_info, overwrite_id=None):
+        """儲存或更新檔案記錄"""
         if not self.db: return False
         try:
             doc_id = overwrite_id if overwrite_id else str(uuid.uuid4())
@@ -391,7 +387,9 @@ def generate_word_files(selected_questions):
     
     def write_single_question(doc, q, idx_str):
         p = doc.add_paragraph()
-        type_label = {'Single': '【單選】', 'Multi': '【多選】', 'Fill': '【填充】', 'Group': '【題組】'}.get(q.type, '')
+        # 中文題型顯示
+        type_badge_zh = TYPE_MAP_EN_TO_ZH.get(q.type, q.type)
+        type_label = f"【{type_badge_zh}】"
         src_label = f"[{q.source}] " if q.source and not q.parent_id else "" 
         
         runner = p.add_run(f"{idx_str}. {src_label}{type_label} {q.content.strip()}")
@@ -425,6 +423,7 @@ def generate_word_files(selected_questions):
 
     for q in selected_questions:
         if q.is_group_parent:
+            # 處理題組
             write_single_question(exam_doc, q, f"{q_counter}-{q_counter + len(q.sub_questions) - 1} 為題組")
             for sub_q in q.sub_questions:
                 write_single_question(exam_doc, sub_q, str(q_counter))
@@ -801,18 +800,26 @@ with tab_review:
 
                 with c2:
                     st.markdown("✂️ **截圖工具**")
-                    # 優先使用 ref_image (AI 截取區域)，若無則用 ref_image (已在 smart_importer 強制產生)
-                    image_to_crop = cand.ref_image_bytes 
+                    # [重點] 優先使用 AI 截的 ref_image，若無則使用整頁 full_page_bytes
+                    image_to_crop = cand.ref_image_bytes if cand.ref_image_bytes else cand.full_page_bytes
                     
                     if image_to_crop:
                         try:
-                            pil_ref = Image.open(io.BytesIO(image_to_crop))
-                            st_cropper(
-                                pil_ref, realtime_update=True, box_color='#FF0000',
-                                key=f"{selected_file}_cropper_{i}", aspect_ratio=None
-                            )
-                            st.caption("提示：截圖需在 Form 提交後或獨立操作")
-                        except: st.error("截圖載入失敗")
+                            # 顯示裁切器
+                            if st_cropper:
+                                pil_ref = Image.open(io.BytesIO(image_to_crop))
+                                st_cropper(
+                                    pil_ref, realtime_update=True, box_color='#FF0000',
+                                    key=f"{selected_file}_cropper_{i}", aspect_ratio=None
+                                )
+                                st.caption("提示：截圖需在 Form 提交後或獨立操作")
+                            else:
+                                st.error("Streamlit Cropper 未安裝")
+                                st.image(image_to_crop, caption="原始圖片 (無法裁切)")
+                        except: 
+                            st.error("截圖載入失敗")
+                            # 萬一載入失敗，至少顯示靜態圖
+                            st.image(image_to_crop, caption="靜態預覽", width=300)
                     else:
                         st.info("無法取得此題的參考圖片 (也無整頁圖片)")
                 st.divider()
