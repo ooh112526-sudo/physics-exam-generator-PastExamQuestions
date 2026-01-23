@@ -1,3 +1,4 @@
+# ... (前段 imports 與 CloudManager 類別保持不變，略) ...
 import streamlit as st
 import docx
 from docx.shared import Pt, Inches
@@ -28,10 +29,16 @@ TYPE_MAP_ZH_TO_EN = {"單選": "Single", "多選": "Multi", "填充": "Fill", "�
 TYPE_MAP_EN_TO_ZH = {v: k for k, v in TYPE_MAP_ZH_TO_EN.items()}
 TYPE_OPTIONS = ["單選", "多選", "填充", "題組"]
 
+# ... (CloudManager class 與其他部分保持不變，直接複製上方完整的 app.py 內容即可，只需注意 Tab 3 部分的修改) ...
+
+# 為了節省篇幅，我只列出 Tab 3 關鍵修改的部分，請您替換到您的 app.py 中
+# 或者您直接使用下方的完整 app.py (我會重新生成完整的以防萬一)
+
 # ==========================================
 # 雲端資料庫與儲存模組 (內建)
 # ==========================================
 class CloudManager:
+    # ... (程式碼同上，無需變動) ...
     def __init__(self):
         self.bucket_name = os.getenv("GCS_BUCKET_NAME", "physics-exam-assets")
         self.db = None
@@ -132,6 +139,7 @@ class CloudManager:
 
     # --- 容量計算功能 ---
     def get_storage_usage(self):
+        """計算 Bucket 中所有檔案的總大小 (Bytes)"""
         if not self.storage_client: return 0
         try:
             target_bucket_name = self.bucket_name
@@ -274,9 +282,7 @@ class CloudManager:
 # 初始化 Cloud Manager
 cloud_manager = CloudManager()
 
-# ==========================================
-# 資料結構與狀態初始化
-# ==========================================
+# ... (Question class remains same) ...
 class Question:
     def __init__(self, q_type, content, options=None, answer=None, original_id=0, image_data=None, 
                  source="一般試題", chapter="未分類", unit="", db_id=None, 
@@ -360,9 +366,7 @@ if 'question_pool' not in st.session_state:
 if 'file_queue' not in st.session_state:
     st.session_state['file_queue'] = {}
 
-# ==========================================
-# 工具函式
-# ==========================================
+# ... (Utility Functions remain same) ...
 def get_image_bytes(q):
     if q.image_data: return q.image_data
     if q.image_url:
@@ -387,9 +391,7 @@ def generate_word_files(selected_questions):
     
     def write_single_question(doc, q, idx_str):
         p = doc.add_paragraph()
-        # 中文題型顯示
-        type_badge_zh = TYPE_MAP_EN_TO_ZH.get(q.type, q.type)
-        type_label = f"【{type_badge_zh}】"
+        type_label = {'Single': '【單選】', 'Multi': '【多選】', 'Fill': '【填充】', 'Group': '【題組】'}.get(q.type, '')
         src_label = f"[{q.source}] " if q.source and not q.parent_id else "" 
         
         runner = p.add_run(f"{idx_str}. {src_label}{type_label} {q.content.strip()}")
@@ -423,7 +425,6 @@ def generate_word_files(selected_questions):
 
     for q in selected_questions:
         if q.is_group_parent:
-            # 處理題組
             write_single_question(exam_doc, q, f"{q_counter}-{q_counter + len(q.sub_questions) - 1} 為題組")
             for sub_q in q.sub_questions:
                 write_single_question(exam_doc, sub_q, str(q_counter))
@@ -463,7 +464,6 @@ def process_single_file(filename, api_key, file_id_in_db=None):
             cloud_manager.update_file_status(file_id_in_db, "已辨識")
         
         st.success(f"{filename} 辨識完成！")
-        # [優化] 設定標記，讓 Tab 3 自動選取該檔案
         st.session_state['just_processed_file'] = filename
         st.info("💡 請切換至「📝 AI匯入校對」分頁開始編輯")
         
@@ -537,7 +537,6 @@ with tab_upload_process:
         if 'upload_configs' not in st.session_state:
             st.session_state['upload_configs'] = {}
 
-        # 批次套用工具
         with st.expander("批次設定 (一次套用給下方所有檔案)"):
             c_batch1, c_batch2, c_batch3, c_batch4 = st.columns(4)
             with c_batch1: b_type = st.selectbox("統一類型", ["學測", "分科", "北模", "中模", "全模", "其他"], key="batch_type")
@@ -802,7 +801,8 @@ with tab_review:
 
                 with c2:
                     st.markdown("✂️ **截圖工具**")
-                    image_to_crop = cand.ref_image_bytes if cand.ref_image_bytes else cand.full_page_bytes
+                    # 優先使用 ref_image (AI 截取區域)，若無則用 ref_image (已在 smart_importer 強制產生)
+                    image_to_crop = cand.ref_image_bytes 
                     
                     if image_to_crop:
                         try:
