@@ -10,7 +10,7 @@ import base64
 import requests 
 from PIL import Image
 
-# [修正] 安全載入 streamlit_cropper，避免 Cloud Run 崩潰
+# 安全載入 streamlit_cropper
 try:
     from streamlit_cropper import st_cropper 
 except ImportError:
@@ -54,7 +54,6 @@ class CloudManager:
             service_account_json = os.getenv("GCP_SERVICE_ACCOUNT_JSON")
             if service_account_json:
                 try:
-                    # Clean up potential formatting issues
                     service_account_json = service_account_json.strip()
                     if service_account_json.startswith("'") and service_account_json.endswith("'"):
                          service_account_json = service_account_json[1:-1]
@@ -178,16 +177,31 @@ class CloudManager:
             blob = bucket.blob(unique_name)
             blob.upload_from_string(file_bytes, content_type=content_type)
             
+            # [修正] 下載異常的關鍵修復
+            # 如果沒有 Service Account Token Creator 權限，generate_signed_url 會失敗
+            # 這裡加入更完善的 Fallback
             try:
-                url = blob.generate_signed_url(
-                    version="v4",
-                    expiration=datetime.timedelta(days=7),
-                    method="GET",
-                    service_account_email=self.credentials.service_account_email if hasattr(self.credentials, 'service_account_email') else None,
-                    access_token=self.credentials.token if hasattr(self.credentials, 'token') else None
-                )
-                return url
-            except:
+                # 檢查是否有 credentials 且支援 sign_bytes (Service Account Key)
+                if self.credentials and hasattr(self.credentials, 'service_account_email'):
+                    url = blob.generate_signed_url(
+                        version="v4",
+                        expiration=datetime.timedelta(days=7),
+                        method="GET",
+                        service_account_email=self.credentials.service_account_email,
+                        access_token=self.credentials.token
+                    )
+                    return url
+                else:
+                    # 如果是透過 Cloud Run 預設權限，通常無法直接簽署，除非有特別設定
+                    # 嘗試直接產生，若失敗則回傳 public
+                    url = blob.generate_signed_url(
+                        version="v4",
+                        expiration=datetime.timedelta(days=7),
+                        method="GET"
+                    )
+                    return url
+            except Exception as e:
+                # print(f"Signed URL 生成失敗 (將使用 Public URL): {e}")
                 return blob.public_url 
 
         except Exception as e:
@@ -197,6 +211,7 @@ class CloudManager:
     # --- 檔案庫管理功能 ---
     
     def check_file_exists(self, filename):
+        """檢查 Firestore 中是否有同名檔案"""
         if not self.db: return None
         try:
             docs = self.db.collection("exam_files").where("filename", "==", filename).limit(1).stream()
@@ -210,6 +225,7 @@ class CloudManager:
             return None
 
     def save_file_record(self, file_info, overwrite_id=None):
+        """儲存或更新檔案記錄"""
         if not self.db: return False
         try:
             doc_id = overwrite_id if overwrite_id else str(uuid.uuid4())
@@ -395,7 +411,6 @@ def generate_word_files(selected_questions):
     
     def write_single_question(doc, q, idx_str):
         p = doc.add_paragraph()
-        # 中文題型顯示
         type_badge_zh = TYPE_MAP_EN_TO_ZH.get(q.type, q.type)
         type_label = f"【{type_badge_zh}】"
         src_label = f"[{q.source}] " if q.source and not q.parent_id else "" 
@@ -458,6 +473,7 @@ def process_single_file(filename, api_key, file_id_in_db=None):
     info['status'] = 'processing'
     
     with st.spinner(f"正在分析 {filename}... (AI 思考中，請稍候)"):
+        # 這裡會呼叫 smart_importer 進行解析
         res = smart_importer.parse_with_gemini(info['data'], info['type'], api_key)
     
     if isinstance(res, dict) and "error" in res:
@@ -471,7 +487,6 @@ def process_single_file(filename, api_key, file_id_in_db=None):
             cloud_manager.update_file_status(file_id_in_db, "已辨識")
         
         st.success(f"{filename} 辨識完成！")
-        # [優化] 設定標記，讓 Tab 3 自動選取該檔案
         st.session_state['just_processed_file'] = filename
         st.info("💡 請切換至「📝 AI匯入校對」分頁開始編輯")
         
@@ -485,7 +500,6 @@ st.title("🧲 物理題庫系統 Pro (Cloud Storage)")
 with st.sidebar:
     st.header("設定")
     env_api_key = os.getenv("GOOGLE_API_KEY", "")
-    # [修正] 加入 key 參數以避免 StreamlitDuplicateElementId 錯誤
     api_key_input = st.text_input("Gemini API Key", value=env_api_key, type="password", key="sidebar_api_key")
     
     if cloud_manager.has_connection:
@@ -520,7 +534,6 @@ with st.sidebar:
         except:
             st.caption("無法取得容量資訊")
 
-    # [修正] 加入 key="sidebar_force_save" 以避免 DuplicateElementId 錯誤
     if st.button("強制儲存至雲端", key="sidebar_force_save"):
         if cloud_manager.has_connection:
             progress_bar = st.progress(0)
@@ -530,7 +543,7 @@ with st.sidebar:
                 progress_bar.progress((i + 1) / total)
             st.success("儲存完成！")
 
-# 調整 Tabs 順序與名稱
+# Tabs
 tab_upload_process, tab_files, tab_review, tab_bank = st.tabs(["🧠 考古題上傳", "📂 檔案管理及AI辨識", "📝 AI匯入校對", "📚 題庫管理與試卷輸出"])
 
 # === Tab 1: 考古題上傳 ===
