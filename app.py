@@ -12,7 +12,7 @@ from PIL import Image
 try:
     from streamlit_cropper import st_cropper 
 except ImportError:
-    st_cropper = None # Handle missing dependency
+    st_cropper = None 
 import os
 import datetime
 import uuid
@@ -31,7 +31,9 @@ TYPE_MAP_ZH_TO_EN = {"單選": "Single", "多選": "Multi", "填充": "Fill", "�
 TYPE_MAP_EN_TO_ZH = {v: k for k, v in TYPE_MAP_ZH_TO_EN.items()}
 TYPE_OPTIONS = ["單選", "多選", "填充", "題組"]
 
-# ... (CloudManager 類別保持不變，直接複製前面的版本) ...
+# ==========================================
+# 雲端資料庫與儲存模組 (內建)
+# ==========================================
 class CloudManager:
     def __init__(self):
         self.bucket_name = os.getenv("GCS_BUCKET_NAME", "physics-exam-assets")
@@ -47,7 +49,7 @@ class CloudManager:
             service_account_json = os.getenv("GCP_SERVICE_ACCOUNT_JSON")
             if service_account_json:
                 try:
-                    # Clean up potential formatting issues
+                    # Clean up
                     service_account_json = service_account_json.strip()
                     if service_account_json.startswith("'") and service_account_json.endswith("'"):
                          service_account_json = service_account_json[1:-1]
@@ -131,9 +133,7 @@ class CloudManager:
                     bucket.create(location="us-central1") 
         except: pass
 
-    # --- 容量計算功能 ---
     def get_storage_usage(self):
-        """計算 Bucket 中所有檔案的總大小 (Bytes)"""
         if not self.storage_client: return 0
         try:
             target_bucket_name = self.bucket_name
@@ -191,7 +191,6 @@ class CloudManager:
     # --- 檔案庫管理功能 ---
     
     def check_file_exists(self, filename):
-        """檢查 Firestore 中是否有同名檔案"""
         if not self.db: return None
         try:
             docs = self.db.collection("exam_files").where("filename", "==", filename).limit(1).stream()
@@ -205,7 +204,6 @@ class CloudManager:
             return None
 
     def save_file_record(self, file_info, overwrite_id=None):
-        """儲存或更新檔案記錄"""
         if not self.db: return False
         try:
             doc_id = overwrite_id if overwrite_id else str(uuid.uuid4())
@@ -278,7 +276,9 @@ class CloudManager:
 # 初始化 Cloud Manager
 cloud_manager = CloudManager()
 
-# ... (Question class remains same) ...
+# ==========================================
+# 資料結構與狀態初始化
+# ==========================================
 class Question:
     def __init__(self, q_type, content, options=None, answer=None, original_id=0, image_data=None, 
                  source="一般試題", chapter="未分類", unit="", db_id=None, 
@@ -362,7 +362,9 @@ if 'question_pool' not in st.session_state:
 if 'file_queue' not in st.session_state:
     st.session_state['file_queue'] = {}
 
-# ... (Utility Functions remain same) ...
+# ==========================================
+# 工具函式
+# ==========================================
 def get_image_bytes(q):
     if q.image_data: return q.image_data
     if q.image_url:
@@ -387,7 +389,6 @@ def generate_word_files(selected_questions):
     
     def write_single_question(doc, q, idx_str):
         p = doc.add_paragraph()
-        # 中文題型顯示
         type_badge_zh = TYPE_MAP_EN_TO_ZH.get(q.type, q.type)
         type_label = f"【{type_badge_zh}】"
         src_label = f"[{q.source}] " if q.source and not q.parent_id else "" 
@@ -423,7 +424,6 @@ def generate_word_files(selected_questions):
 
     for q in selected_questions:
         if q.is_group_parent:
-            # 處理題組
             write_single_question(exam_doc, q, f"{q_counter}-{q_counter + len(q.sub_questions) - 1} 為題組")
             for sub_q in q.sub_questions:
                 write_single_question(exam_doc, sub_q, str(q_counter))
@@ -492,7 +492,6 @@ with st.sidebar:
     st.divider()
     st.metric("題庫總數", len(st.session_state['question_pool']))
     
-    # 顯示雲端空間使用量
     if cloud_manager.has_connection:
         st.divider()
         try:
@@ -519,7 +518,7 @@ with st.sidebar:
                 progress_bar.progress((i + 1) / total)
             st.success("儲存完成！")
 
-# 調整 Tabs 順序與名稱
+# Tabs
 tab_upload_process, tab_files, tab_review, tab_bank = st.tabs(["🧠 考古題上傳", "📂 檔案管理及AI辨識", "📝 AI匯入校對", "📚 題庫管理與試卷輸出"])
 
 # === Tab 1: 考古題上傳 ===
@@ -776,7 +775,6 @@ with tab_review:
                         new_opts = st.text_area(f"選項 #{i}", opts_text, height=80, key=f"{selected_file}_o_{i}")
                         cand.options = new_opts.split('\n') if new_opts else []
                     
-                    # 題型選擇 (中文)
                     current_type_zh = TYPE_MAP_EN_TO_ZH.get(cand.q_type, "單選")
                     new_type_zh = st.selectbox(f"題型 #{i}", TYPE_OPTIONS, index=TYPE_OPTIONS.index(current_type_zh), key=f"{selected_file}_t_{i}")
                     cand.q_type = TYPE_MAP_ZH_TO_EN[new_type_zh]
@@ -800,12 +798,10 @@ with tab_review:
 
                 with c2:
                     st.markdown("✂️ **截圖工具**")
-                    # [重點] 優先使用 AI 截的 ref_image，若無則使用整頁 full_page_bytes
                     image_to_crop = cand.ref_image_bytes if cand.ref_image_bytes else cand.full_page_bytes
                     
                     if image_to_crop:
                         try:
-                            # 顯示裁切器
                             if st_cropper:
                                 pil_ref = Image.open(io.BytesIO(image_to_crop))
                                 st_cropper(
@@ -818,7 +814,6 @@ with tab_review:
                                 st.image(image_to_crop, caption="原始圖片 (無法裁切)")
                         except: 
                             st.error("截圖載入失敗")
-                            # 萬一載入失敗，至少顯示靜態圖
                             st.image(image_to_crop, caption="靜態預覽", width=300)
                     else:
                         st.info("無法取得此題的參考圖片 (也無整頁圖片)")
