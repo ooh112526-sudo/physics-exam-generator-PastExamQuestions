@@ -9,15 +9,10 @@ import time
 import base64
 import requests 
 from PIL import Image
-
-# 安全載入 streamlit_cropper
 try:
     from streamlit_cropper import st_cropper 
 except ImportError:
     st_cropper = None 
-except Exception:
-    st_cropper = None
-
 import os
 import datetime
 import uuid
@@ -137,7 +132,7 @@ class CloudManager:
                     bucket.create(location="us-central1") 
         except: pass
 
-    # --- 容量計算功能 ---
+    # --- 容量計算 ---
     def get_storage_usage(self):
         if not self.storage_client: return 0
         try:
@@ -158,8 +153,10 @@ class CloudManager:
             print(f"容量計算失敗: {e}")
             return 0
 
+    # --- 核心修復：上傳與下載 ---
     def upload_bytes(self, file_bytes, filename, folder="uploads", content_type=None):
-        if not self.storage_client: return None
+        """上傳檔案，回傳 (公開網址, Blob名稱)"""
+        if not self.storage_client: return None, None
         try:
             target_bucket_name = self.bucket_name
             if not target_bucket_name:
@@ -170,48 +167,50 @@ class CloudManager:
             
             if not target_bucket_name:
                 st.error("未設定 Bucket 名稱")
-                return None
+                return None, None
 
             bucket = self.storage_client.bucket(target_bucket_name)
             unique_name = f"{folder}/{int(datetime.datetime.now().timestamp())}_{str(uuid.uuid4())[:8]}_{filename}"
             blob = bucket.blob(unique_name)
             blob.upload_from_string(file_bytes, content_type=content_type)
             
-            # [修正] 下載異常的關鍵修復
-            # 如果沒有 Service Account Token Creator 權限，generate_signed_url 會失敗
-            # 這裡加入更完善的 Fallback
+            url = blob.public_url
             try:
-                # 檢查是否有 credentials 且支援 sign_bytes (Service Account Key)
-                if self.credentials and hasattr(self.credentials, 'service_account_email'):
-                    url = blob.generate_signed_url(
-                        version="v4",
-                        expiration=datetime.timedelta(days=7),
-                        method="GET",
-                        service_account_email=self.credentials.service_account_email,
-                        access_token=self.credentials.token
-                    )
-                    return url
-                else:
-                    # 如果是透過 Cloud Run 預設權限，通常無法直接簽署，除非有特別設定
-                    # 嘗試直接產生，若失敗則回傳 public
-                    url = blob.generate_signed_url(
-                        version="v4",
-                        expiration=datetime.timedelta(days=7),
-                        method="GET"
-                    )
-                    return url
-            except Exception as e:
-                # print(f"Signed URL 生成失敗 (將使用 Public URL): {e}")
-                return blob.public_url 
+                url = blob.generate_signed_url(
+                    version="v4",
+                    expiration=datetime.timedelta(days=7),
+                    method="GET",
+                    service_account_email=self.credentials.service_account_email if hasattr(self.credentials, 'service_account_email') else None,
+                    access_token=self.credentials.token if hasattr(self.credentials, 'token') else None
+                )
+            except: pass
+            
+            return url, unique_name # 回傳 Tuple
 
         except Exception as e:
             print(f"上傳失敗: {e}")
+            return None, None
+
+    def download_blob(self, blob_name):
+        """直接透過 API 下載 Blob，不需經過 URL (解決下載異常最有效的方法)"""
+        if not self.storage_client or not blob_name: return None
+        try:
+            target_bucket_name = self.bucket_name
+            if not target_bucket_name:
+                try:
+                    if "GCS_BUCKET_NAME" in st.secrets:
+                        target_bucket_name = st.secrets["GCS_BUCKET_NAME"]
+                except: pass
+                
+            bucket = self.storage_client.bucket(target_bucket_name)
+            blob = bucket.blob(blob_name)
+            return blob.download_as_bytes()
+        except Exception as e:
+            print(f"Blob 下載失敗: {e}")
             return None
 
-    # --- 檔案庫管理功能 ---
-    
+    # --- 檔案庫管理 ---
     def check_file_exists(self, filename):
-        """檢查 Firestore 中是否有同名檔案"""
         if not self.db: return None
         try:
             docs = self.db.collection("exam_files").where("filename", "==", filename).limit(1).stream()
@@ -225,13 +224,11 @@ class CloudManager:
             return None
 
     def save_file_record(self, file_info, overwrite_id=None):
-        """儲存或更新檔案記錄"""
         if not self.db: return False
         try:
             doc_id = overwrite_id if overwrite_id else str(uuid.uuid4())
             file_info["id"] = doc_id
             file_info["updated_at"] = datetime.datetime.now()
-            
             self.db.collection("exam_files").document(doc_id).set(file_info)
             return True
         except Exception as e:
@@ -258,7 +255,7 @@ class CloudManager:
         if self.db:
             self.db.collection("exam_files").document(file_id).update({"ai_status": status})
 
-    # --- 題庫管理功能 ---
+    # --- 題庫管理 ---
     def save_question(self, question_dict):
         if not self.db: return False
         try:
@@ -266,7 +263,7 @@ class CloudManager:
                 try:
                     img_bytes = base64.b64decode(question_dict["image_data_b64"])
                     fname = f"q_{question_dict.get('id', 'unknown')}.png"
-                    img_url = self.upload_bytes(img_bytes, fname, folder="question_images", content_type="image/png")
+                    img_url, _ = self.upload_bytes(img_bytes, fname, folder="question_images", content_type="image/png")
                     if img_url:
                         question_dict["image_url"] = img_url
                         del question_dict["image_data_b64"]
@@ -446,7 +443,6 @@ def generate_word_files(selected_questions):
 
     for q in selected_questions:
         if q.is_group_parent:
-            # 處理題組
             write_single_question(exam_doc, q, f"{q_counter}-{q_counter + len(q.sub_questions) - 1} 為題組")
             for sub_q in q.sub_questions:
                 write_single_question(exam_doc, sub_q, str(q_counter))
@@ -473,7 +469,6 @@ def process_single_file(filename, api_key, file_id_in_db=None):
     info['status'] = 'processing'
     
     with st.spinner(f"正在分析 {filename}... (AI 思考中，請稍候)"):
-        # 這裡會呼叫 smart_importer 進行解析
         res = smart_importer.parse_with_gemini(info['data'], info['type'], api_key)
     
     if isinstance(res, dict) and "error" in res:
@@ -516,7 +511,6 @@ with st.sidebar:
     st.divider()
     st.metric("題庫總數", len(st.session_state['question_pool']))
     
-    # 顯示雲端空間使用量
     if cloud_manager.has_connection:
         st.divider()
         try:
@@ -632,7 +626,8 @@ with tab_upload_process:
                     f.seek(0)
                     file_bytes = f.read()
                     
-                    backup_url = cloud_manager.upload_bytes(
+                    # 使用 upload_bytes 回傳的 (url, blob_name)
+                    backup_url, blob_name = cloud_manager.upload_bytes(
                         file_bytes, 
                         new_fname, 
                         folder="raw_uploads", 
@@ -643,6 +638,7 @@ with tab_upload_process:
                         "filename": new_fname,
                         "original_filename": f.name,
                         "url": backup_url,
+                        "blob_name": blob_name, # 儲存 Blob Name
                         "exam_type": item['type'],
                         "year": item['year'],
                         "exam_no": item['exam_no'],
@@ -734,11 +730,32 @@ with tab_files:
                                     btn_label = "重新辨識" if status == '已辨識' else "AI 辨識"
                                     if st.button(btn_label, key=f"ai_{f_record['id']}", use_container_width=True):
                                         fname = f_record['filename']
+                                        
+                                        # 嘗試載入檔案
+                                        loaded_success = False
                                         if fname not in st.session_state['file_queue']:
-                                            try:
-                                                file_url = f_record.get('url')
-                                                if file_url:
-                                                    resp = requests.get(file_url)
+                                            # 修復：優先使用 blob_name 下載，解決過期問題
+                                            blob_name = f_record.get('blob_name')
+                                            if blob_name:
+                                                file_bytes = cloud_manager.download_blob(blob_name)
+                                                if file_bytes:
+                                                    st.session_state['file_queue'][fname] = {
+                                                        "status": "uploaded", 
+                                                        "data": file_bytes,
+                                                        "type": fname.split('.')[-1].lower(),
+                                                        "result": [],
+                                                        "error_msg": "",
+                                                        "source_tag": f"{ftype}-{fyear}",
+                                                        "backup_url": f_record.get('url'),
+                                                        "db_id": f_record['id']
+                                                    }
+                                                    loaded_success = True
+                                                else:
+                                                    st.error("Blob 下載失敗")
+                                            # Fallback to URL if blob_name missing (legacy data)
+                                            elif f_record.get('url'):
+                                                try:
+                                                    resp = requests.get(f_record.get('url'))
                                                     if resp.status_code == 200:
                                                         st.session_state['file_queue'][fname] = {
                                                             "status": "uploaded", 
@@ -747,14 +764,19 @@ with tab_files:
                                                             "result": [],
                                                             "error_msg": "",
                                                             "source_tag": f"{ftype}-{fyear}",
-                                                            "backup_url": file_url,
+                                                            "backup_url": f_record.get('url'),
                                                             "db_id": f_record['id']
                                                         }
-                                                        process_single_file(fname, api_key_input, f_record['id'])
-                                                    else: st.error("下載失敗")
-                                            except: st.error("下載異常")
+                                                        loaded_success = True
+                                                except: pass
                                         else:
+                                            loaded_success = True
+                                            
+                                        if loaded_success:
                                             process_single_file(fname, api_key_input, f_record['id'])
+                                        else:
+                                            st.error("無法讀取檔案，請嘗試重新上傳。")
+
                                 with b2:
                                     if st.button("🗑️", key=f"del_f_{f_record['id']}", type="primary", use_container_width=True):
                                         cloud_manager.delete_file_record(f_record['id'])
