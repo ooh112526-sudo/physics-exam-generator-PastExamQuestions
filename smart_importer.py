@@ -63,7 +63,12 @@ class SmartQuestionCandidate:
                  is_likely=True, status_reason="", image_bytes=None, q_type="Single", 
                  ref_image_bytes=None, full_page_bytes=None, subject="Physics", sub_questions=None):
         self.raw_text = raw_text
-        self.number = question_number
+        # 確保 number 為整數，若無法轉換則設為 0
+        try:
+            self.number = int(question_number)
+        except:
+            self.number = 0
+            
         self.content = raw_text 
         self.options = options if options else []
         self.predicted_chapter = chapter if chapter in PHYSICS_CHAPTERS_LIST else "未分類"
@@ -92,26 +97,18 @@ def clean_json_string(json_str):
     return json_str.strip()
 
 def crop_image(original_img, box_2d, force_full_width=False, padding_y=10):
-    """
-    裁切圖片
-    force_full_width: 是否強制寬度為整張圖片 (0-1000)
-    padding_y: 上下擴展的範圍 (以 1000 為基底)
-    """
     if not box_2d or len(box_2d) != 4: return None
     
     width, height = original_img.size
     ymin, xmin, ymax, xmax = box_2d
     
-    # 應用 padding (上下擴展)
     ymin = max(0, ymin - padding_y)
     ymax = min(1000, ymax + padding_y)
     
-    # 決定左右範圍
     if force_full_width:
         left = 0
         right = width
     else:
-        # 一般附圖裁切，稍微加點 padding
         xmin = max(0, xmin - 10)
         xmax = min(1000, xmax + 10)
         left = (xmin / 1000) * width
@@ -126,25 +123,24 @@ def crop_image(original_img, box_2d, force_full_width=False, padding_y=10):
         cropped = original_img.crop((left, top, right, bottom))
         img_byte_arr = io.BytesIO()
         if cropped.mode in ("RGBA", "P"): cropped = cropped.convert("RGB")
-        # 壓縮裁切圖 (70% 品質可大幅減少記憶體，且文字仍清晰)
-        cropped.save(img_byte_arr, format='JPEG', quality=70)
+        # 壓縮裁切圖
+        cropped.save(img_byte_arr, format='JPEG', quality=85)
         return img_byte_arr.getvalue()
     except Exception as e:
         print(f"Crop failed: {e}")
         return None
 
 def img_to_bytes(pil_img):
-    """將 PIL Image 轉為 bytes"""
     if pil_img is None: return None
     img_byte_arr = io.BytesIO()
     if pil_img.mode in ("RGBA", "P"): 
         pil_img = pil_img.convert("RGB")
     # 壓縮整頁圖片以加速傳輸
-    pil_img.save(img_byte_arr, format='JPEG', quality=85) 
+    pil_img.save(img_byte_arr, format='JPEG', quality=70) 
     return img_byte_arr.getvalue()
 
 # ==========================================
-# Gemini AI 解析邏輯 (修正重點：確保此函式存在)
+# Gemini AI 解析邏輯
 # ==========================================
 def parse_with_gemini(file_bytes, file_type, api_key):
     if not HAS_GENAI: return {"error": "缺少 google-generativeai 套件"}
@@ -160,7 +156,7 @@ def parse_with_gemini(file_bytes, file_type, api_key):
     if file_type == 'pdf':
         if not HAS_PDF2IMAGE: return {"error": "缺少 pdf2image (Poppler) 未安裝"}
         try:
-            # [優化] 降低 DPI 至 100 以解決記憶體不足與速度問題 (文字辨識仍足夠)
+            # [優化] 降低 DPI 至 100
             source_images = convert_from_bytes(file_bytes, dpi=100, fmt='jpeg')
         except Exception as e:
             return {"error": f"PDF 轉圖片失敗: {str(e)}"}
@@ -181,7 +177,7 @@ def parse_with_gemini(file_bytes, file_type, api_key):
 
     if not source_images and file_type == 'pdf': return {"error": "PDF 頁面為空"}
 
-    # Batch Size (降低到 5 以避免 OOM 與 超時)
+    # Batch Size
     BATCH_SIZE = 5 
     total_pages = len(source_images)
     all_candidates = []
@@ -297,19 +293,14 @@ def parse_with_gemini(file_bytes, file_type, api_key):
                         
                         if 0 <= absolute_idx < len(source_images):
                             src_img = source_images[absolute_idx]
-                            
-                            # 強制儲存整頁
                             full_page_bytes = img_to_bytes(src_img)
                             
-                            # 1. 題目附圖
                             if 'box_2d' in item:
                                 diagram_bytes = crop_image(src_img, item['box_2d'], force_full_width=False, padding_y=5)
                             
-                            # 2. 整題截圖
                             if 'full_question_box_2d' in item:
                                 ref_bytes = crop_image(src_img, item['full_question_box_2d'], force_full_width=True, padding_y=150)
                             else:
-                                # 若 AI 沒回傳範圍，預設使用整頁做為 fallback
                                 ref_bytes = full_page_bytes
                                 
                     except Exception as e:
@@ -324,7 +315,7 @@ def parse_with_gemini(file_bytes, file_type, api_key):
                     status_reason=f"Batch {batch_idx+1}",
                     image_bytes=diagram_bytes,      
                     ref_image_bytes=ref_bytes,
-                    full_page_bytes=full_page_bytes, # 傳遞整頁圖片
+                    full_page_bytes=full_page_bytes, 
                     q_type=q_type,
                     subject='Physics',
                     sub_questions=item.get('sub_questions', [])
@@ -339,8 +330,14 @@ def parse_with_gemini(file_bytes, file_type, api_key):
 
     if not all_candidates and errors:
         return {"error": f"分析失敗詳情: {'; '.join(errors)}"}
+    
+    # [修正] 確保 x.number 為 int 再排序，避免 TypeError
+    try:
+        all_candidates.sort(key=lambda x: int(x.number))
+    except:
+        # 如果真的有無法轉 int 的情況，就暫時不排序或依原始順序
+        pass
         
-    all_candidates.sort(key=lambda x: x.number)
     return all_candidates
 
 def parse_raw_file(file_obj, file_type, use_ocr=False):
