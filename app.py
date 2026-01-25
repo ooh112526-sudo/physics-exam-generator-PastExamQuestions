@@ -511,6 +511,7 @@ with st.sidebar:
     st.divider()
     st.metric("題庫總數", len(st.session_state['question_pool']))
     
+    # 顯示雲端空間使用量
     if cloud_manager.has_connection:
         st.divider()
         try:
@@ -655,7 +656,11 @@ with tab_upload_process:
                         "error_msg": "",
                         "source_tag": f"{item['type']}-{item['year']}",
                         "backup_url": backup_url,
+                        "blob_name": blob_name,
+                        "db_id": file_record['id'] # 這裡暫時拿不到 doc id, 需要調整 save_file_record 回傳
                     }
+                    # 重新載入 file records 以獲取 ID
+                    # 為了簡單，這裡不立即做，而是依賴 load_file_records
                     success_count += 1
                     progress_bar.progress((idx + 1) / len(files_to_upload))
                 
