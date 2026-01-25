@@ -160,8 +160,8 @@ def parse_with_gemini(file_bytes, file_type, api_key):
     if file_type == 'pdf':
         if not HAS_PDF2IMAGE: return {"error": "缺少 pdf2image (Poppler) 未安裝"}
         try:
-            # DPI 150
-            source_images = convert_from_bytes(file_bytes, dpi=150, fmt='jpeg')
+            # [優化] 降低 DPI 至 100 以解決記憶體不足與速度問題 (文字辨識仍足夠)
+            source_images = convert_from_bytes(file_bytes, dpi=100, fmt='jpeg')
         except Exception as e:
             return {"error": f"PDF 轉圖片失敗: {str(e)}"}
             
@@ -181,8 +181,8 @@ def parse_with_gemini(file_bytes, file_type, api_key):
 
     if not source_images and file_type == 'pdf': return {"error": "PDF 頁面為空"}
 
-    # Batch Size
-    BATCH_SIZE = 10 
+    # Batch Size (降低到 5 以避免 OOM 與 超時)
+    BATCH_SIZE = 5 
     total_pages = len(source_images)
     all_candidates = []
     errors = []
