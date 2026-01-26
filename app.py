@@ -25,8 +25,8 @@ from google.cloud import firestore
 from google.cloud import storage
 import google.auth 
 from google.oauth2 import service_account
-from pdf2image import convert_from_bytes # 用於計算總頁數
 
+# 確保正確匯入 smart_importer
 import smart_importer
 
 st.set_page_config(page_title="物理題庫系統 (Pro)", layout="wide", page_icon="🧲")
@@ -54,6 +54,7 @@ class CloudManager:
             service_account_json = os.getenv("GCP_SERVICE_ACCOUNT_JSON")
             if service_account_json:
                 try:
+                    # Clean up
                     service_account_json = service_account_json.strip()
                     if service_account_json.startswith("'") and service_account_json.endswith("'"):
                          service_account_json = service_account_json[1:-1]
@@ -68,9 +69,8 @@ class CloudManager:
                     self.db = firestore.Client(credentials=self.credentials, project=self.project_id)
                     self.storage_client = storage.Client(credentials=self.credentials, project=self.project_id)
                     self.has_connection = True
-                    if self.has_connection: 
-                        self._ensure_bucket_exists()
-                        return 
+                    if self.has_connection: self._ensure_bucket_exists()
+                    return
                 except Exception as e:
                     print(f"環境變數 JSON 連線失敗: {e}")
 
@@ -159,8 +159,9 @@ class CloudManager:
             print(f"容量計算失敗: {e}")
             return 0
 
-    # --- 上傳與下載 ---
+    # --- 上傳與下載 (修正版) ---
     def upload_bytes(self, file_bytes, filename, folder="uploads", content_type=None):
+        """上傳檔案，回傳 (URL, Blob名稱)"""
         if not self.storage_client: return None, None
         try:
             target_bucket_name = self.bucket_name
@@ -198,13 +199,14 @@ class CloudManager:
                     )
             except: pass
             
-            return url, unique_name 
+            return url, unique_name # 回傳 Tuple (url, blob_name)
 
         except Exception as e:
             print(f"上傳失敗: {e}")
             return None, None
 
     def download_blob(self, blob_name):
+        """直接透過 API 下載 Blob (解決下載異常的關鍵)"""
         if not self.storage_client or not blob_name: return None
         try:
             target_bucket_name = self.bucket_name
@@ -220,56 +222,6 @@ class CloudManager:
         except Exception as e:
             print(f"Blob 下載失敗: {e}")
             return None
-
-    # --- 暫存批次管理 (新功能) ---
-    def save_temp_batch(self, file_id, batch_idx, data, status="success"):
-        """將 AI 辨識結果暫存到 Firestore"""
-        if not self.db: return
-        
-        # 將題目物件轉為可儲存的 dict (移除 bytes)
-        serializable_data = []
-        for cand in data:
-            if isinstance(cand, dict):
-                d = cand
-            else:
-                d = cand.__dict__.copy()
-            # 圖片資料不存資料庫，只存文字
-            d.pop('image_bytes', None)
-            d.pop('ref_image_bytes', None) 
-            d.pop('full_page_bytes', None)
-            serializable_data.append(d)
-
-        doc_ref = self.db.collection("temp_batches").document(f"{file_id}_{batch_idx}")
-        doc_ref.set({
-            "file_id": file_id,
-            "batch_idx": batch_idx,
-            "data": json.dumps(serializable_data), # 轉為 JSON 字串
-            "status": status,
-            "updated_at": datetime.datetime.now()
-        })
-
-    def load_temp_batches(self, file_id):
-        """讀取該檔案的所有暫存批次"""
-        if not self.db: return {}
-        try:
-            docs = self.db.collection("temp_batches").where("file_id", "==", file_id).stream()
-            batches = {}
-            for doc in docs:
-                d = doc.to_dict()
-                batches[d['batch_idx']] = d
-            return batches
-        except Exception as e:
-            print(f"載入暫存失敗: {e}")
-            return {}
-
-    def clear_temp_batches(self, file_id):
-        """匯入成功後清除暫存"""
-        if not self.db: return
-        try:
-            docs = self.db.collection("temp_batches").where("file_id", "==", file_id).stream()
-            for doc in docs:
-                doc.reference.delete()
-        except: pass
 
     # --- 檔案庫管理 ---
     def check_file_exists(self, filename):
@@ -312,15 +264,10 @@ class CloudManager:
     def delete_file_record(self, file_id):
         if self.db:
             self.db.collection("exam_files").document(file_id).delete()
-            self.clear_temp_batches(file_id) # 同步清除暫存
 
-    def update_file_status(self, file_id, status, total_pages=0, processed_pages=0):
+    def update_file_status(self, file_id, status):
         if self.db:
-            self.db.collection("exam_files").document(file_id).update({
-                "ai_status": status,
-                "total_pages": total_pages,
-                "processed_pages": processed_pages
-            })
+            self.db.collection("exam_files").document(file_id).update({"ai_status": status})
 
     # --- 題庫管理 ---
     def save_question(self, question_dict):
@@ -530,83 +477,43 @@ def generate_word_files(selected_questions):
     ans_io.seek(0)
     return exam_io, ans_io
 
-# 核心：分頁批次處理邏輯
-def process_file_in_batches(filename, api_key, file_id, batch_size=5, target_batch_idx=None):
-    """
-    分批處理檔案：
-    1. 下載檔案 (Blob)
-    2. 計算總頁數
-    3. 每次處理 5 頁，將結果存入 Firestore 暫存
-    """
-    # 1. 取得檔案
-    file_bytes = None
-    if filename in st.session_state.get('file_queue', {}):
-        file_bytes = st.session_state['file_queue'][filename]['data']
+def process_single_file(filename, api_key, file_id_in_db=None):
+    if filename not in st.session_state['file_queue']: return
+    info = st.session_state['file_queue'][filename]
+    info['status'] = 'processing'
+    
+    with st.spinner(f"正在分析 {filename}... (AI 思考中，請稍候)"):
+        # 修正：優先使用 blob_name 下載，解決過期問題
+        file_bytes = info.get('data')
+        blob_name = info.get('blob_name')
+        
+        # 如果記憶體中沒有，嘗試從 Cloud Storage 下載
+        if not file_bytes and blob_name:
+            file_bytes = cloud_manager.download_blob(blob_name)
+            if file_bytes:
+                st.session_state['file_queue'][filename]['data'] = file_bytes
+        
+        if not file_bytes:
+            st.error("無法讀取檔案內容，請確認檔案是否已上傳。")
+            info['status'] = 'error'
+            return
+
+        res = smart_importer.parse_with_gemini(file_bytes, info['type'], api_key)
+    
+    if isinstance(res, dict) and "error" in res:
+        info['status'] = 'error'
+        info['error_msg'] = res['error']
+        st.error(f"{filename} 辨識失敗: {res['error']}")
     else:
-        record = cloud_manager.check_file_exists(filename)
-        if record and record.get('blob_name'):
-             file_bytes = cloud_manager.download_blob(record['blob_name'])
-        elif record and record.get('url'):
-            try:
-                resp = requests.get(record.get('url'))
-                if resp.status_code == 200: file_bytes = resp.content
-            except: pass
-    
-    if not file_bytes:
-        st.error("無法讀取檔案內容")
-        return
-
-    # 2. 計算頁數 (需要 pdf2image)
-    try:
-        from pdf2image import convert_from_bytes
-        # 這裡可能會花點時間，但為了分頁是必須的
-        # 為了加速，我們可以只抓第一頁和最後一頁來估算，或者直接全轉
-        # 這裡假設 Cloud Run 記憶體足夠轉一次 PDF info
-        # 若記憶體不足，可以嘗試 pypdf (需安裝)
-        # 這裡維持 pdf2image，但注意要安裝 poppler
-        info = convert_from_bytes(file_bytes, size=1) 
-        total_pages = len(info) # 其實這行會把所有頁面轉出來
-    except:
-        # Fallback
-        total_pages = 20 # 假設值
-    
-    num_batches = (total_pages + batch_size - 1) // batch_size
-    batches_to_run = range(num_batches) if target_batch_idx is None else [target_batch_idx]
-
-    progress_bar = st.progress(0)
-    
-    for i, b_idx in enumerate(batches_to_run):
-        start_page = b_idx * batch_size
-        end_page = min((b_idx + 1) * batch_size, total_pages)
+        info['status'] = 'done'
+        info['result'] = res
+        if file_id_in_db:
+            cloud_manager.update_file_status(file_id_in_db, "已辨識")
         
-        status_text = f"正在分析第 {start_page+1}~{end_page} 頁..."
-        st.caption(status_text)
+        st.success(f"{filename} 辨識完成！")
+        st.session_state['just_processed_file'] = filename
+        st.info("💡 請切換至「📝 AI匯入校對」分頁開始編輯")
         
-        # 呼叫 smart_importer (帶入頁數範圍)
-        res_candidates = smart_importer.parse_with_gemini(
-            file_bytes, 'pdf', api_key, target_pages=(start_page, end_page)
-        )
-        
-        if isinstance(res_candidates, list):
-            # 轉換為 dict 存入 Firestore (去除 image bytes)
-            serializable_data = []
-            for cand in res_candidates:
-                d = cand.__dict__.copy()
-                d.pop('image_bytes', None)
-                d.pop('ref_image_bytes', None) 
-                d.pop('full_page_bytes', None)
-                serializable_data.append(d)
-
-            cloud_manager.save_temp_batch(file_id, b_idx, serializable_data, "success")
-        else:
-            cloud_manager.save_temp_batch(file_id, b_idx, [], "failed")
-            st.error(f"第 {b_idx+1} 批次失敗")
-
-        progress_bar.progress((i + 1) / len(batches_to_run))
-        
-    cloud_manager.update_file_status(file_id, "已辨識") # 標記為已辨識
-    st.success("處理完成！")
-    time.sleep(1)
     st.rerun()
 
 # ==========================================
@@ -625,10 +532,15 @@ with st.sidebar:
             st.caption(f"Bucket: {cloud_manager.bucket_name}")
     else:
         st.warning(f"☁️ Cloud: 未連線")
+        if cloud_manager.connection_error:
+            st.caption(f"錯誤: {cloud_manager.connection_error}")
+            if "No secrets found" in cloud_manager.connection_error:
+                st.info("Secrets 未設定，請改用環境變數 GCP_SERVICE_ACCOUNT_JSON")
 
     st.divider()
     st.metric("題庫總數", len(st.session_state['question_pool']))
     
+    # 顯示雲端空間使用量
     if cloud_manager.has_connection:
         st.divider()
         try:
@@ -636,11 +548,15 @@ with st.sidebar:
             total_mb = total_bytes / (1024 * 1024)
             limit_mb = 1024.0 # 1GB
             percentage = min(total_mb / limit_mb, 1.0)
+            
             st.write("📊 **雲端儲存空間**")
             st.progress(percentage)
             st.caption(f"已使用: {total_mb:.2f} MB / 1 GB")
-            if percentage > 0.9: st.warning("⚠️ 容量即將額滿！")
-        except: st.caption("無法取得容量資訊")
+            
+            if percentage > 0.9:
+                st.warning("⚠️ 容量即將額滿！")
+        except:
+            st.caption("無法取得容量資訊")
 
     if st.button("強制儲存至雲端", key="sidebar_force_save"):
         if cloud_manager.has_connection:
@@ -657,12 +573,16 @@ tab_upload_process, tab_files, tab_review, tab_bank = st.tabs(["🧠 考古題�
 # === Tab 1: 考古題上傳 ===
 with tab_upload_process:
     st.markdown("### 📤 上傳新考古題")
+    st.info("請先選擇檔案，設定各自的標籤後，系統將自動重新命名並上傳。")
+    
     uploaded_files = st.file_uploader("支援 .pdf, .docx", type=['pdf', 'docx'], accept_multiple_files=True)
     
     if uploaded_files:
         st.divider()
         st.subheader("設定檔案資訊")
-        if 'upload_configs' not in st.session_state: st.session_state['upload_configs'] = {}
+        
+        if 'upload_configs' not in st.session_state:
+            st.session_state['upload_configs'] = {}
 
         with st.expander("批次設定 (一次套用給下方所有檔案)"):
             c_batch1, c_batch2, c_batch3, c_batch4 = st.columns(4)
@@ -672,12 +592,19 @@ with tab_upload_process:
             with c_batch4: 
                 if st.button("全部套用"):
                     for uf in uploaded_files:
-                        st.session_state['upload_configs'][uf.name] = {"type": b_type, "year": b_year, "exam_no": b_exam_no}
+                        st.session_state['upload_configs'][uf.name] = {
+                            "type": b_type,
+                            "year": b_year,
+                            "exam_no": b_exam_no
+                        }
                     st.success("已套用！")
 
         files_to_upload = []
         for i, f in enumerate(uploaded_files):
-            current_config = st.session_state['upload_configs'].get(f.name, {"type": "學測", "year": "112", "exam_no": "正式考試"})
+            current_config = st.session_state['upload_configs'].get(f.name, {
+                "type": "學測", "year": "112", "exam_no": "正式考試"
+            })
+            
             with st.container():
                 c1, c2, c3, c4 = st.columns([3, 2, 2, 2])
                 with c1: 
@@ -685,22 +612,38 @@ with tab_upload_process:
                     ext = f.name.split('.')[-1]
                     new_name = f"{current_config['year']}-{current_config['type']}-{current_config['exam_no']}.{ext}"
                     st.caption(f"➝ `{new_name}`")
+                
                 with c2: 
-                    new_type = st.selectbox("類型", ["學測", "分科", "北模", "中模", "全模", "其他"], index=["學測", "分科", "北模", "中模", "全模", "其他"].index(current_config['type']), key=f"type_{f.name}")
+                    new_type = st.selectbox("類型", ["學測", "分科", "北模", "中模", "全模", "其他"], 
+                                          index=["學測", "分科", "北模", "中模", "全模", "其他"].index(current_config['type']),
+                                          key=f"type_{f.name}")
                 with c3: 
                     new_year = st.text_input("年度", value=current_config['year'], key=f"year_{f.name}")
                 with c4: 
-                    new_no = st.selectbox("次別", ["第一次", "第二次", "第三次", "正式考試"], index=["第一次", "第二次", "第三次", "正式考試"].index(current_config['exam_no']), key=f"no_{f.name}")
-                st.session_state['upload_configs'][f.name] = {"type": new_type, "year": new_year, "exam_no": new_no}
+                    new_no = st.selectbox("次別", ["第一次", "第二次", "第三次", "正式考試"], 
+                                        index=["第一次", "第二次", "第三次", "正式考試"].index(current_config['exam_no']),
+                                        key=f"no_{f.name}")
+                
+                st.session_state['upload_configs'][f.name] = {
+                    "type": new_type, "year": new_year, "exam_no": new_no
+                }
+                
                 final_new_name = f"{new_year}-{new_type}-{new_no}.{f.name.split('.')[-1]}"
-                files_to_upload.append({"file_obj": f, "new_filename": final_new_name, "type": new_type, "year": new_year, "exam_no": new_no})
+                files_to_upload.append({
+                    "file_obj": f,
+                    "new_filename": final_new_name,
+                    "type": new_type,
+                    "year": new_year,
+                    "exam_no": new_no
+                })
             st.divider()
 
         if st.button("確認並上傳所有檔案", type="primary"):
             duplicate_warnings = []
             for item in files_to_upload:
                 existing = cloud_manager.check_file_exists(item['new_filename'])
-                if existing: duplicate_warnings.append(f"{item['new_filename']} (原: {item['file_obj'].name})")
+                if existing:
+                    duplicate_warnings.append(f"{item['new_filename']} (原: {item['file_obj'].name})")
             
             if duplicate_warnings:
                 st.error(f"發現雲端已有重複檔名，請修改年度或次別：\n" + "\n".join(duplicate_warnings))
@@ -713,14 +656,38 @@ with tab_upload_process:
                     f.seek(0)
                     file_bytes = f.read()
                     
-                    backup_url, blob_name = cloud_manager.upload_bytes(file_bytes, new_fname, folder="raw_uploads", content_type=f.type)
+                    # 使用 upload_bytes 回傳的 (url, blob_name)
+                    backup_url, blob_name = cloud_manager.upload_bytes(
+                        file_bytes, 
+                        new_fname, 
+                        folder="raw_uploads", 
+                        content_type=f.type
+                    )
                     
                     file_record = {
-                        "filename": new_fname, "original_filename": f.name, "url": backup_url, "blob_name": blob_name,
-                        "exam_type": item['type'], "year": item['year'], "exam_no": item['exam_no'],
-                        "ai_status": "未辨識", "created_at": datetime.datetime.now()
+                        "filename": new_fname,
+                        "original_filename": f.name,
+                        "url": backup_url,
+                        "blob_name": blob_name, # 儲存 Blob Name
+                        "exam_type": item['type'],
+                        "year": item['year'],
+                        "exam_no": item['exam_no'],
+                        "ai_status": "未辨識",
+                        "created_at": datetime.datetime.now()
                     }
                     cloud_manager.save_file_record(file_record)
+                    
+                    st.session_state['file_queue'][new_fname] = {
+                        "status": "uploaded", 
+                        "data": file_bytes,
+                        "type": f.type.split('/')[-1] if '/' in f.type else 'pdf',
+                        "result": [],
+                        "error_msg": "",
+                        "source_tag": f"{item['type']}-{item['year']}",
+                        "backup_url": backup_url,
+                        "blob_name": blob_name,
+                        "db_id": file_record['id'] 
+                    }
                     success_count += 1
                     progress_bar.progress((idx + 1) / len(files_to_upload))
                 
@@ -730,8 +697,18 @@ with tab_upload_process:
                     time.sleep(1)
                     st.rerun()
 
+    if st.session_state['file_queue']:
+        with st.expander(f"查看目前工作階段暫存 ({len(st.session_state['file_queue'])})"):
+            for fname in st.session_state['file_queue']:
+                st.write(fname)
+
 # === Tab 2: 檔案管理及AI辨識 ===
 with tab_files:
+    if 'just_processed_file' in st.session_state:
+        st.success(f"🎉 **{st.session_state['just_processed_file']}** 辨識完成！")
+        st.info("👉 請點選上方 **「📝 AI匯入校對」** 分頁進行檢查。")
+        del st.session_state['just_processed_file']
+
     st.subheader("已上傳考古題檔案庫")
     cloud_files = cloud_manager.load_file_records()
     
@@ -742,140 +719,260 @@ with tab_files:
         for f in cloud_files:
             ftype = f.get('exam_type', '未分類')
             fyear = f.get('year', '未知年份')
+            
             if ftype not in files_tree: files_tree[ftype] = {}
             if fyear not in files_tree[ftype]: files_tree[ftype][fyear] = []
+            
             files_tree[ftype][fyear].append(f)
 
         for ftype in sorted(files_tree.keys()):
             with st.expander(f"📁 {ftype}", expanded=False):
                 years_dict = files_tree[ftype]
-                def year_sort_key(y_str): return -int(y_str) if y_str.isdigit() else 0
+                
+                def year_sort_key(y_str):
+                    return -int(y_str) if y_str.isdigit() else 0
+                
                 for fyear in sorted(years_dict.keys(), key=year_sort_key):
                     with st.expander(f"📁 {fyear} 年度", expanded=False):
                         files_list = years_dict[fyear]
+                        
                         exam_no_order = {"第一次": 1, "第二次": 2, "第三次": 3, "正式考試": 4, "其他": 99}
-                        def file_sort_key(f): return exam_no_order.get(f.get('exam_no', '其他'), 100)
+                        def file_sort_key(f):
+                            no = f.get('exam_no', '其他')
+                            return exam_no_order.get(no, 100)
+                        
                         sorted_files = sorted(files_list, key=file_sort_key)
                         
                         for f_record in sorted_files:
                             c_name, c_status, c_action = st.columns([5, 2, 3], vertical_alignment="center")
-                            with c_name: st.write(f"📄 {f_record.get('filename')}")
+                            
+                            with c_name:
+                                st.write(f"📄 {f_record.get('filename')}")
+                            
                             with c_status:
                                 status = f_record.get('ai_status', '未辨識')
-                                if status == '已辨識': st.button("✅ 已辨識", key=f"status_{f_record['id']}", disabled=True, use_container_width=True)
-                                else: st.button("⬜ 未辨識", key=f"status_{f_record['id']}", disabled=True, use_container_width=True)
+                                if status == '已辨識':
+                                    st.button("✅ 已辨識", key=f"status_{f_record['id']}", disabled=True, use_container_width=True)
+                                else:
+                                    st.button("⬜ 未辨識", key=f"status_{f_record['id']}", disabled=True, use_container_width=True)
+                            
                             with c_action:
                                 b1, b2 = st.columns(2)
                                 with b1:
-                                    # 分批辨識
-                                    if st.button("AI 辨識", key=f"ai_{f_record['id']}", use_container_width=True):
-                                        process_file_in_batches(f_record['filename'], api_key_input, f_record['id'])
+                                    btn_label = "重新辨識" if status == '已辨識' else "AI 辨識"
+                                    if st.button(btn_label, key=f"ai_{f_record['id']}", use_container_width=True):
+                                        fname = f_record['filename']
+                                        
+                                        # 嘗試載入檔案
+                                        loaded_success = False
+                                        blob_name = f_record.get('blob_name')
+                                        file_url = f_record.get('url')
+                                        
+                                        if fname not in st.session_state['file_queue']:
+                                            # 優先使用 blob_name 下載 (更穩定)
+                                            if blob_name:
+                                                file_bytes = cloud_manager.download_blob(blob_name)
+                                                if file_bytes:
+                                                    st.session_state['file_queue'][fname] = {
+                                                        "status": "uploaded", 
+                                                        "data": file_bytes,
+                                                        "type": fname.split('.')[-1].lower(),
+                                                        "result": [],
+                                                        "error_msg": "",
+                                                        "source_tag": f"{ftype}-{fyear}",
+                                                        "backup_url": file_url,
+                                                        "blob_name": blob_name,
+                                                        "db_id": f_record['id']
+                                                    }
+                                                    loaded_success = True
+                                                else:
+                                                    st.error("Blob 下載失敗")
+                                            # Fallback
+                                            elif file_url:
+                                                try:
+                                                    resp = requests.get(file_url)
+                                                    if resp.status_code == 200:
+                                                        st.session_state['file_queue'][fname] = {
+                                                            "status": "uploaded", 
+                                                            "data": resp.content,
+                                                            "type": fname.split('.')[-1].lower(),
+                                                            "result": [],
+                                                            "error_msg": "",
+                                                            "source_tag": f"{ftype}-{fyear}",
+                                                            "backup_url": file_url,
+                                                            "db_id": f_record['id']
+                                                        }
+                                                        loaded_success = True
+                                                except: pass
+                                        else:
+                                            loaded_success = True
+                                            
+                                        if loaded_success:
+                                            process_single_file(fname, api_key_input, f_record['id'])
+                                        else:
+                                            st.error("無法讀取檔案，請嘗試重新上傳。")
+
                                 with b2:
                                     if st.button("🗑️", key=f"del_f_{f_record['id']}", type="primary", use_container_width=True):
                                         cloud_manager.delete_file_record(f_record['id'])
                                         st.rerun()
 
-                        # 顯示批次錯誤重試
-                        batches = cloud_manager.load_temp_batches(f_record['id'])
-                        if batches:
-                            with st.expander("查看批次狀態 (重試錯誤)", expanded=False):
-                                for b_idx, b_data in sorted(batches.items()):
-                                    if b_data.get('status') != 'success':
-                                        if st.button(f"重試第 {b_idx+1} 批次", key=f"retry_{f_record['id']}_{b_idx}"):
-                                             process_file_in_batches(f_record['filename'], api_key_input, f_record['id'], target_batch_idx=b_idx)
-
 # === Tab 3: AI匯入校對 ===
 with tab_review:
     st.subheader("匯入校對與截圖")
-    # 這裡改成選擇檔案 (從 Firestore 檔案列表讀取)
-    cloud_files = cloud_manager.load_file_records()
-    processed_files = [f for f in cloud_files if f.get('ai_status') == '已辨識']
+    ready_files = [f for f, info in st.session_state['file_queue'].items() if info['status'] == 'done']
     
-    if not processed_files:
-        st.warning("沒有已辨識完成的檔案。請先至 Tab 2 執行 AI 辨識。")
+    if not ready_files:
+        st.warning("沒有已完成辨識的檔案。請先至「檔案管理及AI辨識」點擊辨識，或上傳新檔案。")
     else:
-        file_options = {f['filename']: f['id'] for f in processed_files}
-        selected_filename = st.selectbox("選擇要校對的檔案", list(file_options.keys()))
-        selected_file_id = file_options[selected_filename]
+        default_idx = 0
+        if 'just_processed_file' in st.session_state and st.session_state['just_processed_file'] in ready_files:
+             default_idx = ready_files.index(st.session_state['just_processed_file'])
+
+        selected_file = st.selectbox("選擇要處理的檔案", ready_files, index=default_idx)
+        file_info = st.session_state['file_queue'][selected_file]
+        candidates = file_info['result']
         
-        # 載入暫存資料 (合併所有批次)
-        all_candidates = []
-        batches = cloud_manager.load_temp_batches(selected_file_id)
-        for b_idx in sorted(batches.keys()):
-            b_data = batches[b_idx]
-            if b_data.get('data'):
-                # JSON 反序列化
-                items = json.loads(b_data['data'])
-                # 轉換回 SmartQuestionCandidate (需要 smart_importer 支援 from_dict)
-                # 這裡簡化，直接用 dict 操作
-                all_candidates.extend(items)
+        st.markdown(f"**正在編輯：{selected_file} (共 {len(candidates)} 題)**")
+        col_src1, col_src2 = st.columns(2)
+        with col_src1:
+            default_tag = file_info.get("source_tag", "未分類")
+            source_tag = st.text_input("設定此批試卷來源標籤", value=default_tag)
         
-        if not all_candidates:
-            st.info("此檔案沒有辨識出題目，或暫存資料已清除。")
-        else:
-            # 分頁顯示 (避免 OOM)
-            ITEMS_PER_PAGE = 5
-            if 'review_page' not in st.session_state: st.session_state['review_page'] = 0
-            
-            total_items = len(all_candidates)
-            max_page = (total_items - 1) // ITEMS_PER_PAGE
-            
-            c_prev, c_info, c_next = st.columns([1, 2, 1])
-            with c_prev:
-                if st.button("⬅️ 上一頁", disabled=(st.session_state['review_page'] == 0)):
-                    st.session_state['review_page'] -= 1
-                    st.rerun()
-            with c_next:
-                if st.button("下一頁 ➡️", disabled=(st.session_state['review_page'] >= max_page)):
-                    st.session_state['review_page'] += 1
-                    st.rerun()
-            
-            start_idx = st.session_state['review_page'] * ITEMS_PER_PAGE
-            end_idx = min(start_idx + ITEMS_PER_PAGE, total_items)
-            
-            # 需要重新下載 PDF 轉圖 (為了截圖)
-            # 這是必要的 trade-off，為了不存圖在 DB
-            # 優化：只下載一次存 session
-            if 'current_pdf_bytes' not in st.session_state or st.session_state.get('current_pdf_name') != selected_filename:
-                record = cloud_manager.check_file_exists(selected_filename)
-                if record and record.get('blob_name'):
-                    st.session_state['current_pdf_bytes'] = cloud_manager.download_blob(record['blob_name'])
-                    st.session_state['current_pdf_name'] = selected_filename
-
-            # 顯示題目表單
-            with st.form(key=f"review_form_{selected_file_id}_{st.session_state['review_page']}"):
-                for i, item in enumerate(all_candidates[start_idx:end_idx]):
-                    real_idx = start_idx + i
-                    st.markdown(f"**第 {item.get('number', '?')} 題**")
+        st.divider()
+        
+        with st.form(key=f"edit_form_{selected_file}"):
+            for i, cand in enumerate(candidates):
+                st.markdown(f"**第 {cand.number} 題**")
+                
+                if cand.q_type == "Group":
+                    st.info("📖 題組共用敘述")
+                
+                c1, c2 = st.columns([1, 1])
+                with c1:
+                    cand.content = st.text_area(f"題目內容 #{i}", cand.content, height=100, key=f"{selected_file}_c_{i}")
                     
-                    c1, c2 = st.columns([1, 1])
-                    with c1:
-                        new_content = st.text_area("題目", item.get('content', ''), key=f"c_{real_idx}")
-                        # ... (其他欄位) ...
-                        st.text_input("答案", item.get('answer', ''), key=f"a_{real_idx}")
+                    if cand.q_type != "Group":
+                        opts_text = "\n".join(cand.options)
+                        new_opts = st.text_area(f"選項 #{i}", opts_text, height=80, key=f"{selected_file}_o_{i}")
+                        cand.options = new_opts.split('\n') if new_opts else []
                     
-                    with c2:
-                        st.write("截圖區域 (需實作動態裁切)")
-                        # 這裡如果要截圖，需要用 st.session_state['current_pdf_bytes'] 配合 pdf2image 轉出該頁圖片
-                        # 由於邏輯較複雜，這裡先保留佔位符
-                        st.info("如需截圖，請確認 PDF 已載入")
+                    # 題型選擇 (中文)
+                    current_type_zh = TYPE_MAP_EN_TO_ZH.get(cand.q_type, "單選")
+                    new_type_zh = st.selectbox(f"題型 #{i}", TYPE_OPTIONS, index=TYPE_OPTIONS.index(current_type_zh), key=f"{selected_file}_t_{i}")
+                    cand.q_type = TYPE_MAP_ZH_TO_EN[new_type_zh]
 
-                if st.form_submit_button("暫存修改"):
-                    # 更新 all_candidates 並存回 Firestore temp
-                    # (需實作 update 邏輯)
-                    pass
+                    if cand.q_type == "Group" and cand.sub_questions:
+                        with st.expander("編輯子題目"):
+                            for sub_q in cand.sub_questions:
+                                st.text_area(f"子題 {sub_q.get('number')} 內容", sub_q.get('content', ''), key=f"sub_c_{selected_file}_{i}_{sub_q.get('number')}")
+
+                    ans_key = f"{selected_file}_ans_{i}"
+                    default_ans = st.session_state.get(ans_key, "")
+                    st.text_input(f"答案 (可留空) #{i}", value=default_ans, key=ans_key)
+                    
+                    chap_idx = 0
+                    if cand.predicted_chapter in smart_importer.PHYSICS_CHAPTERS_LIST:
+                        chap_idx = smart_importer.PHYSICS_CHAPTERS_LIST.index(cand.predicted_chapter)
+                    cand.predicted_chapter = st.selectbox(f"章節分類 #{i}", smart_importer.PHYSICS_CHAPTERS_LIST, index=chap_idx, key=f"{selected_file}_ch_{i}")
+                    
+                    if cand.image_bytes: st.image(cand.image_bytes, caption="目前附圖", width=200)
+                    else: st.caption("🚫 目前無附圖")
+
+                with c2:
+                    st.markdown("✂️ **截圖工具**")
+                    # [重點] 優先使用 AI 截的 ref_image，若無則使用整頁 full_page_bytes
+                    image_to_crop = cand.ref_image_bytes if cand.ref_image_bytes else cand.full_page_bytes
+                    
+                    if image_to_crop:
+                        try:
+                            # 顯示裁切器
+                            if st_cropper:
+                                pil_ref = Image.open(io.BytesIO(image_to_crop))
+                                st_cropper(
+                                    pil_ref, 
+                                    realtime_update=True, 
+                                    box_color='#FF0000',
+                                    key=f"{selected_file}_cropper_{i}",
+                                    aspect_ratio=None
+                                )
+                                st.caption("提示：截圖需在 Form 提交後或獨立操作")
+                            else:
+                                st.error("Streamlit Cropper 未安裝")
+                                st.image(image_to_crop, caption="原始圖片 (無法裁切)")
+                        except: 
+                            st.error("截圖載入失敗")
+                            # 萬一載入失敗，至少顯示靜態圖
+                            st.image(image_to_crop, caption="靜態預覽", width=300)
+                    else:
+                        st.info("無法取得此題的參考圖片 (也無整頁圖片)")
+                st.divider()
             
-            st.divider()
-            if st.button("✅ 確認匯入題庫 (清除暫存)", type="primary"):
-                # 將 all_candidates 轉為 Question 存入 questions
-                # 刪除 temp_batches
-                # 刪除 storage raw_uploads
-                cloud_manager.clear_temp_batches(selected_file_id)
-                # ...
-                st.success("匯入成功！")
-                st.rerun()
+            st.form_submit_button("💾 暫存所有修改 (不會上傳)")
+        
+        if st.button(f"✅ 確認匯入 [{selected_file}] 至雲端", type="primary"):
+            progress_bar = st.progress(0)
+            count = 0
+            total = len(candidates)
+            db_file_id = file_info.get("db_id")
 
-# === Tab 4: 題庫管理 ===
+            for i, cand in enumerate(candidates):
+                ans_val = st.session_state.get(f"{selected_file}_ans_{i}", "")
+                new_q = Question(
+                    q_type=cand.q_type,
+                    content=cand.content,
+                    options=cand.options,
+                    source=source_tag, 
+                    chapter=cand.predicted_chapter,
+                    image_data=cand.image_bytes,
+                    answer=ans_val,
+                    source_file_id=db_file_id,
+                    sub_questions=[Question.from_dict(sq) for sq in cand.sub_questions] if cand.sub_questions else []
+                )
+                cloud_manager.save_question(new_q.to_dict())
+                st.session_state['question_pool'].append(new_q)
+                count += 1
+                progress_bar.progress((i + 1) / total)
+            
+            st.success(f"成功匯入 {count} 題！")
+            st.session_state['file_queue'][selected_file]['status'] = 'imported'
+            if db_file_id:
+                cloud_manager.update_file_status(db_file_id, "已匯入")
+            st.rerun()
+
+# === Tab 4: 題庫管理與試卷輸出 ===
 with tab_bank:
-    # ... (保持原樣) ...
-    st.write("題庫管理功能")
+    st.subheader("題庫總覽與試卷輸出")
+    if not st.session_state['question_pool']:
+        st.info("目前沒有題目。")
+    else:
+        all_sources = sorted(list(set([q.source for q in st.session_state['question_pool']])))
+        selected_questions_for_export = []
+        for src in all_sources:
+            qs_in_src = [q for q in st.session_state['question_pool'] if q.source == src]
+            with st.expander(f"📁 {src} ({len(qs_in_src)} 題)"):
+                if st.checkbox(f"選取全套 [{src}] 進行匯出", key=f"sel_src_{src}"):
+                    selected_questions_for_export.extend(qs_in_src)
+                for i, q in enumerate(qs_in_src):
+                    type_badge = TYPE_MAP_EN_TO_ZH.get(q.type, q.type)
+                    if q.parent_id: continue 
+                    st.markdown(f"**【{type_badge}】 {q.content[:30]}...**")
+                    if q.image_url: st.caption("🖼️ 雲端圖片")
+                    elif q.image_data: st.caption("💾 本機圖片 (未同步)")
+                    with st.popover("編輯"):
+                        q.content = st.text_area("題目", q.content, key=f"edt_c_{q.id}")
+                        q.answer = st.text_input("答案", q.answer, key=f"edt_a_{q.id}")
+                        if st.button("儲存", key=f"save_{q.id}"):
+                            cloud_manager.save_question(q.to_dict())
+                            st.rerun()
+                        if st.button("刪除", key=f"del_{q.id}", type="primary"):
+                            cloud_manager.delete_question(q.id)
+                            st.rerun()
+                    st.divider()
+
+        st.divider()
+        st.subheader(f"已選取 {len(selected_questions_for_export)} 題準備匯出")
+        if st.button("生成 Word 試卷"):
+            f1, f2 = generate_word_files(selected_questions_for_export)
+            st.download_button("下載試題卷", f1, "exam.docx")
+            st.download_button("下載答案卷", f2, "ans.docx")
