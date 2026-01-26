@@ -9,14 +9,10 @@ import time
 import base64
 import requests 
 from PIL import Image
-# 安全載入 streamlit_cropper
 try:
     from streamlit_cropper import st_cropper 
 except ImportError:
     st_cropper = None 
-except Exception:
-    st_cropper = None
-
 import os
 import datetime
 import uuid
@@ -26,7 +22,6 @@ from google.cloud import storage
 import google.auth 
 from google.oauth2 import service_account
 
-# 確保正確匯入 smart_importer
 import smart_importer
 
 st.set_page_config(page_title="物理題庫系統 (Pro)", layout="wide", page_icon="🧲")
@@ -37,7 +32,7 @@ TYPE_MAP_EN_TO_ZH = {v: k for k, v in TYPE_MAP_ZH_TO_EN.items()}
 TYPE_OPTIONS = ["單選", "多選", "填充", "題組"]
 
 # ==========================================
-# 雲端資料庫與儲存模組 (CloudManager)
+# 雲端資料庫與儲存模組 (內建)
 # ==========================================
 class CloudManager:
     def __init__(self):
@@ -54,7 +49,6 @@ class CloudManager:
             service_account_json = os.getenv("GCP_SERVICE_ACCOUNT_JSON")
             if service_account_json:
                 try:
-                    # Clean up
                     service_account_json = service_account_json.strip()
                     if service_account_json.startswith("'") and service_account_json.endswith("'"):
                          service_account_json = service_account_json[1:-1]
@@ -159,9 +153,9 @@ class CloudManager:
             print(f"容量計算失敗: {e}")
             return 0
 
-    # --- 上傳與下載 (修正版) ---
+    # --- 核心修復：上傳與下載 ---
     def upload_bytes(self, file_bytes, filename, folder="uploads", content_type=None):
-        """上傳檔案，回傳 (URL, Blob名稱)"""
+        """上傳檔案，回傳 (公開網址, Blob名稱)"""
         if not self.storage_client: return None, None
         try:
             target_bucket_name = self.bucket_name
@@ -199,14 +193,14 @@ class CloudManager:
                     )
             except: pass
             
-            return url, unique_name # 回傳 Tuple (url, blob_name)
+            return url, unique_name # 回傳 Tuple
 
         except Exception as e:
             print(f"上傳失敗: {e}")
             return None, None
 
     def download_blob(self, blob_name):
-        """直接透過 API 下載 Blob (解決下載異常的關鍵)"""
+        """直接透過 API 下載 Blob，不需經過 URL (解決下載異常最有效的方法)"""
         if not self.storage_client or not blob_name: return None
         try:
             target_bucket_name = self.bucket_name
@@ -688,6 +682,8 @@ with tab_upload_process:
                         "blob_name": blob_name,
                         "db_id": file_record['id'] 
                     }
+                    # 重新載入 file records 以獲取 ID
+                    # 為了簡單，這裡不立即做，而是依賴 load_file_records
                     success_count += 1
                     progress_bar.progress((idx + 1) / len(files_to_upload))
                 
@@ -799,7 +795,7 @@ with tab_files:
                                                             "result": [],
                                                             "error_msg": "",
                                                             "source_tag": f"{ftype}-{fyear}",
-                                                            "backup_url": file_url,
+                                                            "backup_url": f_record.get('url'),
                                                             "db_id": f_record['id']
                                                         }
                                                         loaded_success = True
@@ -890,11 +886,8 @@ with tab_review:
                             if st_cropper:
                                 pil_ref = Image.open(io.BytesIO(image_to_crop))
                                 st_cropper(
-                                    pil_ref, 
-                                    realtime_update=True, 
-                                    box_color='#FF0000',
-                                    key=f"{selected_file}_cropper_{i}",
-                                    aspect_ratio=None
+                                    pil_ref, realtime_update=True, box_color='#FF0000',
+                                    key=f"{selected_file}_cropper_{i}", aspect_ratio=None
                                 )
                                 st.caption("提示：截圖需在 Form 提交後或獨立操作")
                             else:
