@@ -71,7 +71,7 @@ class SmartQuestionCandidate:
         self.status_reason = status_reason
         self.image_bytes = image_bytes      # 題目附圖 (已裁切)
         self.ref_image_bytes = ref_image_bytes # 題目區域截圖 (全寬度)
-        self.full_page_bytes = full_page_bytes # 整頁原始圖 (供手動裁切用)
+        self.full_page_bytes = full_page_bytes # [關鍵] 整頁原始圖 (供手動裁切用)
         self.q_type = q_type
         self.subject = subject
         self.sub_questions = sub_questions if sub_questions else [] # 支援題組
@@ -92,6 +92,11 @@ def clean_json_string(json_str):
     return json_str.strip()
 
 def crop_image(original_img, box_2d, force_full_width=False, padding_y=10):
+    """
+    裁切圖片
+    force_full_width: 是否強制寬度為整張圖片 (0-1000)
+    padding_y: 上下擴展的範圍 (以 1000 為基底)
+    """
     if not box_2d or len(box_2d) != 4: return None
     
     width, height = original_img.size
@@ -139,13 +144,9 @@ def img_to_bytes(pil_img):
     return img_byte_arr.getvalue()
 
 # ==========================================
-# Gemini AI 解析邏輯 (支援指定頁數)
+# Gemini AI 解析邏輯 (修正重點：確保此函式存在)
 # ==========================================
-def parse_with_gemini(file_bytes, file_type, api_key, target_pages=None):
-    """
-    target_pages: tuple (start_page_idx, end_page_idx) 
-                  例如 (0, 5) 代表處理第 0 到 4 頁 (不含 5)。若為 None 則處理全部。
-    """
+def parse_with_gemini(file_bytes, file_type, api_key):
     if not HAS_GENAI: return {"error": "缺少 google-generativeai 套件"}
     if not api_key: return {"error": "請輸入 API Key"}
 
@@ -159,13 +160,12 @@ def parse_with_gemini(file_bytes, file_type, api_key, target_pages=None):
     if file_type == 'pdf':
         if not HAS_PDF2IMAGE: return {"error": "缺少 pdf2image (Poppler) 未安裝"}
         try:
-            # DPI 150
-            source_images = convert_from_bytes(file_bytes, dpi=150, fmt='jpeg')
+            # [優化] 降低 DPI 至 100 以解決記憶體不足與速度問題 (文字辨識仍足夠)
+            source_images = convert_from_bytes(file_bytes, dpi=100, fmt='jpeg')
         except Exception as e:
             return {"error": f"PDF 轉圖片失敗: {str(e)}"}
             
     elif file_type == 'docx':
-        # Docx 暫時不支援分頁邏輯，視為一整批
         if not HAS_DOCX: return {"error": "缺少 python-docx 套件"}
         try:
             doc = docx.Document(io.BytesIO(file_bytes))
@@ -181,25 +181,17 @@ def parse_with_gemini(file_bytes, file_type, api_key, target_pages=None):
 
     if not source_images and file_type == 'pdf': return {"error": "PDF 頁面為空"}
 
-    # 處理指定頁數範圍
-    start_offset = 0
-    images_to_process = source_images
-    
-    if target_pages and file_type == 'pdf':
-        start_p, end_p = target_pages
-        # 邊界檢查
-        start_p = max(0, start_p)
-        end_p = min(len(source_images), end_p)
-        
-        if start_p < end_p:
-            images_to_process = source_images[start_p:end_p]
-            start_offset = start_p
-        else:
-            return {"error": "指定的頁數範圍無效"}
+    # Batch Size (降低到 5 以避免 OOM 與 超時)
+    BATCH_SIZE = 5 
+    total_pages = len(source_images)
+    all_candidates = []
+    errors = []
 
-    # 這裡我們不再分批，因為 caller 會負責分批 (每次呼叫只傳 5 頁進來)
-    batches = [images_to_process]
-    
+    if file_type == 'docx':
+        batches = [source_images] 
+    else:
+        batches = [source_images[i:i + BATCH_SIZE] for i in range(0, total_pages, BATCH_SIZE)]
+
     prompt_chapters = [c for c in PHYSICS_CHAPTERS_LIST if c != "未分類"]
     chapters_str = "\n".join(prompt_chapters)
     
@@ -210,11 +202,9 @@ def parse_with_gemini(file_bytes, file_type, api_key, target_pages=None):
         "gemini-2.0-flash",    
         "gemini-1.5-pro"       
     ]
-    
-    all_candidates = []
-    errors = []
 
     for batch_idx, batch_imgs in enumerate(batches):
+        start_page_idx = batch_idx * BATCH_SIZE
         
         extra_instruction = ""
         if file_type == 'pdf':
@@ -225,6 +215,7 @@ def parse_with_gemini(file_bytes, file_type, api_key, target_pages=None):
             3. 'page_index': 該題目位於本批次圖片的第幾頁 (0, 1, ...)。
             """
         
+        # 增強版 Prompt
         prompt = f"""
         分析考卷圖片，只擷取【高中物理】試題。
         
@@ -270,12 +261,12 @@ def parse_with_gemini(file_bytes, file_type, api_key, target_pages=None):
                 continue
         
         if not response:
-             errors.append(f"Batch failed: {str(last_error)}")
+             errors.append(f"Batch {batch_idx+1} failed: {str(last_error)}")
              continue
 
         try:
             if not response.text:
-                errors.append("Batch: Empty response")
+                errors.append(f"Batch {batch_idx+1}: Empty response")
                 continue
 
             json_text = clean_json_string(response.text)
@@ -295,41 +286,45 @@ def parse_with_gemini(file_bytes, file_type, api_key, target_pages=None):
 
                 diagram_bytes = None
                 ref_bytes = None
-                full_page_bytes = None
+                full_page_bytes = None 
                 
                 if file_type == 'pdf':
                     try:
                         local_idx = item.get('page_index', 0)
-                        # 邊界檢查
                         if not isinstance(local_idx, int) or local_idx < 0 or local_idx >= len(batch_imgs):
                             local_idx = 0
+                        absolute_idx = start_page_idx + local_idx
+                        
+                        if 0 <= absolute_idx < len(source_images):
+                            src_img = source_images[absolute_idx]
                             
-                        # 對應到原始圖片列表中的正確圖片 (因為 batch_imgs 是切片後的)
-                        src_img = batch_imgs[local_idx] 
-                        
-                        full_page_bytes = img_to_bytes(src_img)
-                        
-                        if 'box_2d' in item:
-                            diagram_bytes = crop_image(src_img, item['box_2d'], False, 5)
-                        
-                        if 'full_question_box_2d' in item:
-                            ref_bytes = crop_image(src_img, item['full_question_box_2d'], True, 100)
-                        else:
-                            ref_bytes = full_page_bytes
+                            # 強制儲存整頁
+                            full_page_bytes = img_to_bytes(src_img)
                             
+                            # 1. 題目附圖
+                            if 'box_2d' in item:
+                                diagram_bytes = crop_image(src_img, item['box_2d'], force_full_width=False, padding_y=5)
+                            
+                            # 2. 整題截圖
+                            if 'full_question_box_2d' in item:
+                                ref_bytes = crop_image(src_img, item['full_question_box_2d'], force_full_width=True, padding_y=150)
+                            else:
+                                # 若 AI 沒回傳範圍，預設使用整頁做為 fallback
+                                ref_bytes = full_page_bytes
+                                
                     except Exception as e:
-                        print(f"Crop error: {e}")
-
+                        print(f"Image crop error: {e}")
+                
                 cand = SmartQuestionCandidate(
                     raw_text=item.get('content', ''),
                     question_number=item.get('number', 0),
                     options=item.get('options', []),
                     chapter=item.get('chapter', '未分類'),
                     is_likely=True,
-                    status_reason="AI",
+                    status_reason=f"Batch {batch_idx+1}",
                     image_bytes=diagram_bytes,      
                     ref_image_bytes=ref_bytes,
-                    full_page_bytes=full_page_bytes,
+                    full_page_bytes=full_page_bytes, # 傳遞整頁圖片
                     q_type=q_type,
                     subject='Physics',
                     sub_questions=item.get('sub_questions', [])
@@ -338,16 +333,14 @@ def parse_with_gemini(file_bytes, file_type, api_key, target_pages=None):
                 all_candidates.append(cand)
                 
         except Exception as e:
-            errors.append(f"解析錯誤: {str(e)}")
+            errors.append(f"Batch {batch_idx+1} processing error: {str(e)}")
+            
+        time.sleep(1) 
 
     if not all_candidates and errors:
-        return {"error": "; ".join(errors)}
+        return {"error": f"分析失敗詳情: {'; '.join(errors)}"}
         
-    # 確保 number 為整數後排序
-    try:
-        all_candidates.sort(key=lambda x: int(x.number))
-    except: pass
-    
+    all_candidates.sort(key=lambda x: x.number)
     return all_candidates
 
 def parse_raw_file(file_obj, file_type, use_ocr=False):
