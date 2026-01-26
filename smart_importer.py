@@ -71,7 +71,7 @@ class SmartQuestionCandidate:
         self.status_reason = status_reason
         self.image_bytes = image_bytes      # 題目附圖 (已裁切)
         self.ref_image_bytes = ref_image_bytes # 題目區域截圖 (全寬度)
-        self.full_page_bytes = full_page_bytes # [關鍵] 整頁原始圖 (供手動裁切用)
+        self.full_page_bytes = full_page_bytes # 整頁原始圖 (供手動裁切用)
         self.q_type = q_type
         self.subject = subject
         self.sub_questions = sub_questions if sub_questions else [] # 支援題組
@@ -144,7 +144,7 @@ def img_to_bytes(pil_img):
     return img_byte_arr.getvalue()
 
 # ==========================================
-# Gemini AI 解析邏輯 (修正重點：確保此函式存在)
+# Gemini AI 解析邏輯
 # ==========================================
 def parse_with_gemini(file_bytes, file_type, api_key):
     if not HAS_GENAI: return {"error": "缺少 google-generativeai 套件"}
@@ -181,7 +181,7 @@ def parse_with_gemini(file_bytes, file_type, api_key):
 
     if not source_images and file_type == 'pdf': return {"error": "PDF 頁面為空"}
 
-    # Batch Size (降低到 5 以避免 OOM 與 超時)
+    # Batch Size
     BATCH_SIZE = 5 
     total_pages = len(source_images)
     all_candidates = []
@@ -215,7 +215,7 @@ def parse_with_gemini(file_bytes, file_type, api_key):
             3. 'page_index': 該題目位於本批次圖片的第幾頁 (0, 1, ...)。
             """
         
-        # 增強版 Prompt
+        # 增強版 Prompt：支援題組與自動判題
         prompt = f"""
         分析考卷圖片，只擷取【高中物理】試題。
         
@@ -239,6 +239,17 @@ def parse_with_gemini(file_bytes, file_type, api_key):
                 "full_question_box_2d": [ymin, 0, ymax, 1000],
                 "box_2d": [ymin, xmin, ymax, xmax], 
                 "page_index": 0 
+            }},
+            {{
+                "number": 2,
+                "type": "Group",
+                "content": "題組共用敘述...",
+                "sub_questions": [
+                    {{ "number": 2, "content": "子題1...", "type": "Single", "options": [...], "answer": "C" }},
+                    {{ "number": 3, "content": "子題2...", "type": "Fill", "answer": "100" }}
+                ],
+                "full_question_box_2d": [ymin, 0, ymax, 1000],
+                "page_index": 0
             }}
         ]
         {extra_instruction}
@@ -274,16 +285,23 @@ def parse_with_gemini(file_bytes, file_type, api_key):
             if isinstance(data, dict): data = [data]
             
             for item in data:
+                # 關鍵字過濾
                 content_text = (item.get('content', '') + " " + " ".join(item.get('options', []))).lower()
                 if any(ek in content_text for ek in EXCLUDE_KEYWORDS):
                     continue 
 
+                # === 自動修正判題邏輯 (Python 二次確認) ===
                 q_type = item.get('type', 'Single')
+                
+                # 1. 檢查複選
                 if "應選" in content_text and ("項" in content_text or "二" in content_text or "三" in content_text):
                     q_type = "Multi"
+                
+                # 2. 檢查填充 (若不是 Group 且沒有選項)
                 if q_type != "Group" and not item.get('options'):
                     q_type = "Fill"
 
+                # === 圖片處理 ===
                 diagram_bytes = None
                 ref_bytes = None
                 full_page_bytes = None 
@@ -298,14 +316,14 @@ def parse_with_gemini(file_bytes, file_type, api_key):
                         if 0 <= absolute_idx < len(source_images):
                             src_img = source_images[absolute_idx]
                             
-                            # 強制儲存整頁
+                            # 強制儲存整頁，作為手動截圖的底圖
                             full_page_bytes = img_to_bytes(src_img)
                             
-                            # 1. 題目附圖
+                            # 1. 題目附圖 (Box)
                             if 'box_2d' in item:
                                 diagram_bytes = crop_image(src_img, item['box_2d'], force_full_width=False, padding_y=5)
                             
-                            # 2. 整題截圖
+                            # 2. 整題截圖 (Ref Box) - 強制全寬 + 上下大幅擴展
                             if 'full_question_box_2d' in item:
                                 ref_bytes = crop_image(src_img, item['full_question_box_2d'], force_full_width=True, padding_y=150)
                             else:
@@ -327,7 +345,7 @@ def parse_with_gemini(file_bytes, file_type, api_key):
                     full_page_bytes=full_page_bytes, # 傳遞整頁圖片
                     q_type=q_type,
                     subject='Physics',
-                    sub_questions=item.get('sub_questions', [])
+                    sub_questions=item.get('sub_questions', []) # 傳遞子題
                 )
                 cand.content = item.get('content', '')
                 all_candidates.append(cand)
