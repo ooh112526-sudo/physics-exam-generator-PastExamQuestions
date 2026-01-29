@@ -56,37 +56,25 @@ EXCLUDE_KEYWORDS = [
 ]
 
 # ==========================================
-# 候選題目物件 (擴充子題支援)
+# 候選題目物件
 # ==========================================
 class SmartQuestionCandidate:
     def __init__(self, raw_text, question_number, options=None, chapter="未分類", 
                  is_likely=True, status_reason="", image_bytes=None, q_type="Single", 
-                 ref_image_bytes=None, full_page_bytes=None, subject="Physics", sub_questions=None, page_index=0):
+                 ref_image_bytes=None, full_page_bytes=None, subject="Physics", sub_questions=None):
         self.raw_text = raw_text
-        
-        # [修正] 強制轉換題號為整數，若失敗則預設為 0
-        try:
-            self.number = int(question_number)
-        except (ValueError, TypeError):
-            # 嘗試從字串中提取數字 (例如 "1." -> 1)
-            if isinstance(question_number, str):
-                nums = re.findall(r'\d+', question_number)
-                self.number = int(nums[0]) if nums else 0
-            else:
-                self.number = 0
-                
+        self.number = question_number
         self.content = raw_text 
         self.options = options if options else []
         self.predicted_chapter = chapter if chapter in PHYSICS_CHAPTERS_LIST else "未分類"
         self.is_physics_likely = is_likely
         self.status_reason = status_reason
-        self.image_bytes = image_bytes      # 題目附圖 (已裁切)
-        self.ref_image_bytes = ref_image_bytes # 題目區域截圖 (全寬度)
-        self.full_page_bytes = full_page_bytes # 整頁原始圖 (供手動裁切用)
+        self.image_bytes = image_bytes      
+        self.ref_image_bytes = ref_image_bytes 
+        self.full_page_bytes = full_page_bytes 
         self.q_type = q_type
         self.subject = subject
         self.sub_questions = sub_questions if sub_questions else [] 
-        self.page_index = page_index
 
 # ==========================================
 # 工具函式
@@ -109,16 +97,13 @@ def crop_image(original_img, box_2d, force_full_width=False, padding_y=10):
     width, height = original_img.size
     ymin, xmin, ymax, xmax = box_2d
     
-    # 應用 padding (上下擴展)
     ymin = max(0, ymin - padding_y)
     ymax = min(1000, ymax + padding_y)
     
-    # 決定左右範圍
     if force_full_width:
         left = 0
         right = width
     else:
-        # 一般附圖裁切，稍微加點 padding
         xmin = max(0, xmin - 10)
         xmax = min(1000, xmax + 10)
         left = (xmin / 1000) * width
@@ -146,17 +131,16 @@ def img_to_bytes(pil_img):
     img_byte_arr = io.BytesIO()
     if pil_img.mode in ("RGBA", "P"): 
         pil_img = pil_img.convert("RGB")
-    # 壓縮整頁圖片以加速傳輸，避免 Session State 過大
-    pil_img.save(img_byte_arr, format='JPEG', quality=70) 
+    pil_img.save(img_byte_arr, format='JPEG', quality=85) 
     return img_byte_arr.getvalue()
 
 # ==========================================
-# Gemini AI 解析邏輯 (支援指定頁數)
+# Gemini AI 解析邏輯 (修正：支援 target_pages)
 # ==========================================
 def parse_with_gemini(file_bytes, file_type, api_key, target_pages=None):
     """
     target_pages: tuple (start_page_idx, end_page_idx) 
-                  例如 (0, 5) 代表處理第 0 到 4 頁 (不含 5)。若為 None 則處理全部。
+                  例如 (0, 5) 代表處理第 0 到 4 頁。若為 None 則處理全部。
     """
     if not HAS_GENAI: return {"error": "缺少 google-generativeai 套件"}
     if not api_key: return {"error": "請輸入 API Key"}
@@ -171,13 +155,12 @@ def parse_with_gemini(file_bytes, file_type, api_key, target_pages=None):
     if file_type == 'pdf':
         if not HAS_PDF2IMAGE: return {"error": "缺少 pdf2image (Poppler) 未安裝"}
         try:
-            # [優化] 降低 DPI 至 100 以解決記憶體不足與速度問題 (文字辨識仍足夠)
-            source_images = convert_from_bytes(file_bytes, dpi=100, fmt='jpeg')
+            # DPI 150
+            source_images = convert_from_bytes(file_bytes, dpi=150, fmt='jpeg')
         except Exception as e:
             return {"error": f"PDF 轉圖片失敗: {str(e)}"}
             
     elif file_type == 'docx':
-        # Docx 暫時不支援分頁邏輯，視為一整批
         if not HAS_DOCX: return {"error": "缺少 python-docx 套件"}
         try:
             doc = docx.Document(io.BytesIO(file_bytes))
@@ -191,35 +174,26 @@ def parse_with_gemini(file_bytes, file_type, api_key, target_pages=None):
     
     if not source_images: return {"error": "無法提取圖片"}
 
-    # 處理指定頁數範圍
-    start_offset = 0
+    # [關鍵修改] 處理指定頁數範圍
     images_to_process = source_images
-    
     if target_pages and file_type == 'pdf':
         start_p, end_p = target_pages
         # 邊界檢查
         start_p = max(0, start_p)
         end_p = min(len(source_images), end_p)
-        
         if start_p < end_p:
             images_to_process = source_images[start_p:end_p]
-            start_offset = start_p
         else:
             return {"error": "指定的頁數範圍無效"}
 
-    # 這裡我們不再分批，因為 caller 會負責分批 (每次呼叫只傳 5 頁進來)
+    # 這裡我們不再分批，因為 caller (app.py) 已經負責分批了
+    # 我們只處理 `images_to_process` 這一批圖片
     batches = [images_to_process]
     
     prompt_chapters = [c for c in PHYSICS_CHAPTERS_LIST if c != "未分類"]
     chapters_str = "\n".join(prompt_chapters)
     
-    # 2026年模型清單
-    candidate_models = [
-        "gemini-2.5-flash",    
-        "gemini-2.5-pro",      
-        "gemini-2.0-flash",    
-        "gemini-1.5-pro"       
-    ]
+    candidate_models = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-pro"]
     
     all_candidates = []
     errors = []
@@ -235,7 +209,6 @@ def parse_with_gemini(file_bytes, file_type, api_key, target_pages=None):
             3. 'page_index': 該題目位於本批次圖片的第幾頁 (0, 1, ...)。
             """
         
-        # 增強版 Prompt
         prompt = f"""
         分析考卷圖片，只擷取【高中物理】試題。
         
@@ -269,34 +242,25 @@ def parse_with_gemini(file_bytes, file_type, api_key, target_pages=None):
 
         generation_config = {"response_mime_type": "application/json"}
         response = None
-        last_error = None
         
         for model_name in candidate_models:
             try:
                 model = genai.GenerativeModel(model_name)
                 response = model.generate_content(input_parts, generation_config=generation_config)
                 break
-            except Exception as e:
-                last_error = e
-                continue
-        
-        if not response:
-             errors.append(f"Batch failed: {str(last_error)}")
-             continue
+            except: continue
+            
+        if not response or not response.text:
+            errors.append("AI 回應為空或失敗")
+            continue
 
         try:
-            if not response.text:
-                errors.append("Batch: Empty response")
-                continue
-
-            json_text = clean_json_string(response.text)
-            data = json.loads(json_text)
+            data = json.loads(clean_json_string(response.text))
             if isinstance(data, dict): data = [data]
             
             for item in data:
                 content_text = (item.get('content', '') + " " + " ".join(item.get('options', []))).lower()
-                if any(ek in content_text for ek in EXCLUDE_KEYWORDS):
-                    continue 
+                if any(ek in content_text for ek in EXCLUDE_KEYWORDS): continue 
 
                 q_type = item.get('type', 'Single')
                 if "應選" in content_text and ("項" in content_text or "二" in content_text or "三" in content_text):
@@ -306,19 +270,17 @@ def parse_with_gemini(file_bytes, file_type, api_key, target_pages=None):
 
                 diagram_bytes = None
                 ref_bytes = None
-                full_page_bytes = None # 確保初始化
+                full_page_bytes = None
                 
                 if file_type == 'pdf':
                     try:
                         local_idx = item.get('page_index', 0)
-                        # 邊界檢查
                         if not isinstance(local_idx, int) or local_idx < 0 or local_idx >= len(batch_imgs):
                             local_idx = 0
                             
-                        # 對應到原始圖片列表中的正確圖片 (因為 batch_imgs 是切片後的)
                         src_img = batch_imgs[local_idx] 
                         
-                        # 強制儲存整頁，作為手動截圖的底圖
+                        # 強制產生整頁圖片
                         full_page_bytes = img_to_bytes(src_img)
                         
                         if 'box_2d' in item:
@@ -331,12 +293,7 @@ def parse_with_gemini(file_bytes, file_type, api_key, target_pages=None):
                             ref_bytes = full_page_bytes
                             
                     except Exception as e:
-                        print(f"Image crop error: {e}")
-                
-                # 計算真實頁碼 (Absolute Page Index)
-                relative_page_index = item.get('page_index', 0)
-                if not isinstance(relative_page_index, int): relative_page_index = 0
-                absolute_page_index = start_offset + relative_page_index
+                        print(f"Crop error: {e}")
 
                 cand = SmartQuestionCandidate(
                     raw_text=item.get('content', ''),
@@ -347,11 +304,10 @@ def parse_with_gemini(file_bytes, file_type, api_key, target_pages=None):
                     status_reason="AI",
                     image_bytes=diagram_bytes,      
                     ref_image_bytes=ref_bytes,
-                    full_page_bytes=full_page_bytes, # 傳遞整頁圖片
+                    full_page_bytes=full_page_bytes,
                     q_type=q_type,
                     subject='Physics',
-                    sub_questions=item.get('sub_questions', []),
-                    page_index=absolute_page_index # [重要] 傳遞頁碼
+                    sub_questions=item.get('sub_questions', [])
                 )
                 cand.content = item.get('content', '')
                 all_candidates.append(cand)
@@ -362,12 +318,11 @@ def parse_with_gemini(file_bytes, file_type, api_key, target_pages=None):
     if not all_candidates and errors:
         return {"error": "; ".join(errors)}
     
-    # [修正] 排序時確保型別安全，若無法轉換則視為 0
+    # 修正排序 Bug：確保型別正確
     try:
-        all_candidates.sort(key=lambda x: x.number)
-    except:
-        pass # 忽略排序錯誤
-        
+        all_candidates.sort(key=lambda x: int(x.number) if str(x.number).isdigit() else 0)
+    except: pass
+    
     return all_candidates
 
 def parse_raw_file(file_obj, file_type, use_ocr=False):
