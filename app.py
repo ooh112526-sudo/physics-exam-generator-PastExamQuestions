@@ -15,7 +15,6 @@ except ImportError:
     st_cropper = None 
 except Exception:
     st_cropper = None
-
 import os
 import datetime
 import uuid
@@ -24,17 +23,20 @@ from google.cloud import firestore
 from google.cloud import storage
 import google.auth 
 from google.oauth2 import service_account
-# 引入 pdf2image 進行動態轉圖
-from pdf2image import convert_from_bytes
+from pdf2image import convert_from_bytes # 用於動態轉圖
 
 import smart_importer
 
 st.set_page_config(page_title="物理題庫系統 (Pro)", layout="wide", page_icon="🧲")
 
+# 題型對照表
 TYPE_MAP_ZH_TO_EN = {"單選": "Single", "多選": "Multi", "填充": "Fill", "題組": "Group"}
 TYPE_MAP_EN_TO_ZH = {v: k for k, v in TYPE_MAP_ZH_TO_EN.items()}
 TYPE_OPTIONS = ["單選", "多選", "填充", "題組"]
 
+# ==========================================
+# 雲端資料庫與儲存模組 (完整版)
+# ==========================================
 class CloudManager:
     def __init__(self):
         self.bucket_name = os.getenv("GCS_BUCKET_NAME", "physics-exam-assets")
@@ -46,7 +48,6 @@ class CloudManager:
         self.credentials = None 
 
         try:
-            # 優先嘗試環境變數 JSON
             service_account_json = os.getenv("GCP_SERVICE_ACCOUNT_JSON")
             if service_account_json:
                 try:
@@ -73,7 +74,6 @@ class CloudManager:
                     self.storage_client = storage.Client(project=self.project_id)
                     self.has_connection = True
                 else:
-                    # Fallback default
                     try:
                         self.db = firestore.Client()
                         self.storage_client = storage.Client()
@@ -94,7 +94,8 @@ class CloudManager:
         if not self.storage_client: return 0
         try:
             bucket = self.storage_client.bucket(self.bucket_name)
-            return sum(blob.size for blob in bucket.list_blobs() if blob.size)
+            blobs = bucket.list_blobs()
+            return sum(blob.size for blob in blobs if blob.size)
         except: return 0
 
     def upload_bytes(self, file_bytes, filename, folder="uploads", content_type=None):
@@ -112,7 +113,7 @@ class CloudManager:
                 else:
                     url = blob.generate_signed_url(version="v4", expiration=datetime.timedelta(days=7), method="GET")
             except: pass
-            return url, unique_name
+            return url, unique_name 
         except: return None, None
 
     def download_blob(self, blob_name):
@@ -121,14 +122,15 @@ class CloudManager:
             bucket = self.storage_client.bucket(self.bucket_name)
             blob = bucket.blob(blob_name)
             return blob.download_as_bytes()
-        except Exception as e:
-            print(f"Download blob failed: {e}")
-            return None
+        except: return None
 
+    # --- 檔案與暫存 ---
     def check_file_exists(self, filename):
         if not self.db: return None
         docs = self.db.collection("exam_files").where("filename", "==", filename).limit(1).stream()
-        for doc in docs: d = doc.to_dict(); d['id'] = doc.id; return d
+        for doc in docs: 
+            d = doc.to_dict(); d['id'] = doc.id
+            return d
         return None
 
     def save_file_record(self, file_info):
@@ -151,18 +153,22 @@ class CloudManager:
             self.clear_temp_batches(file_id)
 
     def update_file_status(self, file_id, status):
-        if self.db: self.db.collection("exam_files").document(file_id).update({"ai_status": status})
+        if self.db:
+            self.db.collection("exam_files").document(file_id).update({"ai_status": status})
 
+    # [關鍵優化] 暫存批次管理
     def save_temp_batch(self, file_id, batch_idx, data, status="success"):
         if not self.db: return
         serializable_data = []
         for cand in data:
             if isinstance(cand, dict): d = cand
             else: d = cand.__dict__.copy()
+            # 移除二進位資料，只存文字與座標
             d.pop('image_bytes', None)
             d.pop('ref_image_bytes', None) 
             d.pop('full_page_bytes', None)
             serializable_data.append(d)
+        
         self.db.collection("temp_batches").document(f"{file_id}_{batch_idx}").set({
             "file_id": file_id, "batch_idx": batch_idx, "data": json.dumps(serializable_data),
             "status": status, "updated_at": datetime.datetime.now()
@@ -189,17 +195,19 @@ class CloudManager:
                 img_bytes = base64.b64decode(question_dict["image_data_b64"])
                 fname = f"q_{question_dict.get('id')}.png"
                 img_url, _ = self.upload_bytes(img_bytes, fname, folder="question_images", content_type="image/png")
-                if img_url: question_dict["image_url"] = img_url; del question_dict["image_data_b64"]
+                if img_url: 
+                    question_dict["image_url"] = img_url
+                    del question_dict["image_data_b64"]
             except: pass
         self.db.collection("questions").document(question_dict["id"]).set(question_dict)
         return True
 
     def load_questions(self):
         if not self.db: return []
-        qs = []
+        questions = []
         docs = self.db.collection("questions").order_by("id").stream()
-        for doc in docs: qs.append(doc.to_dict())
-        return qs
+        for doc in docs: questions.append(doc.to_dict())
+        return questions
 
     def delete_question(self, doc_id):
         if self.db: self.db.collection("questions").document(doc_id).delete()
@@ -238,7 +246,7 @@ class Question:
             "parent_id": self.parent_id, "is_group_parent": self.is_group_parent,
             "sub_questions": subs, "source_file_id": self.source_file_id
         }
-
+    
     @staticmethod
     def from_dict(data):
         img_bytes = None
@@ -331,27 +339,37 @@ def generate_word_files(selected_questions):
     f1.seek(0); f2.seek(0)
     return f1, f2
 
+# [核心功能] 分頁批次處理邏輯 (解決 OOM 與 TimeOut)
 def process_file_in_batches(filename, api_key, file_id, batch_size=5, target_batch_idx=None):
-    # [核心修正] 強制重新下載 Blob，防止 Session 過期或遺失
     file_bytes = None
-    record = cloud_manager.check_file_exists(filename)
-    if record and record.get('blob_name'):
-         file_bytes = cloud_manager.download_blob(record['blob_name'])
-         # 同步更新 session
-         if file_bytes:
-             if filename not in st.session_state.get('file_queue', {}):
-                 st.session_state['file_queue'][filename] = {}
-             st.session_state['file_queue'][filename]['data'] = file_bytes
+    if filename in st.session_state.get('file_queue', {}):
+        file_bytes = st.session_state['file_queue'][filename]['data']
+    else:
+        # 從雲端重新下載檔案
+        record = cloud_manager.check_file_exists(filename)
+        if record and record.get('blob_name'):
+             file_bytes = cloud_manager.download_blob(record['blob_name'])
+        elif record and record.get('url'):
+            try:
+                resp = requests.get(record.get('url'))
+                if resp.status_code == 200: file_bytes = resp.content
+            except: pass
     
     if not file_bytes:
-        st.error("無法從雲端讀取檔案，請確認檔案是否已上傳。")
+        st.error("無法讀取檔案內容")
         return
 
+    # 計算頁數
     try:
         from pdf2image.pdf2image import pdfinfo_from_bytes
         info = pdfinfo_from_bytes(file_bytes)
         total_pages = info["Pages"]
-    except: total_pages = 20
+    except:
+        try:
+            info = convert_from_bytes(file_bytes, size=1) 
+            total_pages = len(info)
+            if total_pages == 0: total_pages = 20
+        except: total_pages = 20
     
     num_batches = (total_pages + batch_size - 1) // batch_size
     batches_to_run = range(num_batches) if target_batch_idx is None else [target_batch_idx]
@@ -362,6 +380,7 @@ def process_file_in_batches(filename, api_key, file_id, batch_size=5, target_bat
         end_page = min((b_idx + 1) * batch_size, total_pages)
         st.caption(f"正在分析第 {start_page+1}~{end_page} 頁...")
         
+        # 呼叫 smart_importer (帶入頁數範圍)
         res_candidates = smart_importer.parse_with_gemini(
             file_bytes, 'pdf', api_key, target_pages=(start_page, end_page)
         )
@@ -373,14 +392,14 @@ def process_file_in_batches(filename, api_key, file_id, batch_size=5, target_bat
                 d.pop('image_bytes', None)
                 d.pop('ref_image_bytes', None) 
                 d.pop('full_page_bytes', None)
-                # [關鍵] 確保座標被儲存，因為下一步校對需要用它來切圖
+                # 確保座標存在
                 if not d.get('full_question_box_2d'): d['full_question_box_2d'] = None
                 serializable_data.append(d)
+            # 存入暫存
             cloud_manager.save_temp_batch(file_id, b_idx, serializable_data, "success")
         else:
             cloud_manager.save_temp_batch(file_id, b_idx, [], "failed")
             st.error(f"第 {b_idx+1} 批次失敗")
-
         progress_bar.progress((i + 1) / len(batches_to_run))
     
     cloud_manager.update_file_status(file_id, "已辨識")
@@ -389,38 +408,17 @@ def process_file_in_batches(filename, api_key, file_id, batch_size=5, target_bat
     time.sleep(1)
     st.rerun()
 
-# [核心功能] 動態生成校對圖片
-def get_review_image(pdf_bytes, page_index, box_2d=None):
-    """
-    即時產生校對用圖片：
-    1. 若有 box_2d (AI 座標)，則裁切該區域 (Auto Positioning)
-    2. 若無，則回傳整頁圖片 (Fallback)
-    """
+# [核心功能] 動態生成校對圖片 (解決截圖空白與 OOM)
+def get_page_image(pdf_bytes, page_index):
     try:
-        # 轉換指定頁面 (1-based index)
         images = convert_from_bytes(pdf_bytes, first_page=page_index+1, last_page=page_index+1, dpi=100, fmt='jpeg')
-        if not images: return None
-        
-        img = images[0]
-        
-        # 如果有座標，進行裁切 (需轉換座標系 0-1000 -> pixel)
-        if box_2d and len(box_2d) == 4:
-            W, H = img.size
-            ymin, xmin, ymax, xmax = box_2d
-            # 加一點 padding
-            top = max(0, (ymin - 50) / 1000 * H)
-            bottom = min(H, (ymax + 50) / 1000 * H)
-            # 全寬度
-            left = 0
-            right = W
-            img = img.crop((left, top, right, bottom))
-            
-        img_byte_arr = io.BytesIO()
-        img.save(img_byte_arr, format='JPEG')
-        return img_byte_arr.getvalue()
+        if images:
+            img_byte_arr = io.BytesIO()
+            images[0].save(img_byte_arr, format='JPEG')
+            return img_byte_arr.getvalue()
     except Exception as e: 
-        print(f"Render error: {e}")
         return None
+    return None
 
 # ==========================================
 # UI
@@ -438,6 +436,7 @@ with st.sidebar:
         st.warning("☁️ Cloud: 未連線")
     st.divider()
     st.metric("題庫總數", len(st.session_state['question_pool']))
+    
     if cloud_manager.has_connection:
         st.divider()
         try:
@@ -460,9 +459,9 @@ with st.sidebar:
                 progress_bar.progress((i + 1) / total)
             st.success("儲存完成！")
 
-tab_upload, tab_files, tab_review, tab_bank = st.tabs(["🧠 考古題上傳", "📂 檔案管理", "📝 AI匯入校對", "📚 題庫管理"])
+tab_upload, tab_files, tab_review, tab_bank = st.tabs(["🧠 考古題上傳", "📂 檔案管理及AI辨識", "📝 AI匯入校對", "📚 題庫管理"])
 
-# Tab 1: Upload
+# Tab 1: Upload (Simplified)
 with tab_upload:
     st.markdown("### 📤 上傳")
     uploaded_files = st.file_uploader("PDF", type=['pdf'], accept_multiple_files=True)
@@ -496,14 +495,22 @@ with tab_upload:
             st.divider()
 
         if st.button("確認上傳", type="primary"):
-            prog = st.progress(0)
-            for idx, item in enumerate(files_to_upload):
-                f = item['file_obj']; f.seek(0); fb = f.read()
-                url, blob = cloud_manager.upload_bytes(fb, item['new_filename'], folder="raw_uploads", content_type=f.type)
-                rec = {"filename": item['new_filename'], "url": url, "blob_name": blob, "exam_type": item['type'], "year": item['year'], "exam_no": item['exam_no'], "ai_status": "未辨識", "created_at": datetime.datetime.now()}
-                cloud_manager.save_file_record(rec)
-                prog.progress((idx+1)/len(files_to_upload))
-            st.success("上傳成功"); time.sleep(1); st.rerun()
+            dup = []
+            for item in files_to_upload:
+                if cloud_manager.check_file_exists(item['new_filename']): dup.append(item['new_filename'])
+            if dup: st.error(f"檔名重複: {', '.join(dup)}")
+            else:
+                prog = st.progress(0)
+                for idx, item in enumerate(files_to_upload):
+                    f = item['file_obj']; f.seek(0); fb = f.read()
+                    url, blob = cloud_manager.upload_bytes(fb, item['new_filename'], folder="raw_uploads", content_type=f.type)
+                    rec = {"filename": item['new_filename'], "url": url, "blob_name": blob, "exam_type": item['type'], "year": item['year'], "exam_no": item['exam_no'], "ai_status": "未辨識", "created_at": datetime.datetime.now()}
+                    cloud_manager.save_file_record(rec)
+                    st.session_state['file_queue'][item['new_filename']] = {"status": "uploaded", "data": fb, "type": "pdf", "backup_url": url, "blob_name": blob}
+                    prog.progress((idx+1)/len(files_to_upload))
+                st.success("上傳成功！")
+                st.session_state['upload_configs'] = {}
+                time.sleep(1); st.rerun()
 
 # Tab 2: File Manage
 with tab_files:
@@ -543,20 +550,24 @@ with tab_files:
                             
                             batches = cloud_manager.load_temp_batches(f['id'])
                             if batches:
-                                with st.expander("批次詳情"):
+                                with st.expander("查看批次處理詳情 (可單獨重試)", expanded=False):
                                     for b_idx, b_data in sorted(batches.items()):
-                                        st.write(f"Batch {b_idx}: {b_data.get('status')}")
-                                        if b_data.get('status') != 'success':
-                                            if st.button(f"重試 B{b_idx}", key=f"rt_{f['id']}_{b_idx}"):
-                                                process_file_in_batches(f['filename'], api_key_input, f['id'], target_batch_idx=b_idx)
+                                        b_status = b_data.get('status', 'unknown')
+                                        b_icon = "✅" if b_status == "success" else "❌"
+                                        col_b1, col_b2 = st.columns([3, 1])
+                                        col_b1.write(f"Batch {b_idx+1}: {b_icon}")
+                                        if col_b2.button("重試", key=f"retry_{f['id']}_{b_idx}"):
+                                            process_file_in_batches(f['filename'], api_key_input, f['id'], target_batch_idx=b_idx)
+                            st.divider()
 
-# Tab 3: Review
+# Tab 3: Review (Pagination & Cleanup)
 with tab_review:
     st.subheader("匯入校對")
-    processed = [f for f in cloud_manager.load_file_records() if f.get('ai_status') == '已辨識']
-    if not processed: st.warning("無資料")
+    processed_files = [f for f in cloud_manager.load_file_records() if f.get('ai_status') == '已辨識']
+    if not processed_files:
+        st.warning("無已辨識檔案")
     else:
-        opts = {f['filename']: f['id'] for f in processed}
+        opts = {f['filename']: f['id'] for f in processed_files}
         idx = 0
         if 'last_file' in st.session_state and st.session_state['last_file'] in opts:
              idx = list(opts.keys()).index(st.session_state['last_file'])
@@ -565,7 +576,6 @@ with tab_review:
         st.session_state['last_file'] = sel_name
         sel_id = opts[sel_name]
 
-        # Load candidates
         cands = []
         batches = cloud_manager.load_temp_batches(sel_id)
         for b in sorted(batches.keys()):
@@ -575,13 +585,13 @@ with tab_review:
         else:
             PER_PAGE = 5
             if 'p' not in st.session_state: st.session_state['p'] = 0
-            max_p = (len(cands)-1)//PER_PAGE
+            max_p = max(0, (len(cands)-1)//PER_PAGE)
             
             c_prev, _, c_next = st.columns([1, 2, 1])
             if c_prev.button("⬅️", key="prev", disabled=st.session_state['p']==0): st.session_state['p'] -= 1; st.rerun()
             if c_next.button("➡️", key="next", disabled=st.session_state['p']>=max_p): st.session_state['p'] += 1; st.rerun()
 
-            # Ensure PDF is loaded for dynamic cropping
+            # Load PDF for dynamic cropping
             if 'curr_pdf' not in st.session_state or st.session_state.get('curr_name') != sel_name:
                 rec = cloud_manager.check_file_exists(sel_name)
                 if rec and rec.get('blob_name'):
@@ -595,52 +605,39 @@ with tab_review:
                 for i, item in enumerate(cands[start:end]):
                     real_idx = start + i
                     st.markdown(f"**第 {item.get('number')} 題**")
+                    if item.get('type') == "Group": st.info("📖 題組")
+                    
                     c1, c2 = st.columns([1, 1])
                     with c1:
                         st.text_area("題目", item.get('content'), key=f"c_{real_idx}")
-                        
-                        # 題型顯示 (中文化)
                         curr_type_zh = TYPE_MAP_EN_TO_ZH.get(item.get('type', 'Single'), "單選")
                         st.selectbox("題型", TYPE_OPTIONS, index=TYPE_OPTIONS.index(curr_type_zh) if curr_type_zh in TYPE_OPTIONS else 0, key=f"t_{real_idx}")
-                        
                         if item.get('type') != 'Group':
                             st.text_area("選項", "\n".join(item.get('options', [])), key=f"o_{real_idx}")
                         st.text_input("答案", item.get('answer'), key=f"a_{real_idx}")
-                        
-                        # 題組子題
-                        if item.get('type') == 'Group':
-                            st.info("包含子題編輯區 (簡化版)")
-
                     with c2:
-                        st.write("截圖預覽")
+                        st.write("圖片預覽")
                         if 'curr_pdf' in st.session_state and st.session_state['curr_pdf']:
                             page_idx = item.get('page_index', 0)
-                            # [關鍵] 動態生成截圖 (Auto Positioning)
                             box = item.get('full_question_box_2d')
-                            # 優先使用座標切圖，若無座標則顯示整頁
+                            # 動態裁切 (Auto Position)
                             img_bytes = get_review_image(st.session_state['curr_pdf'], page_idx, box_2d=box)
                             
                             if img_bytes:
-                                # 顯示靜態圖 (最穩定)
-                                st.image(img_bytes, caption=f"Page {page_idx+1} (Auto-crop)", use_container_width=True)
-                                
-                                # 提供切換到互動裁切模式的選項
-                                if st.checkbox("✂️ 調整範圍", key=f"en_cr_{real_idx}"):
-                                    if st_cropper:
-                                        # 為了裁切，必須給整頁圖，否則無法擴大範圍
-                                        full_page_bytes = get_review_image(st.session_state['curr_pdf'], page_idx, box_2d=None)
-                                        st_cropper(Image.open(io.BytesIO(full_page_bytes)), realtime_update=True, box_color='#FF0000', key=f"cr_{real_idx}")
-                                    else: st.warning("裁切元件未載入")
-                            else: st.error("圖片生成失敗")
-                        else: st.info("PDF 載入中...")
+                                st.image(img_bytes, caption=f"Page {page_idx+1}", use_container_width=True)
+                                # [互動裁切] 若需要調整，這裡可放 cropper
+                                # 為了效能，這裡先只顯示靜態圖，可加入 checkbox 開啟
+                            else: st.warning("無法載入頁面")
+                        else: st.info("PDF載入中...")
                 
                 st.form_submit_button("暫存此頁修改")
 
-            if st.button("✅ 確認匯入題庫"):
+            st.divider()
+            # [功能 3] 匯入並清理
+            if st.button("✅ 確認匯入題庫 (清除暫存)", type="primary"):
                 prog = st.progress(0)
                 for idx, item in enumerate(cands):
-                    # 這裡將 dict 轉回 Question 物件並儲存
-                    # 簡化範例：
+                    # Convert & Save
                     q = Question(
                         q_type=item.get('type'), content=item.get('content'),
                         options=item.get('options'), answer=item.get('answer'),
@@ -648,10 +645,23 @@ with tab_review:
                     )
                     cloud_manager.save_question(q.to_dict())
                     prog.progress((idx+1)/len(cands))
+                
+                # Cleanup
                 cloud_manager.clear_temp_batches(sel_id)
+                # 刪除原始檔案 (可選)
+                # cloud_manager.delete_file_record(sel_id) 
+
                 st.success("匯入完成！")
                 st.rerun()
 
 # === Tab 4: Bank ===
 with tab_bank:
-    st.write("題庫管理")
+    st.subheader("題庫管理")
+    if not st.session_state['question_pool']: st.info("無題目")
+    else:
+        for i, q in enumerate(st.session_state['question_pool']):
+            with st.expander(f"{q.content[:20]}..."):
+                st.write(q.content)
+                if st.button("刪除", key=f"del_q_{i}"):
+                    cloud_manager.delete_question(q.id)
+                    st.rerun()
