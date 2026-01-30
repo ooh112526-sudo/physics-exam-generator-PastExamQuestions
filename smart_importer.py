@@ -134,7 +134,7 @@ def img_to_bytes(pil_img):
     return img_byte_arr.getvalue()
 
 # ==========================================
-# Gemini AI 解析邏輯
+# Gemini AI 解析邏輯 (支援分頁)
 # ==========================================
 def parse_with_gemini(file_bytes, file_type, api_key, target_pages=None):
     if not HAS_GENAI or not api_key: return {"error": "API Key 錯誤"}
@@ -145,9 +145,10 @@ def parse_with_gemini(file_bytes, file_type, api_key, target_pages=None):
     if file_type == 'pdf':
         if not HAS_PDF2IMAGE: return {"error": "缺少 pdf2image"}
         try:
-            # DPI 100 已經足夠且快速
+            # [核心優化] 支援 target_pages，只轉需要的頁面，避免 OOM
             if target_pages:
                 start_p, end_p = target_pages
+                # dpi=100 足夠辨識且快速
                 source_images = convert_from_bytes(file_bytes, dpi=100, fmt='jpeg', first_page=start_p+1, last_page=end_p)
             else:
                 source_images = convert_from_bytes(file_bytes, dpi=100, fmt='jpeg')
@@ -169,7 +170,7 @@ def parse_with_gemini(file_bytes, file_type, api_key, target_pages=None):
     start_offset = target_pages[0] if target_pages else 0
     prompt_chapters = [c for c in PHYSICS_CHAPTERS_LIST if c != "未分類"]
     chapters_str = "\n".join(prompt_chapters)
-    candidate_models = ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.0-flash", "gemini-1.5-pro"]
+    candidate_models = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-pro"]
     
     all_candidates = []
     errors = []
@@ -177,7 +178,7 @@ def parse_with_gemini(file_bytes, file_type, api_key, target_pages=None):
     for batch_idx, batch_imgs in enumerate(batches):
         prompt = f"""
         分析考卷圖片，只擷取【高中物理】試題。
-        判題規則：含「應選X項」為 Multi (多選)；無選項為 Fill (填充)；含子題為 Group (題組)。
+        判題規則：包含「應選X項」為 Multi (多選)；無選項為 Fill (填充)；包含子題為 Group (題組)。
         請回傳每題座標：
         1. full_question_box_2d: [ymin, 0, ymax, 1000] (整題範圍)
         2. box_2d: [ymin, xmin, ymax, xmax] (附圖範圍)
@@ -213,23 +214,23 @@ def parse_with_gemini(file_bytes, file_type, api_key, target_pages=None):
                 diagram_bytes = None
                 ref_bytes = None
                 
+                # 計算絕對頁碼
                 rel_idx = item.get('page_index', 0)
                 if not isinstance(rel_idx, int): rel_idx = 0
                 abs_idx = start_offset + rel_idx
 
-                # 這裡只做基本附圖裁切，參考圖留給前端動態做
                 if file_type == 'pdf' and 0 <= rel_idx < len(batch_imgs):
                     src_img = batch_imgs[rel_idx]
                     if 'box_2d' in item: diagram_bytes = crop_image(src_img, item['box_2d'], False, 5)
-                    # ref_bytes 這裡先切一份小的備用，但主要靠後端動態切
+                    # 這裡只切一小部分做縮圖，主要的裁切留給前端動態生成
                     if 'full_question_box_2d' in item: ref_bytes = crop_image(src_img, item['full_question_box_2d'], True, 100)
-
+                
                 cand = SmartQuestionCandidate(
                     raw_text=item.get('content', ''), question_number=item.get('number', 0),
                     options=item.get('options', []), chapter=item.get('chapter', '未分類'),
                     image_bytes=diagram_bytes,      
                     ref_image_bytes=ref_bytes,
-                    full_page_bytes=None, # 不存大圖，省記憶體
+                    full_page_bytes=None, # [重點] 不存大圖，改由 app.py 動態生成，省記憶體
                     q_type=q_type, subject='Physics', sub_questions=item.get('sub_questions', []),
                     page_index=abs_idx,
                     full_question_box_2d=item.get('full_question_box_2d') # 儲存座標
