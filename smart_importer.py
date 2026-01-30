@@ -56,25 +56,33 @@ EXCLUDE_KEYWORDS = [
 ]
 
 # ==========================================
-# 候選題目物件 (擴充子題支援)
+# 候選題目物件
 # ==========================================
 class SmartQuestionCandidate:
     def __init__(self, raw_text, question_number, options=None, chapter="未分類", 
                  is_likely=True, status_reason="", image_bytes=None, q_type="Single", 
-                 ref_image_bytes=None, full_page_bytes=None, subject="Physics", sub_questions=None):
+                 ref_image_bytes=None, full_page_bytes=None, subject="Physics", 
+                 sub_questions=None, page_index=0, full_question_box_2d=None):
         self.raw_text = raw_text
-        self.number = question_number
+        try:
+            self.number = int(question_number)
+        except:
+            self.number = 0
+            
         self.content = raw_text 
         self.options = options if options else []
         self.predicted_chapter = chapter if chapter in PHYSICS_CHAPTERS_LIST else "未分類"
         self.is_physics_likely = is_likely
         self.status_reason = status_reason
-        self.image_bytes = image_bytes      # 題目附圖 (已裁切)
-        self.ref_image_bytes = ref_image_bytes # 題目區域截圖 (全寬度)
-        self.full_page_bytes = full_page_bytes # [關鍵] 整頁原始圖 (供手動裁切用)
+        self.image_bytes = image_bytes      
+        self.ref_image_bytes = ref_image_bytes 
+        self.full_page_bytes = full_page_bytes
         self.q_type = q_type
         self.subject = subject
-        self.sub_questions = sub_questions if sub_questions else [] # 支援題組
+        self.sub_questions = sub_questions if sub_questions else [] 
+        self.page_index = page_index
+        # [關鍵新增] 保留座標資料，供後端動態裁切使用
+        self.full_question_box_2d = full_question_box_2d
 
 # ==========================================
 # 工具函式
@@ -92,81 +100,60 @@ def clean_json_string(json_str):
     return json_str.strip()
 
 def crop_image(original_img, box_2d, force_full_width=False, padding_y=10):
-    """
-    裁切圖片
-    force_full_width: 是否強制寬度為整張圖片 (0-1000)
-    padding_y: 上下擴展的範圍 (以 1000 為基底)
-    """
     if not box_2d or len(box_2d) != 4: return None
-    
     width, height = original_img.size
     ymin, xmin, ymax, xmax = box_2d
-    
-    # 應用 padding (上下擴展)
     ymin = max(0, ymin - padding_y)
     ymax = min(1000, ymax + padding_y)
-    
-    # 決定左右範圍
     if force_full_width:
         left = 0
         right = width
     else:
-        # 一般附圖裁切，稍微加點 padding
         xmin = max(0, xmin - 10)
         xmax = min(1000, xmax + 10)
         left = (xmin / 1000) * width
         right = (xmax / 1000) * width
-    
     top = (ymin / 1000) * height
     bottom = (ymax / 1000) * height
-    
     if right <= left or bottom <= top: return None
 
     try:
         cropped = original_img.crop((left, top, right, bottom))
         img_byte_arr = io.BytesIO()
         if cropped.mode in ("RGBA", "P"): cropped = cropped.convert("RGB")
-        # 壓縮裁切圖 (70% 品質可大幅減少記憶體，且文字仍清晰)
         cropped.save(img_byte_arr, format='JPEG', quality=70)
         return img_byte_arr.getvalue()
     except Exception as e:
-        print(f"Crop failed: {e}")
         return None
 
 def img_to_bytes(pil_img):
-    """將 PIL Image 轉為 bytes"""
     if pil_img is None: return None
     img_byte_arr = io.BytesIO()
-    if pil_img.mode in ("RGBA", "P"): 
-        pil_img = pil_img.convert("RGB")
-    # 壓縮整頁圖片以加速傳輸，避免 Session State 過大
+    if pil_img.mode in ("RGBA", "P"): pil_img = pil_img.convert("RGB")
     pil_img.save(img_byte_arr, format='JPEG', quality=70) 
     return img_byte_arr.getvalue()
 
 # ==========================================
 # Gemini AI 解析邏輯
 # ==========================================
-def parse_with_gemini(file_bytes, file_type, api_key):
-    if not HAS_GENAI: return {"error": "缺少 google-generativeai 套件"}
-    if not api_key: return {"error": "請輸入 API Key"}
-
-    try:
-        genai.configure(api_key=api_key)
-    except Exception as e:
-        return {"error": f"API Key 設定失敗: {str(e)}"}
+def parse_with_gemini(file_bytes, file_type, api_key, target_pages=None):
+    if not HAS_GENAI or not api_key: return {"error": "API Key 錯誤"}
+    try: genai.configure(api_key=api_key)
+    except Exception as e: return {"error": f"API Key 設定失敗: {e}"}
 
     source_images = [] 
-    
     if file_type == 'pdf':
-        if not HAS_PDF2IMAGE: return {"error": "缺少 pdf2image (Poppler) 未安裝"}
+        if not HAS_PDF2IMAGE: return {"error": "缺少 pdf2image"}
         try:
-            # [優化] 降低 DPI 至 100 以解決記憶體不足與速度問題 (文字辨識仍足夠)
-            source_images = convert_from_bytes(file_bytes, dpi=100, fmt='jpeg')
-        except Exception as e:
-            return {"error": f"PDF 轉圖片失敗: {str(e)}"}
-            
+            # DPI 100 已經足夠且快速
+            if target_pages:
+                start_p, end_p = target_pages
+                source_images = convert_from_bytes(file_bytes, dpi=100, fmt='jpeg', first_page=start_p+1, last_page=end_p)
+            else:
+                source_images = convert_from_bytes(file_bytes, dpi=100, fmt='jpeg')
+        except Exception as e: return {"error": f"PDF 轉圖失敗: {e}"}
     elif file_type == 'docx':
-        if not HAS_DOCX: return {"error": "缺少 python-docx 套件"}
+        if not HAS_DOCX: return {"error": "缺少 python-docx"}
         try:
             doc = docx.Document(io.BytesIO(file_bytes))
             for rel in doc.part.rels.values():
@@ -174,192 +161,86 @@ def parse_with_gemini(file_bytes, file_type, api_key):
                     img_bytes = rel.target_part.blob
                     pil_img = Image.open(io.BytesIO(img_bytes))
                     source_images.append(pil_img)
-        except Exception as e:
-            return {"error": f"Word 解析失敗: {str(e)}"}
-    else:
-        return {"error": "僅支援 PDF 或 Word 檔"}
+        except Exception as e: return {"error": f"Word 解析失敗: {e}"}
+    
+    if not source_images: return {"error": "無法提取圖片"}
 
-    if not source_images and file_type == 'pdf': return {"error": "PDF 頁面為空"}
-
-    # Batch Size
-    BATCH_SIZE = 5 # 保持較小的批次以避免 OOM
-    total_pages = len(source_images)
+    batches = [source_images]
+    start_offset = target_pages[0] if target_pages else 0
+    prompt_chapters = [c for c in PHYSICS_CHAPTERS_LIST if c != "未分類"]
+    chapters_str = "\n".join(prompt_chapters)
+    candidate_models = ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.0-flash", "gemini-1.5-pro"]
+    
     all_candidates = []
     errors = []
 
-    if file_type == 'docx':
-        batches = [source_images] 
-    else:
-        batches = [source_images[i:i + BATCH_SIZE] for i in range(0, total_pages, BATCH_SIZE)]
-
-    prompt_chapters = [c for c in PHYSICS_CHAPTERS_LIST if c != "未分類"]
-    chapters_str = "\n".join(prompt_chapters)
-    
-    # 2026年模型清單
-    candidate_models = [
-        "gemini-2.5-flash",    
-        "gemini-2.5-pro",      
-        "gemini-2.0-flash",    
-        "gemini-1.5-pro"       
-    ]
-
     for batch_idx, batch_imgs in enumerate(batches):
-        start_page_idx = batch_idx * BATCH_SIZE
-        
-        extra_instruction = ""
-        if file_type == 'pdf':
-            extra_instruction = """
-            【座標要求】：
-            1. 'full_question_box_2d': 請框選該題目(含題號、文字、選項)的垂直範圍。x軸必須是全寬 [ymin, 0, ymax, 1000]。
-            2. 'box_2d': 若有圖片，標示圖片範圍。
-            3. 'page_index': 該題目位於本批次圖片的第幾頁 (0, 1, ...)。
-            """
-        
-        # 增強版 Prompt：支援題組與自動判題
         prompt = f"""
         分析考卷圖片，只擷取【高中物理】試題。
+        判題規則：含「應選X項」為 Multi (多選)；無選項為 Fill (填充)；含子題為 Group (題組)。
+        請回傳每題座標：
+        1. full_question_box_2d: [ymin, 0, ymax, 1000] (整題範圍)
+        2. box_2d: [ymin, xmin, ymax, xmax] (附圖範圍)
         
-        【判題規則】：
-        1. 若題目包含「應選X項」或「應選x項」，type 請設為 "Multi" (多選)。
-        2. 若題目沒有選項 (A,B,C,D...)，type 請設為 "Fill" (填充)。
-        3. 若為題組題 (Group Question)，包含一段共用敘述與多個小題：
-           - type 設為 "Group"。
-           - 將共用敘述放在 "content"。
-           - 將子題目放在 "sub_questions" 列表中 (格式同一般題目)。
-        
-        輸出 JSON List 格式範例:
-        [
-            {{
-                "number": 1,
-                "type": "Single", 
-                "content": "題目文字...",
-                "options": ["(A)...", "(B)..."],
-                "answer": "A",
-                "chapter": "從此選: {chapters_str}",
-                "full_question_box_2d": [ymin, 0, ymax, 1000],
-                "box_2d": [ymin, xmin, ymax, xmax], 
-                "page_index": 0 
-            }},
-            {{
-                "number": 2,
-                "type": "Group",
-                "content": "題組共用敘述...",
-                "sub_questions": [
-                    {{ "number": 2, "content": "子題1...", "type": "Single", "options": [...], "answer": "C" }},
-                    {{ "number": 3, "content": "子題2...", "type": "Fill", "answer": "100" }}
-                ],
-                "full_question_box_2d": [ymin, 0, ymax, 1000],
-                "page_index": 0
-            }}
-        ]
-        {extra_instruction}
+        輸出 JSON List: [{{number, type, content, options, answer, chapter, full_question_box_2d, box_2d, page_index}}]
         """
-
-        input_parts = [prompt]
-        input_parts.extend(batch_imgs)
-
-        generation_config = {"response_mime_type": "application/json"}
+        input_parts = [prompt] + batch_imgs
+        
         response = None
         last_error = None
-        
-        for model_name in candidate_models:
+        for m in candidate_models:
             try:
-                model = genai.GenerativeModel(model_name)
-                response = model.generate_content(input_parts, generation_config=generation_config)
+                model = genai.GenerativeModel(m)
+                response = model.generate_content(input_parts, generation_config={"response_mime_type": "application/json"})
                 break
-            except Exception as e:
-                last_error = e
-                continue
+            except Exception as e: last_error = e; continue
         
-        if not response:
-             errors.append(f"Batch {batch_idx+1} failed: {str(last_error)}")
-             continue
+        if not response or not response.text:
+             errors.append(f"Batch failed: {last_error}"); continue
 
         try:
-            if not response.text:
-                errors.append(f"Batch {batch_idx+1}: Empty response")
-                continue
-
-            json_text = clean_json_string(response.text)
-            data = json.loads(json_text)
+            data = json.loads(clean_json_string(response.text))
             if isinstance(data, dict): data = [data]
             
             for item in data:
-                # 關鍵字過濾
                 content_text = (item.get('content', '') + " " + " ".join(item.get('options', []))).lower()
-                if any(ek in content_text for ek in EXCLUDE_KEYWORDS):
-                    continue 
+                if any(ek in content_text for ek in EXCLUDE_KEYWORDS): continue 
 
-                # === 自動修正判題邏輯 (Python 二次確認) ===
                 q_type = item.get('type', 'Single')
-                
-                # 1. 檢查複選
-                if "應選" in content_text and ("項" in content_text or "二" in content_text or "三" in content_text):
-                    q_type = "Multi"
-                
-                # 2. 檢查填充 (若不是 Group 且沒有選項)
-                if q_type != "Group" and not item.get('options'):
-                    q_type = "Fill"
+                if "應選" in content_text: q_type = "Multi"
+                if q_type != "Group" and not item.get('options'): q_type = "Fill"
 
-                # === 圖片處理 ===
                 diagram_bytes = None
                 ref_bytes = None
-                full_page_bytes = None 
                 
-                if file_type == 'pdf':
-                    try:
-                        local_idx = item.get('page_index', 0)
-                        if not isinstance(local_idx, int) or local_idx < 0 or local_idx >= len(batch_imgs):
-                            local_idx = 0
-                        absolute_idx = start_page_idx + local_idx
-                        
-                        if 0 <= absolute_idx < len(source_images):
-                            src_img = source_images[absolute_idx]
-                            
-                            # [關鍵修正] 強制儲存整頁，作為手動截圖的底圖
-                            full_page_bytes = img_to_bytes(src_img)
-                            
-                            # 1. 題目附圖 (Box)
-                            if 'box_2d' in item:
-                                diagram_bytes = crop_image(src_img, item['box_2d'], force_full_width=False, padding_y=5)
-                            
-                            # 2. 整題截圖 (Ref Box) - 強制全寬 + 上下大幅擴展
-                            if 'full_question_box_2d' in item:
-                                ref_bytes = crop_image(src_img, item['full_question_box_2d'], force_full_width=True, padding_y=150)
-                            else:
-                                # 若 AI 沒回傳範圍，預設使用整頁做為 fallback
-                                ref_bytes = full_page_bytes
-                                
-                    except Exception as e:
-                        print(f"Image crop error: {e}")
-                
+                rel_idx = item.get('page_index', 0)
+                if not isinstance(rel_idx, int): rel_idx = 0
+                abs_idx = start_offset + rel_idx
+
+                # 這裡只做基本附圖裁切，參考圖留給前端動態做
+                if file_type == 'pdf' and 0 <= rel_idx < len(batch_imgs):
+                    src_img = batch_imgs[rel_idx]
+                    if 'box_2d' in item: diagram_bytes = crop_image(src_img, item['box_2d'], False, 5)
+                    # ref_bytes 這裡先切一份小的備用，但主要靠後端動態切
+                    if 'full_question_box_2d' in item: ref_bytes = crop_image(src_img, item['full_question_box_2d'], True, 100)
+
                 cand = SmartQuestionCandidate(
-                    raw_text=item.get('content', ''),
-                    question_number=item.get('number', 0),
-                    options=item.get('options', []),
-                    chapter=item.get('chapter', '未分類'),
-                    is_likely=True,
-                    status_reason=f"Batch {batch_idx+1}",
+                    raw_text=item.get('content', ''), question_number=item.get('number', 0),
+                    options=item.get('options', []), chapter=item.get('chapter', '未分類'),
                     image_bytes=diagram_bytes,      
                     ref_image_bytes=ref_bytes,
-                    full_page_bytes=full_page_bytes, # 傳遞整頁圖片
-                    q_type=q_type,
-                    subject='Physics',
-                    sub_questions=item.get('sub_questions', []) # 傳遞子題
+                    full_page_bytes=None, # 不存大圖，省記憶體
+                    q_type=q_type, subject='Physics', sub_questions=item.get('sub_questions', []),
+                    page_index=abs_idx,
+                    full_question_box_2d=item.get('full_question_box_2d') # 儲存座標
                 )
                 cand.content = item.get('content', '')
                 all_candidates.append(cand)
-                
-        except Exception as e:
-            errors.append(f"Batch {batch_idx+1} processing error: {str(e)}")
-            
-        time.sleep(1) 
+        except Exception as e: errors.append(f"Parse error: {e}")
 
-    if not all_candidates and errors:
-        return {"error": f"分析失敗詳情: {'; '.join(errors)}"}
-        
-    all_candidates.sort(key=lambda x: x.number)
+    if not all_candidates and errors: return {"error": "; ".join(errors)}
+    try: all_candidates.sort(key=lambda x: int(x.number))
+    except: pass
     return all_candidates
 
-def parse_raw_file(file_obj, file_type, use_ocr=False):
-    return []
+def parse_raw_file(file_obj, file_type, use_ocr=False): return []
