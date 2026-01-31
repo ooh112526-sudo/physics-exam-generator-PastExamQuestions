@@ -3,6 +3,7 @@ import io
 import time
 import datetime
 import requests
+import os
 from PIL import Image
 
 # 匯入分離後的模組
@@ -10,6 +11,12 @@ from cloud_service import CloudManager
 from models import Question
 from exporter import generate_word_files
 import smart_importer
+
+# ==========================================
+# 版本控制標籤
+# ==========================================
+# 這個時間標記會在每次重新生成檔案時更新，方便您確認 Cloud Run 是否已部署最新版本
+LAST_UPDATED = "2026-02-01 00:41 (CST)"
 
 # 安全載入 streamlit_cropper
 try:
@@ -125,6 +132,10 @@ with st.sidebar:
                 cloud_manager.save_question(q.to_dict())
                 progress_bar.progress((i + 1) / total)
             st.success("儲存完成！")
+
+    # === [新功能] 版本時間顯示 ===
+    st.divider()
+    st.caption(f"🚀 Last Updated: {LAST_UPDATED}")
 
 # Tabs
 tab_upload_process, tab_files, tab_review, tab_bank = st.tabs(["🧠 考古題上傳", "📂 檔案管理及AI辨識", "📝 AI匯入校對", "📚 題庫管理與試卷輸出"])
