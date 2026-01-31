@@ -92,7 +92,12 @@ class CloudManager:
         if not self.storage_client: return None
         try:
             bucket = self.storage_client.bucket(self.bucket_name)
-            unique_name = f"{folder}/{int(datetime.datetime.now().timestamp())}_{str(uuid.uuid4())[:8]}_{filename}"
+            # 處理路徑
+            if folder:
+                unique_name = f"{folder}/{int(datetime.datetime.now().timestamp())}_{str(uuid.uuid4())[:8]}_{filename}"
+            else:
+                unique_name = f"{int(datetime.datetime.now().timestamp())}_{str(uuid.uuid4())[:8]}_{filename}"
+                
             blob = bucket.blob(unique_name)
             blob.upload_from_string(file_bytes, content_type=content_type)
             
@@ -137,84 +142,96 @@ class CloudManager:
 
     def delete_file_record(self, file_id):
         if self.db: 
-            # 刪除主檔與相關子集合
             doc_ref = self.db.collection("exam_files").document(file_id)
-            # 刪除 ai_results 子集合 (Firestore 不會自動刪除子集合，這裡簡化處理，僅刪除主檔參照)
-            # 若要完整刪除需遍歷子集合，但為效能考量暫略
             doc_ref.delete()
 
     def update_file_status(self, file_id, status):
         if self.db: self.db.collection("exam_files").document(file_id).update({"ai_status": status})
 
     # ==========================================
-    # [新功能] 批次處理狀態管理 (AI Processing State)
+    # 批次處理狀態管理 (AI Processing State)
     # ==========================================
     def init_batch_process(self, file_id, total_batches):
         """初始化批次任務狀態"""
         if not self.db: return
-        
-        # 設定主狀態
         self.db.collection("exam_files").document(file_id).update({
             "ai_status": "處理中",
             "total_batches": total_batches,
             "processed_batches": 0
         })
-
-        # 初始化每個批次的狀態
         batch_collection = self.db.collection("exam_files").document(file_id).collection("batches")
         for i in range(total_batches):
-            # 若該批次不存在才建立，避免覆蓋已完成的進度
             doc_ref = batch_collection.document(str(i))
             if not doc_ref.get().exists:
                 doc_ref.set({
-                    "batch_index": i,
-                    "status": "pending",  # pending, processing, done, error
-                    "last_error": "",
-                    "updated_at": datetime.datetime.now()
+                    "batch_index": i, "status": "pending", "last_error": "", "updated_at": datetime.datetime.now()
                 })
 
     def get_processing_status(self, file_id):
-        """取得目前所有批次的狀態"""
         if not self.db: return []
-        
         batches = []
         docs = self.db.collection("exam_files").document(file_id).collection("batches").order_by("batch_index").stream()
-        for doc in docs:
-            batches.append(doc.to_dict())
+        for doc in docs: batches.append(doc.to_dict())
         return batches
 
     def save_batch_result(self, file_id, batch_index, candidates_data, status="done", error_msg=""):
-        """儲存單一批次的辨識結果 (JSON)"""
+        """
+        儲存單一批次的辨識結果，並解決 Firestore 1MB 限制問題：
+        將 Base64 圖片上傳至 GCS，JSON 中僅保留 URL。
+        """
         if not self.db: return
 
-        # 1. 儲存結果 (分開存，避免單一文件過大)
+        # 1. 圖片處理：Base64 -> GCS URL
         if status == "done" and candidates_data:
+            # 遍歷每個題目
+            for item in candidates_data:
+                # 定義所有可能包含 Base64 圖片的欄位
+                image_keys = ['image_b64', 'ref_image_b64', 'full_page_b64']
+                
+                for key in image_keys:
+                    if item.get(key):
+                        try:
+                            # 解碼 Base64
+                            img_bytes = base64.b64decode(item[key])
+                            
+                            # 定義儲存路徑 (temp_images 用於區分暫存)
+                            fname = f"{item.get('number', 'unknown')}_{key}.jpg"
+                            folder_path = f"temp_images/{file_id}/{batch_index}"
+                            
+                            # 上傳至 GCS
+                            img_url, blob_name = self.upload_bytes(img_bytes, fname, folder=folder_path, content_type="image/jpeg")
+                            
+                            if img_url:
+                                # 替換為 URL
+                                url_key = key.replace('_b64', '_url')
+                                item[url_key] = img_url
+                                # 儲存 blob_name 以便後端下載 (如果 URL 無法公開存取)
+                                item[key.replace('_b64', '_blob_name')] = blob_name
+                                
+                                # 重要：刪除原始 Base64 資料，釋放 JSON 空間
+                                del item[key]
+                                
+                        except Exception as e:
+                            print(f"圖片轉存失敗 ({key}): {e}")
+                            # 若失敗，至少保留 Base64 以免資料遺失 (但可能導致 Save 失敗)
+                            pass
+
+            # 2. 寫入輕量化後的 JSON 至 Firestore
             results_ref = self.db.collection("exam_files").document(file_id).collection("ai_results").document(str(batch_index))
-            # 將物件轉為 dict 並存入
-            # 注意: candidates_data 應為 list of dict
             results_ref.set({"data": candidates_data})
 
-        # 2. 更新批次狀態
+        # 3. 更新批次狀態
         batch_ref = self.db.collection("exam_files").document(file_id).collection("batches").document(str(batch_index))
         batch_ref.update({
             "status": status,
             "last_error": error_msg,
             "updated_at": datetime.datetime.now()
         })
-        
-        # 3. 更新主檔進度 (Optional, 用於快速顯示)
-        # 這裡不特別計算已完成數，由前端統計即可
 
     def load_all_ai_results(self, file_id):
-        """讀取該檔案所有已完成的 AI 辨識結果"""
         if not self.db: return []
-        
         all_results = []
-        # 讀取 ai_results 子集合
         docs = self.db.collection("exam_files").document(file_id).collection("ai_results").stream()
-        
-        # 需要按照 batch_index 排序嗎？通常結果內的題號本身就有順序
-        # 為了保險，我們可以把 batch index 也讀出來排序
         temp_data = []
         for doc in docs:
             try:
@@ -222,25 +239,20 @@ class CloudManager:
                 data = doc.to_dict().get("data", [])
                 temp_data.append((batch_idx, data))
             except: pass
-            
         temp_data.sort(key=lambda x: x[0])
-        
-        for _, data_list in temp_data:
-            all_results.extend(data_list)
-            
+        for _, data_list in temp_data: all_results.extend(data_list)
         return all_results
 
     def reset_batch_status(self, file_id, batch_index):
-        """重設特定批次狀態為 pending (用於重試)"""
         if self.db:
             self.db.collection("exam_files").document(file_id).collection("batches").document(str(batch_index)).update({
-                "status": "pending",
-                "last_error": ""
+                "status": "pending", "last_error": ""
             })
 
     # --- Question Management ---
     def save_question(self, question_dict):
         if not self.db: return False
+        # 若是正式入庫，也做一次 Base64 -> URL (如果有的話)
         if question_dict.get("image_data_b64"):
             try:
                 img_bytes = base64.b64decode(question_dict["image_data_b64"])
