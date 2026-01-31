@@ -18,7 +18,8 @@ except ImportError as e:
     st.error(f"模組匯入失敗: {e}")
     st.stop()
 
-LAST_UPDATED = "2026-02-01 03:45 (CST) [Bank & Export Complete]"
+# 標記修復版本
+LAST_UPDATED = "2026-02-01 04:30 (CST) [Fix OOM Crash]"
 
 try:
     from streamlit_cropper import st_cropper 
@@ -32,7 +33,6 @@ TYPE_OPTIONS = ["單選", "多選", "填充", "題組"]
 
 cloud_manager = CloudManager()
 
-# 初始化 Session State
 if 'question_pool' not in st.session_state:
     st.session_state['question_pool'] = []
     try:
@@ -45,27 +45,19 @@ if 'upload_configs' not in st.session_state: st.session_state['upload_configs'] 
 if 'review_page' not in st.session_state: st.session_state['review_page'] = 0
 if 'review_data_cache' not in st.session_state: st.session_state['review_data_cache'] = None
 if 'current_review_file_id' not in st.session_state: st.session_state['current_review_file_id'] = None
-# [新增] 題庫匯出選取狀態
 if 'selected_export_ids' not in st.session_state: st.session_state['selected_export_ids'] = set()
 
-# ==========================================
-# 輔助函式
-# ==========================================
 def ensure_b64(item, key_prefix):
-    """Lazy Loading 圖片轉 Base64"""
     b64_key = f"{key_prefix}_b64"
     url_key = f"{key_prefix}_url"
     blob_key = f"{key_prefix}_blob_name"
-    
     if item.get(b64_key): return item[b64_key]
-    
     if item.get(blob_key):
         b_data = cloud_manager.download_blob(item[blob_key])
         if b_data:
             b64 = base64.b64encode(b_data).decode('utf-8')
             item[b64_key] = b64
             return b64
-    
     if item.get(url_key):
         try:
             resp = requests.get(item[url_key], timeout=5)
@@ -77,7 +69,7 @@ def ensure_b64(item, key_prefix):
     return None
 
 # ==========================================
-# Batch Job Runner (AI 處理核心)
+# Batch Job Runner (AI 處理核心 - 修復版)
 # ==========================================
 def run_pending_batch(file_record, api_key):
     file_id, fname = file_record['id'], file_record['filename']
@@ -88,27 +80,35 @@ def run_pending_batch(file_record, api_key):
     if not pending_batch: return False 
     
     batch_idx = pending_batch['batch_index']
-    with st.spinner(f"正在處理 {fname} - 第 {batch_idx + 1} 批次 (共 {len(batches)} 批)..."):
+    
+    # 計算頁碼範圍 (pdf2image 是 1-based index)
+    BATCH_SIZE = smart_importer.BATCH_SIZE
+    start_page = (batch_idx * BATCH_SIZE) + 1
+    end_page = start_page + BATCH_SIZE - 1
+    
+    with st.spinner(f"正在處理 {fname} - 第 {batch_idx + 1} 批次 (頁數 {start_page}~{end_page})..."):
         blob_name = file_record.get('blob_name')
         file_bytes = cloud_manager.download_blob(blob_name)
         if not file_bytes:
             cloud_manager.save_batch_result(file_id, batch_idx, None, "error", "檔案下載失敗")
             return True
 
-        all_images, err = smart_importer.convert_file_to_images(file_bytes, file_record.get('exam_type', 'pdf'))
-        if not all_images:
-            cloud_manager.save_batch_result(file_id, batch_idx, None, "error", err or "轉圖失敗")
-            return True
-
-        BATCH_SIZE = smart_importer.BATCH_SIZE
-        start_idx = batch_idx * BATCH_SIZE
-        end_idx = start_idx + BATCH_SIZE
-        batch_imgs = all_images[start_idx:end_idx]
+        # [關鍵修正] 只轉換該批次的頁面，而非整份 PDF
+        batch_imgs, err = smart_importer.convert_file_to_images(
+            file_bytes, 
+            file_record.get('exam_type', 'pdf'),
+            first_page=start_page, 
+            last_page=end_page
+        )
+        
         if not batch_imgs:
-            cloud_manager.save_batch_result(file_id, batch_idx, [], "done")
+            # 可能是最後一批次超出了頁數，或是真的失敗
+            # 若 err 是空，代表只是沒圖片了 (正常結束)
+            status = "done" if not err else "error"
+            cloud_manager.save_batch_result(file_id, batch_idx, [], status, err or "無圖片")
             return True
 
-        candidates, error = smart_importer.process_single_batch(batch_imgs, batch_idx, api_key, start_idx)
+        candidates, error = smart_importer.process_single_batch(batch_imgs, batch_idx, api_key, start_page)
         if error:
             cloud_manager.save_batch_result(file_id, batch_idx, None, "error", error)
         else:
@@ -182,7 +182,6 @@ with tab_upload:
                 with c4: 
                     new_no = st.selectbox("次別", ["第一次", "第二次", "第三次", "正式考試"], index=["第一次", "第二次", "第三次", "正式考試"].index(config['exam_no']), key=f"n_{f.name}")
                     st.session_state['upload_configs'][f.name]['exam_no'] = new_no
-            
             files_to_process.append({"file": f, "name": new_fname, "config": st.session_state['upload_configs'][f.name]})
             st.divider()
 
@@ -193,7 +192,6 @@ with tab_upload:
                 f_obj = item['file']
                 f_obj.seek(0)
                 url, blob_name = cloud_manager.upload_bytes(f_obj.read(), item['name'], "raw_uploads", f_obj.type)
-                
                 old = cloud_manager.check_file_exists(item['name'])
                 rec = {
                     "filename": item['name'], "original_filename": f_obj.name,
@@ -203,11 +201,9 @@ with tab_upload:
                 }
                 cloud_manager.save_file_record(rec, overwrite_id=old['id'] if old else None)
                 prog.progress((idx+1)/len(files_to_process))
-            st.success("上傳完成！")
-            st.session_state['upload_configs'] = {}
-            time.sleep(1); st.rerun()
+            st.success("上傳完成！"); st.session_state['upload_configs'] = {}; time.sleep(1); st.rerun()
 
-# === Tab 2: 檔案管理 (三層樹狀) ===
+# === Tab 2: 檔案管理 ===
 with tab_files:
     st.subheader("📂 檔案庫與 AI 處理狀態")
     files = cloud_manager.load_file_records()
@@ -223,7 +219,6 @@ with tab_files:
         
         type_order = ["學測", "分科", "北模", "中模", "全模", "其他"]
         exam_order = {"第一次": 1, "第二次": 2, "第三次": 3, "正式考試": 4}
-
         sorted_types = sorted(tree.keys(), key=lambda x: type_order.index(x) if x in type_order else 99)
         
         for ftype in sorted_types:
@@ -245,14 +240,31 @@ with tab_files:
                         with col_action:
                             if status == "未辨識":
                                 if st.button("🚀 辨識", key=f"s_{f['id']}"):
-                                    with st.spinner("啟動中..."):
+                                    status_ph = st.empty()
+                                    try:
+                                        status_ph.info("⏳ 正在下載檔案...")
                                         f_bytes = cloud_manager.download_blob(f.get('blob_name'))
                                         if f_bytes:
-                                            imgs, _ = smart_importer.convert_file_to_images(f_bytes, f.get('exam_type', 'pdf'))
-                                            if imgs:
-                                                total_batches = (len(imgs) + smart_importer.BATCH_SIZE - 1) // smart_importer.BATCH_SIZE
+                                            # [關鍵修正] 使用 get_pdf_page_count 快速讀取頁數，不轉圖
+                                            status_ph.info("⏳ 正在分析頁數...")
+                                            total_pages = smart_importer.get_pdf_page_count(f_bytes)
+                                            if total_pages == 0:
+                                                # 如果不是 PDF 或讀不到，只好走老路轉一次 (Docx 情況)
+                                                imgs, _ = smart_importer.convert_file_to_images(f_bytes, f.get('exam_type', 'pdf'))
+                                                total_pages = len(imgs) if imgs else 0
+                                            
+                                            if total_pages > 0:
+                                                total_batches = (total_pages + smart_importer.BATCH_SIZE - 1) // smart_importer.BATCH_SIZE
                                                 cloud_manager.init_batch_process(f['id'], total_batches)
+                                                status_ph.success("✅ 初始化完成")
                                                 st.rerun()
+                                            else:
+                                                status_ph.error("❌ 無法讀取頁數或檔案損毀")
+                                        else:
+                                            status_ph.error("❌ 下載失敗")
+                                    except Exception as e:
+                                        status_ph.error(f"❌ 錯誤: {e}")
+
                             elif status == "處理中":
                                 st.write("⚡ 處理中...")
                                 if run_pending_batch(f, api_key_input): st.rerun()
@@ -269,7 +281,6 @@ with tab_files:
                             elif status == "已辨識":
                                 if st.button("重設", key=f"rst_{f['id']}"):
                                     cloud_manager.update_file_status(f['id'], "未辨識"); st.rerun()
-                            
                             if st.button("🗑️", key=f"d_{f['id']}"):
                                 cloud_manager.delete_file_record(f['id']); st.rerun()
                     st.markdown("<hr style='margin: 5px 0; border-top: 1px dashed #ddd;'>", unsafe_allow_html=True)
@@ -369,111 +380,62 @@ with tab_review:
                     st.session_state['current_review_file_id'] = None
                     st.success(f"匯入 {count} 題！"); time.sleep(2); st.rerun()
 
-# === Tab 4: 題庫管理與試卷輸出 (完整功能) ===
+# === Tab 4: 題庫 ===
 with tab_bank:
     st.subheader("📚 題庫管理與試卷輸出")
-    
-    # 1. 載入題庫
     all_qs = st.session_state['question_pool']
     if not all_qs:
-        st.info("目前題庫為空，請先至前頁匯入試題。")
-        if st.button("重新載入題庫"):
-            data = cloud_manager.load_questions()
-            st.session_state['question_pool'] = [Question.from_dict(d) for d in data]
-            st.rerun()
+        st.info("目前題庫為空。")
+        if st.button("重新載入"): st.session_state['question_pool'] = [Question.from_dict(d) for d in cloud_manager.load_questions()]; st.rerun()
     else:
-        # 2. 顯示統計與匯出按鈕
         c_stat, c_export = st.columns([1, 1])
-        with c_stat:
-            st.metric("題庫總題數", len(all_qs))
-        
+        with c_stat: st.metric("總題數", len(all_qs))
         with c_export:
-            # 計算已選題數
-            selected_count = len(st.session_state['selected_export_ids'])
-            if st.button(f"📥 生成試卷 Word 檔 (已選 {selected_count} 題)", type="primary", disabled=(selected_count==0)):
-                # 篩選題目
-                export_qs = [q for q in all_qs if q.id in st.session_state['selected_export_ids']]
-                # 排序 (依來源與ID)
-                export_qs.sort(key=lambda x: (x.source, x.id))
-                
-                with st.spinner("正在生成 Word 檔案..."):
-                    doc_exam, doc_ans = generate_word_files(export_qs)
-                    st.success("生成完成！請下載：")
-                    
+            sel_cnt = len(st.session_state['selected_export_ids'])
+            if st.button(f"📥 生成 Word (已選 {sel_cnt} 題)", type="primary", disabled=(sel_cnt==0)):
+                ex_qs = [q for q in all_qs if q.id in st.session_state['selected_export_ids']]
+                ex_qs.sort(key=lambda x: (x.source, x.id))
+                with st.spinner("生成中..."):
+                    d_ex, d_ans = generate_word_files(ex_qs)
                     b1, b2 = st.columns(2)
-                    with b1:
-                        st.download_button("📄 下載試題卷", doc_exam, file_name="exam_paper.docx", mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
-                    with b2:
-                        st.download_button("📝 下載詳解卷", doc_ans, file_name="answer_key.docx", mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+                    with b1: st.download_button("📄 下載試題", d_ex, "exam.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+                    with b2: st.download_button("📝 下載詳解", d_ans, "ans.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
 
         st.divider()
-        
-        # 3. 題庫分類瀏覽 (Source -> Question)
-        # 分組
         qs_by_source = {}
         for q in all_qs:
-            if q.parent_id: continue # 子題不單獨顯示
-            src = q.source if q.source else "未分類來源"
+            if q.parent_id: continue 
+            src = q.source if q.source else "未分類"
             if src not in qs_by_source: qs_by_source[src] = []
             qs_by_source[src].append(q)
             
-        # 排序來源 (依年份)
-        sorted_sources = sorted(qs_by_source.keys(), reverse=True)
-        
-        for src in sorted_sources:
-            qs_list = qs_by_source[src]
-            qs_list.sort(key=lambda q: q.id) # 簡單依建立時間/ID排序
-            
-            with st.expander(f"📁 {src} ({len(qs_list)} 題)"):
-                # 全選功能
-                all_ids_in_src = [q.id for q in qs_list]
-                all_selected = all(qid in st.session_state['selected_export_ids'] for qid in all_ids_in_src)
+        sorted_srcs = sorted(qs_by_source.keys(), reverse=True)
+        for src in sorted_srcs:
+            qlist = qs_by_source[src]
+            qlist.sort(key=lambda q: q.id)
+            with st.expander(f"📁 {src} ({len(qlist)} 題)"):
+                all_ids = [q.id for q in qlist]
+                is_all = all(qid in st.session_state['selected_export_ids'] for qid in all_ids)
+                if st.checkbox(f"全選", value=is_all, key=f"sa_{src}"):
+                    for qid in all_ids: st.session_state['selected_export_ids'].add(qid)
                 
-                if st.checkbox(f"全選此卷", value=all_selected, key=f"sel_all_{src}"):
-                    for qid in all_ids_in_src: st.session_state['selected_export_ids'].add(qid)
-                else:
-                    # 若取消全選 (且原本是全選狀態)，則清除
-                    # 注意：Streamlit checkbox 行為較特殊，這裡簡化邏輯：若沒勾則不強制清除，除非是剛從勾變不勾
-                    # 實務上建議使用者手動取消，或使用更複雜的 callback
-                    pass
-
-                for q in qs_list:
-                    # 每個題目的 Row
-                    c_chk, c_content, c_action = st.columns([0.5, 8, 1.5])
-                    
-                    with c_chk:
-                        is_sel = q.id in st.session_state['selected_export_ids']
-                        if st.checkbox("", value=is_sel, key=f"chk_{q.id}"):
-                            st.session_state['selected_export_ids'].add(q.id)
-                        else:
-                            st.session_state['selected_export_ids'].discard(q.id)
-                            
-                    with c_content:
-                        type_badge = TYPE_MAP_EN_TO_ZH.get(q.type, q.type)
-                        st.markdown(f"**【{type_badge}】** {q.content[:60]}..." if len(q.content)>60 else f"**【{type_badge}】** {q.content}")
-                        if q.image_url: st.caption("🖼️ [附圖]")
-                    
-                    with c_action:
-                        # 編輯與刪除 Popover
+                for q in qlist:
+                    c1, c2, c3 = st.columns([0.5, 8, 1.5])
+                    with c1:
+                        if st.checkbox("", value=(q.id in st.session_state['selected_export_ids']), key=f"ck_{q.id}"): st.session_state['selected_export_ids'].add(q.id)
+                        else: st.session_state['selected_export_ids'].discard(q.id)
+                    with c2:
+                        bdg = TYPE_MAP_EN_TO_ZH.get(q.type, q.type)
+                        st.markdown(f"**【{bdg}】** {q.content[:50]}...")
+                    with c3:
                         with st.popover("⚙️"):
-                            st.write("編輯題目")
-                            new_c = st.text_area("內容", q.content, key=f"ed_c_{q.id}")
-                            new_a = st.text_input("答案", q.answer, key=f"ed_a_{q.id}")
-                            new_chap = st.selectbox("章節", smart_importer.PHYSICS_CHAPTERS_LIST, index=smart_importer.PHYSICS_CHAPTERS_LIST.index(q.chapter) if q.chapter in smart_importer.PHYSICS_CHAPTERS_LIST else 0, key=f"ed_ch_{q.id}")
-                            
-                            if st.button("儲存修改", key=f"sv_{q.id}"):
-                                q.content = new_c
-                                q.answer = new_a
-                                q.chapter = new_chap
-                                cloud_manager.save_question(q.to_dict())
-                                st.success("已儲存")
-                                time.sleep(0.5); st.rerun()
-                                
-                            st.divider()
-                            if st.button("🗑️ 刪除", key=f"del_{q.id}", type="primary"):
+                            nc = st.text_area("內容", q.content, key=f"ec_{q.id}")
+                            na = st.text_input("答案", q.answer, key=f"ea_{q.id}")
+                            if st.button("儲存", key=f"sv_{q.id}"):
+                                q.content, q.answer = nc, na
+                                cloud_manager.save_question(q.to_dict()); st.success("OK"); time.sleep(0.5); st.rerun()
+                            if st.button("刪除", key=f"rm_{q.id}", type="primary"):
                                 cloud_manager.delete_question(q.id)
-                                # 從 Session 移除
                                 st.session_state['question_pool'] = [x for x in st.session_state['question_pool'] if x.id != q.id]
-                                st.session_state['selected_export_ids'].discard(q.id)
                                 st.rerun()
                     st.divider()
