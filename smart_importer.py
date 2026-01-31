@@ -29,21 +29,27 @@ try:
 except ImportError: pass
 
 # ==========================================
-# 常數定義
+# 常數定義 (符合技術規格)
 # ==========================================
+# 批次大小：每 5 頁一批，避免 Token Limit 或 Timeout
+BATCH_SIZE = 5
+
+# 圖片處理參數
+IMG_DPI = 100        # 平衡清晰度與記憶體 (規格: 100-150)
+IMG_QUALITY = 85     # JPEG 壓縮品質 (規格: 85)
+
 PHYSICS_CHAPTERS_LIST = [
     "未分類", "第一章.科學的態度與方法", "第二章.物體的運動", 
     "第三章. 物質的組成與交互作用", "第四章.電與磁的統一", 
     "第五章. 能　量", "第六章.量子現象"
 ]
 
+# 排除非物理科的關鍵字
 EXCLUDE_KEYWORDS = [
     "化學", "反應式", "有機化合物", "酸鹼", "沉澱", "氧化還原", "莫耳", "原子量",
     "生物", "細胞", "遺傳", "DNA", "染色體", "演化", "生態", "光合作用", "酵素",
     "地科", "地質", "板塊", "洋流", "大氣", "氣候", "岩石", "化石", "星系", "地層"
 ]
-
-BATCH_SIZE = 5
 
 # ==========================================
 # 工具函式
@@ -61,6 +67,9 @@ def clean_json_string(json_str):
     return json_str.strip()
 
 def crop_image(original_img, box_2d, force_full_width=False, padding_y=10):
+    """
+    智慧截圖邏輯：只儲存題目區域，不重複儲存整頁
+    """
     if not box_2d or len(box_2d) != 4: return None
     width, height = original_img.size
     ymin, xmin, ymax, xmax = box_2d
@@ -70,6 +79,7 @@ def crop_image(original_img, box_2d, force_full_width=False, padding_y=10):
     if force_full_width:
         left, right = 0, width
     else:
+        # 左右保留一點 padding
         xmin = max(0, xmin - 10)
         xmax = min(1000, xmax + 10)
         left = (xmin / 1000) * width
@@ -81,31 +91,29 @@ def crop_image(original_img, box_2d, force_full_width=False, padding_y=10):
     if right <= left or bottom <= top: return None
     try:
         cropped = original_img.crop((left, top, right, bottom))
-        img_byte_arr = io.BytesIO()
-        if cropped.mode in ("RGBA", "P"): cropped = cropped.convert("RGB")
-        cropped.save(img_byte_arr, format='JPEG', quality=70)
-        return img_byte_arr.getvalue()
+        return img_to_bytes(cropped)
     except: return None
 
 def img_to_bytes(pil_img):
     if pil_img is None: return None
     img_byte_arr = io.BytesIO()
     if pil_img.mode in ("RGBA", "P"): pil_img = pil_img.convert("RGB")
-    pil_img.save(img_byte_arr, format='JPEG', quality=70)
+    # 符合規格: JPEG Quality 85
+    pil_img.save(img_byte_arr, format='JPEG', quality=IMG_QUALITY)
     return img_byte_arr.getvalue()
 
 # ==========================================
-# 核心邏輯拆分
+# 核心邏輯
 # ==========================================
 def convert_file_to_images(file_bytes, file_type):
     """
-    第一步：將檔案轉為圖片列表 (PIL Images)
+    OOM 防護：將 PDF 轉為圖片列表 (PIL Images)
     """
     if file_type == 'pdf':
         if not HAS_PDF2IMAGE: return None, "缺少 pdf2image (Poppler)"
         try:
-            # 使用 100 DPI 平衡速度與清晰度
-            return convert_from_bytes(file_bytes, dpi=100, fmt='jpeg'), None
+            # 符合規格: DPI 100-150
+            return convert_from_bytes(file_bytes, dpi=IMG_DPI, fmt='jpeg'), None
         except Exception as e:
             return None, f"PDF 轉圖失敗: {str(e)}"
     elif file_type == 'docx':
@@ -124,8 +132,7 @@ def convert_file_to_images(file_bytes, file_type):
 
 def process_single_batch(batch_images, batch_index, api_key, start_page_idx):
     """
-    第二步：處理單一批次 (5張圖)
-    回傳: (Result_List_of_Dicts, Error_Message)
+    處理單一批次 (5張圖)
     """
     if not HAS_GENAI: return None, "缺少 google-generativeai"
     if not api_key: return None, "缺少 API Key"
@@ -136,22 +143,31 @@ def process_single_batch(batch_images, batch_index, api_key, start_page_idx):
         prompt_chapters = [c for c in PHYSICS_CHAPTERS_LIST if c != "未分類"]
         chapters_str = "\n".join(prompt_chapters)
         
+        # 智慧判題規則 Prompt
         prompt = f"""
-        分析考卷圖片，只擷取【高中物理】試題。
-        輸出 JSON List，格式範例:
+        你是一個高中物理題庫分析專家。請分析圖片中的試題。
+        
+        【判題規則】
+        1. 題型 (type): 
+           - 內容含 "應選x項" 或 "(A)(B)(C)(D)(E)" 且暗示多選 -> "Multi"
+           - 無選項或只有底線填空 -> "Fill"
+           - 題組共用敘述 -> "Group"
+           - 否則 -> "Single"
+        2. 座標 (box_2d): [ymin, xmin, ymax, xmax] (0-1000)
+        3. 章節 (chapter): 從以下列表選擇最接近的: {chapters_str}
+
+        【輸出格式】JSON List:
         [
             {{
-                "number": 1, "type": "Single", "content": "題目...", "options": ["(A)..", "(B).."], "answer": "A",
-                "chapter": "從此選: {chapters_str}",
-                "full_question_box_2d": [ymin, 0, ymax, 1000], "box_2d": [ymin, xmin, ymax, xmax], "page_index": 0 
+                "number": 1, "type": "Single", "content": "題目文字...", "options": ["(A)..", "(B).."], "answer": "A",
+                "chapter": "...", "full_question_box_2d": [y1, 0, y2, 1000], "page_index": 0 
             }},
             {{
-                "number": 2, "type": "Group", "content": "共用敘述...",
+                "number": 2, "type": "Group", "content": "題組文章...",
                 "sub_questions": [{{ "number": 2, "content": "...", "type": "Single", "answer": "C" }}],
-                "full_question_box_2d": [ymin, 0, ymax, 1000], "page_index": 0
+                "full_question_box_2d": [y1, 0, y2, 1000], "page_index": 0
             }}
         ]
-        座標要求：full_question_box_2d 為整題垂直範圍，page_index 為本批次圖片索引(0~4)。
         """
         
         input_parts = [prompt]
@@ -159,19 +175,22 @@ def process_single_batch(batch_images, batch_index, api_key, start_page_idx):
         
         generation_config = {"response_mime_type": "application/json"}
         
-        # 嘗試模型
+        # 模型策略：優先 Gemini 2.5 -> 2.0 -> 1.5
         response = None
         last_error = None
-        for model_name in ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-pro"]:
+        model_priority = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-pro"]
+        
+        for model_name in model_priority:
             try:
                 model = genai.GenerativeModel(model_name)
                 response = model.generate_content(input_parts, generation_config=generation_config)
-                break
+                break # 成功則跳出
             except Exception as e:
                 last_error = e
+                print(f"Model {model_name} failed: {e}")
                 continue
         
-        if not response: return None, f"AI 連線失敗: {last_error}"
+        if not response: return None, f"AI 連線失敗 (所有模型皆嘗試過): {last_error}"
         if not response.text: return None, "AI 回傳空內容"
 
         json_text = clean_json_string(response.text)
@@ -184,7 +203,7 @@ def process_single_batch(batch_images, batch_index, api_key, start_page_idx):
             content_text = (item.get('content', '') + " " + " ".join(item.get('options', []))).lower()
             if any(ek in content_text for ek in EXCLUDE_KEYWORDS): continue 
 
-            # 自動校正題型
+            # 二次確認題型 (補強 Prompt 判斷)
             q_type = item.get('type', 'Single')
             if "應選" in content_text and ("項" in content_text or "二" in content_text): q_type = "Multi"
             if q_type != "Group" and not item.get('options'): q_type = "Fill"
@@ -196,17 +215,17 @@ def process_single_batch(batch_images, batch_index, api_key, start_page_idx):
                 if isinstance(local_idx, int) and 0 <= local_idx < len(batch_images):
                     src_img = batch_images[local_idx]
                     
-                    # 1. 整頁圖 (轉 Base64 儲存)
+                    # 1. 整頁圖 (轉 Base64 儲存) - 這裡僅存 B64，CloudManager 會轉 URL
                     full_page_bytes = img_to_bytes(src_img)
                     if full_page_bytes:
                         item['full_page_b64'] = base64.b64encode(full_page_bytes).decode('utf-8')
                     
-                    # 2. 附圖
+                    # 2. 附圖 (box_2d)
                     if 'box_2d' in item:
                         c_bytes = crop_image(src_img, item['box_2d'])
                         if c_bytes: item['image_b64'] = base64.b64encode(c_bytes).decode('utf-8')
                     
-                    # 3. 截圖範圍
+                    # 3. 截圖範圍 (full_question_box_2d)
                     if 'full_question_box_2d' in item:
                         r_bytes = crop_image(src_img, item['full_question_box_2d'], force_full_width=True, padding_y=150)
                         if r_bytes: item['ref_image_b64'] = base64.b64encode(r_bytes).decode('utf-8')
@@ -222,7 +241,3 @@ def process_single_batch(batch_images, batch_index, api_key, start_page_idx):
 
     except Exception as e:
         return None, str(e)
-
-# 舊函式相容 (若有其他地方用到)
-def parse_with_gemini(file_bytes, file_type, api_key):
-    return {"error": "請使用新的批次處理流程"}
