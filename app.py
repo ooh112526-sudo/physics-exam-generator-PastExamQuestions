@@ -3,20 +3,24 @@ import io
 import time
 import datetime
 import requests
-import os
+import os  # <--- 確保這一行必須存在
 from PIL import Image
 
 # 匯入分離後的模組
-from cloud_service import CloudManager
-from models import Question
-from exporter import generate_word_files
-import smart_importer
+# 請確保目錄下有 cloud_service.py, models.py, exporter.py, smart_importer.py
+try:
+    from cloud_service import CloudManager
+    from models import Question
+    from exporter import generate_word_files
+    import smart_importer
+except ImportError as e:
+    st.error(f"模組匯入失敗，請確認所有 .py 檔案皆已上傳至正確目錄: {e}")
+    st.stop()
 
 # ==========================================
 # 版本控制標籤
 # ==========================================
-# 這個時間標記會在每次重新生成檔案時更新，方便您確認 Cloud Run 是否已部署最新版本
-LAST_UPDATED = "2026-02-01 00:41 (CST)"
+LAST_UPDATED = "2026-02-01 00:50 (CST)"
 
 # 安全載入 streamlit_cropper
 try:
@@ -94,6 +98,7 @@ st.title("🧲 物理題庫系統 Pro (Cloud Storage)")
 # --- Sidebar ---
 with st.sidebar:
     st.header("設定")
+    # 這裡就是發生錯誤的地方，必須確保 os 已匯入
     env_api_key = os.getenv("GOOGLE_API_KEY", "")
     api_key_input = st.text_input("Gemini API Key", value=env_api_key, type="password", key="sidebar_api_key")
     
