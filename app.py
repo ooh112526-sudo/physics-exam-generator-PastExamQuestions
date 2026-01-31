@@ -19,7 +19,7 @@ except ImportError as e:
     st.stop()
 
 # 標記修復版本
-LAST_UPDATED = "2026-02-01 04:30 (CST) [Fix OOM Crash]"
+LAST_UPDATED = "2026-02-01 05:00 (CST) [UI Polish: Button Alignment]"
 
 try:
     from streamlit_cropper import st_cropper 
@@ -238,51 +238,56 @@ with tab_files:
                             st.markdown(f"&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;📄 {icon} **{f.get('filename')}** <span style='color:grey; font-size:0.8em'>({status})</span>", unsafe_allow_html=True)
                         
                         with col_action:
-                            if status == "未辨識":
-                                if st.button("🚀 辨識", key=f"s_{f['id']}"):
-                                    status_ph = st.empty()
-                                    try:
-                                        status_ph.info("⏳ 正在下載檔案...")
-                                        f_bytes = cloud_manager.download_blob(f.get('blob_name'))
-                                        if f_bytes:
-                                            # [關鍵修正] 使用 get_pdf_page_count 快速讀取頁數，不轉圖
-                                            status_ph.info("⏳ 正在分析頁數...")
-                                            total_pages = smart_importer.get_pdf_page_count(f_bytes)
-                                            if total_pages == 0:
-                                                # 如果不是 PDF 或讀不到，只好走老路轉一次 (Docx 情況)
-                                                imgs, _ = smart_importer.convert_file_to_images(f_bytes, f.get('exam_type', 'pdf'))
-                                                total_pages = len(imgs) if imgs else 0
-                                            
-                                            if total_pages > 0:
-                                                total_batches = (total_pages + smart_importer.BATCH_SIZE - 1) // smart_importer.BATCH_SIZE
-                                                cloud_manager.init_batch_process(f['id'], total_batches)
-                                                status_ph.success("✅ 初始化完成")
-                                                st.rerun()
+                            # [UI 優化] 使用巢狀 Columns 將按鈕排成一列 (Action | Delete)
+                            btn_col_main, btn_col_del = st.columns([3, 1])
+                            
+                            with btn_col_main:
+                                if status == "未辨識":
+                                    if st.button("🚀 辨識", key=f"s_{f['id']}", use_container_width=True):
+                                        status_ph = st.empty()
+                                        try:
+                                            status_ph.info("⏳ 正在下載檔案...")
+                                            f_bytes = cloud_manager.download_blob(f.get('blob_name'))
+                                            if f_bytes:
+                                                status_ph.info("⏳ 正在分析頁數...")
+                                                total_pages = smart_importer.get_pdf_page_count(f_bytes)
+                                                if total_pages == 0:
+                                                    imgs, _ = smart_importer.convert_file_to_images(f_bytes, f.get('exam_type', 'pdf'))
+                                                    total_pages = len(imgs) if imgs else 0
+                                                
+                                                if total_pages > 0:
+                                                    total_batches = (total_pages + smart_importer.BATCH_SIZE - 1) // smart_importer.BATCH_SIZE
+                                                    cloud_manager.init_batch_process(f['id'], total_batches)
+                                                    status_ph.success("✅ 初始化完成")
+                                                    st.rerun()
+                                                else:
+                                                    status_ph.error("❌ 無法讀取頁數或檔案損毀")
                                             else:
-                                                status_ph.error("❌ 無法讀取頁數或檔案損毀")
-                                        else:
-                                            status_ph.error("❌ 下載失敗")
-                                    except Exception as e:
-                                        status_ph.error(f"❌ 錯誤: {e}")
+                                                status_ph.error("❌ 下載失敗")
+                                        except Exception as e:
+                                            status_ph.error(f"❌ 錯誤: {e}")
 
-                            elif status == "處理中":
-                                st.write("⚡ 處理中...")
-                                if run_pending_batch(f, api_key_input): st.rerun()
-                                else:
+                                elif status == "處理中":
+                                    st.caption("⚡ 處理中...") # 節省空間
+                                    if run_pending_batch(f, api_key_input): st.rerun()
+                                    else:
+                                        stats = cloud_manager.get_processing_status(f['id'])
+                                        if any(b['status'] == 'error' for b in stats): cloud_manager.update_file_status(f['id'], "部分失敗")
+                                        else: cloud_manager.update_file_status(f['id'], "已辨識"); st.toast("完成！"); st.rerun()
+                                elif status == "部分失敗":
                                     stats = cloud_manager.get_processing_status(f['id'])
-                                    if any(b['status'] == 'error' for b in stats): cloud_manager.update_file_status(f['id'], "部分失敗")
-                                    else: cloud_manager.update_file_status(f['id'], "已辨識"); st.toast("完成！"); st.rerun()
-                            elif status == "部分失敗":
-                                stats = cloud_manager.get_processing_status(f['id'])
-                                err_batches = [b for b in stats if b['status'] == 'error']
-                                if st.button(f"重試 ({len(err_batches)} 批)", key=f"re_{f['id']}"):
-                                    for b in err_batches: cloud_manager.reset_batch_status(f['id'], b['batch_index'])
-                                    cloud_manager.update_file_status(f['id'], "處理中"); st.rerun()
-                            elif status == "已辨識":
-                                if st.button("重設", key=f"rst_{f['id']}"):
-                                    cloud_manager.update_file_status(f['id'], "未辨識"); st.rerun()
-                            if st.button("🗑️", key=f"d_{f['id']}"):
-                                cloud_manager.delete_file_record(f['id']); st.rerun()
+                                    err_batches = [b for b in stats if b['status'] == 'error']
+                                    if st.button(f"重試 ({len(err_batches)} 批)", key=f"re_{f['id']}", use_container_width=True):
+                                        for b in err_batches: cloud_manager.reset_batch_status(f['id'], b['batch_index'])
+                                        cloud_manager.update_file_status(f['id'], "處理中"); st.rerun()
+                                elif status == "已辨識":
+                                    if st.button("重設", key=f"rst_{f['id']}", use_container_width=True):
+                                        cloud_manager.update_file_status(f['id'], "未辨識"); st.rerun()
+                            
+                            with btn_col_del:
+                                if st.button("🗑️", key=f"d_{f['id']}", use_container_width=True):
+                                    cloud_manager.delete_file_record(f['id']); st.rerun()
+
                     st.markdown("<hr style='margin: 5px 0; border-top: 1px dashed #ddd;'>", unsafe_allow_html=True)
 
 # === Tab 3: 校對 ===
