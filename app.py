@@ -18,8 +18,8 @@ except ImportError as e:
     st.error(f"模組匯入失敗: {e}")
     st.stop()
 
-# 更新標記
-LAST_UPDATED = "2026-02-01 07:15 (CST) [Fix Stuck State & Individual Retry]"
+# 標記修復版本
+LAST_UPDATED = "2026-02-02 00:50 (CST) [CRITICAL FIX: File Type Detection]"
 
 try:
     from streamlit_cropper import st_cropper 
@@ -69,7 +69,7 @@ def ensure_b64(item, key_prefix):
     return None
 
 # ==========================================
-# Batch Job Runner (AI 處理核心)
+# Batch Job Runner (AI 處理核心 - 修復版)
 # ==========================================
 def run_pending_batch(file_record, api_key):
     file_id, fname = file_record['id'], file_record['filename']
@@ -95,10 +95,15 @@ def run_pending_batch(file_record, api_key):
                 cloud_manager.save_batch_result(file_id, batch_idx, None, "error", "檔案下載失敗")
                 return True
 
+            # [BUG FIX] 自動偵測副檔名，而不是使用 exam_type (如: '中模')
+            ftype = 'pdf'
+            if fname.lower().endswith('.docx'):
+                ftype = 'docx'
+
             # 切換頁面
             batch_imgs, err = smart_importer.convert_file_to_images(
                 file_bytes, 
-                file_record.get('exam_type', 'pdf'),
+                ftype, # 修正這裡：傳入正確的 'pdf' 或 'docx'
                 first_page=start_page, 
                 last_page=end_page
             )
@@ -235,23 +240,20 @@ with tab_files:
                     for f in files_in_year:
                         status = f.get('ai_status', '未辨識')
                         
-                        # [修復] 自動檢查: 若狀態是處理中，但其實沒有 pending 的批次，自動修正狀態
-                        # 這是為了解決 "一直轉圈圈" 的問題
+                        # [修復] 自動檢查狀態邏輯
                         if status == "處理中":
                             batches = cloud_manager.get_processing_status(f['id'])
-                            if batches: # 確定有批次資料
+                            if batches: 
                                 pending_count = sum(1 for b in batches if b['status'] == 'pending')
                                 if pending_count == 0:
-                                    # 沒有等待中的，檢查是否有錯誤
                                     error_count = sum(1 for b in batches if b['status'] == 'error')
                                     new_status = "部分失敗" if error_count > 0 else "已辨識"
                                     cloud_manager.update_file_status(f['id'], new_status)
-                                    status = new_status # 即時更新變數以利下方顯示
+                                    status = new_status
                                     st.rerun()
 
                         icon = {"已辨識": "✅", "處理中": "🔄", "部分失敗": "⚠️"}.get(status, "⬜")
                         
-                        # 介面佈局: 檔案資訊 | 批次詳情(可展開) | 動作按鈕
                         col_file, col_batches, col_action = st.columns([3, 4, 2])
                         
                         with col_file:
@@ -259,16 +261,13 @@ with tab_files:
                             st.caption(f"狀態: {status}")
 
                         with col_batches:
-                            # 顯示批次進度條與詳情
                             if status != "未辨識":
                                 batches = cloud_manager.get_processing_status(f['id'])
                                 if batches:
                                     done_cnt = sum(1 for b in batches if b['status'] == 'done')
-                                    err_cnt = sum(1 for b in batches if b['status'] == 'error')
                                     total = len(batches)
                                     st.progress(done_cnt / total if total > 0 else 0)
                                     
-                                    # 展開顯示詳細批次 (方便個別重試)
                                     with st.expander(f"查看 {total} 個批次詳情"):
                                         for b in batches:
                                             b_idx = b['batch_index']
@@ -282,7 +281,7 @@ with tab_files:
                                                 elif b_stat == 'error': st.error(f"Batch {b_idx+1}: ❌ 失敗 ({b_msg})")
                                             
                                             with bc2:
-                                                # [新功能] 個別批次重試按鈕
+                                                # [功能確認] 這是個別重試按鈕，請確認是否能點擊
                                                 if b_stat == 'error':
                                                     if st.button("🔄", key=f"r_b_{f['id']}_{b_idx}", help="重試此批次"):
                                                         cloud_manager.reset_batch_status(f['id'], b_idx)
@@ -290,48 +289,55 @@ with tab_files:
                                                         st.rerun()
 
                         with col_action:
-                            if status == "未辨識":
-                                if st.button("🚀 辨識", key=f"s_{f['id']}", use_container_width=True):
-                                    status_ph = st.empty()
-                                    try:
-                                        status_ph.info("⏳ 下載中...")
-                                        f_bytes = cloud_manager.download_blob(f.get('blob_name'))
-                                        if f_bytes:
-                                            status_ph.info("⏳ 分析頁數...")
-                                            total_pages = smart_importer.get_pdf_page_count(f_bytes)
-                                            if total_pages == 0:
-                                                imgs, _ = smart_importer.convert_file_to_images(f_bytes, f.get('exam_type', 'pdf'))
-                                                total_pages = len(imgs) if imgs else 0
-                                            
-                                            if total_pages > 0:
-                                                total_batches = (total_pages + smart_importer.BATCH_SIZE - 1) // smart_importer.BATCH_SIZE
-                                                cloud_manager.init_batch_process(f['id'], total_batches)
-                                                status_ph.success("✅ 初始化完成")
-                                                st.rerun()
-                                            else: status_ph.error("❌ 頁數錯誤")
-                                        else: status_ph.error("❌ 下載失敗")
-                                    except Exception as e: status_ph.error(f"❌ {e}")
+                            btn_col_main, btn_col_del = st.columns([3, 1])
+                            with btn_col_main:
+                                if status == "未辨識":
+                                    if st.button("🚀 辨識", key=f"s_{f['id']}", use_container_width=True):
+                                        status_ph = st.empty()
+                                        try:
+                                            status_ph.info("⏳ 下載中...")
+                                            f_bytes = cloud_manager.download_blob(f.get('blob_name'))
+                                            if f_bytes:
+                                                status_ph.info("⏳ 分析頁數...")
+                                                # [BUG FIX] 這裡也要修正檔案格式判斷
+                                                ftype = 'pdf'
+                                                if f.get('filename', '').lower().endswith('.docx'):
+                                                    ftype = 'docx'
+                                                    
+                                                total_pages = smart_importer.get_pdf_page_count(f_bytes)
+                                                if total_pages == 0:
+                                                    imgs, _ = smart_importer.convert_file_to_images(f_bytes, ftype)
+                                                    total_pages = len(imgs) if imgs else 0
+                                                
+                                                if total_pages > 0:
+                                                    total_batches = (total_pages + smart_importer.BATCH_SIZE - 1) // smart_importer.BATCH_SIZE
+                                                    cloud_manager.init_batch_process(f['id'], total_batches)
+                                                    status_ph.success("✅ 初始化完成")
+                                                    st.rerun()
+                                                else: status_ph.error("❌ 頁數錯誤")
+                                            else: status_ph.error("❌ 下載失敗")
+                                        except Exception as e: status_ph.error(f"❌ {e}")
 
-                            elif status == "處理中":
-                                st.write("⚡ AI 分析中...")
-                                # 自動執行下一個 Job
-                                if run_pending_batch(f, api_key_input): 
-                                    st.rerun()
-                                
-                            elif status == "部分失敗":
-                                if st.button("重試全部失敗", key=f"re_all_{f['id']}", use_container_width=True):
-                                    stats = cloud_manager.get_processing_status(f['id'])
-                                    for b in stats:
-                                        if b['status'] == 'error': cloud_manager.reset_batch_status(f['id'], b['batch_index'])
-                                    cloud_manager.update_file_status(f['id'], "處理中")
-                                    st.rerun()
+                                elif status == "處理中":
+                                    st.caption("⚡ 處理中...") 
+                                    if run_pending_batch(f, api_key_input): 
+                                        st.rerun()
                                     
-                            elif status == "已辨識":
-                                if st.button("重設", key=f"rst_{f['id']}", use_container_width=True):
-                                    cloud_manager.update_file_status(f['id'], "未辨識"); st.rerun()
+                                elif status == "部分失敗":
+                                    if st.button("重試全部", key=f"re_all_{f['id']}", use_container_width=True):
+                                        stats = cloud_manager.get_processing_status(f['id'])
+                                        for b in stats:
+                                            if b['status'] == 'error': cloud_manager.reset_batch_status(f['id'], b['batch_index'])
+                                        cloud_manager.update_file_status(f['id'], "處理中")
+                                        st.rerun()
+                                        
+                                elif status == "已辨識":
+                                    if st.button("重設", key=f"rst_{f['id']}", use_container_width=True):
+                                        cloud_manager.update_file_status(f['id'], "未辨識"); st.rerun()
                             
-                            if st.button("🗑️ 刪除", key=f"d_{f['id']}", type="primary", use_container_width=True):
-                                cloud_manager.delete_file_record(f['id']); st.rerun()
+                            with btn_col_del:
+                                if st.button("🗑️", key=f"d_{f['id']}", use_container_width=True):
+                                    cloud_manager.delete_file_record(f['id']); st.rerun()
 
                     st.markdown("<hr style='margin: 5px 0; border-top: 1px dashed #ddd;'>", unsafe_allow_html=True)
 
