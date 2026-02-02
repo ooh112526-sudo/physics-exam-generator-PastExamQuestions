@@ -185,8 +185,8 @@ class CloudManager:
         if status == "done" and candidates_data:
             # 遍歷每個題目
             for item in candidates_data:
-                # 定義所有可能包含 Base64 圖片的欄位
-                image_keys = ['image_b64', 'ref_image_b64', 'full_page_b64']
+                # 定義所有可能包含 Base64 圖片的欄位 (新增 ai_crop_backup_b64)
+                image_keys = ['image_b64', 'ref_image_b64', 'full_page_b64', 'ai_crop_backup_b64']
                 
                 for key in image_keys:
                     if item.get(key):
