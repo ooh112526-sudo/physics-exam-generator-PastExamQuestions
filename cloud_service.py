@@ -152,7 +152,7 @@ class CloudManager:
     # 批次處理狀態管理 (AI Processing State)
     # ==========================================
     def init_batch_process(self, file_id, total_batches):
-        """初始化批次任務狀態，若已存在則覆蓋 (用於重新辨識)"""
+        """初始化批次任務狀態"""
         if not self.db: return
         self.db.collection("exam_files").document(file_id).update({
             "ai_status": "處理中",
@@ -160,27 +160,12 @@ class CloudManager:
             "processed_batches": 0
         })
         batch_collection = self.db.collection("exam_files").document(file_id).collection("batches")
-        
-        # 刪除舊的 batches (如果有) - 簡單做法是覆蓋，但如果有殘留的舊 batch index 可能會混淆
-        # 這裡我們採用直接覆蓋/設定的方式
         for i in range(total_batches):
             doc_ref = batch_collection.document(str(i))
-            doc_ref.set({
-                "batch_index": i, "status": "pending", "last_error": "", "updated_at": datetime.datetime.now()
-            })
-
-    def reset_analysis_data(self, file_id):
-        """
-        [新功能] 重置分析資料：將狀態設為未辨識，並清除舊的 AI 結果 (Optional)
-        這樣使用者點擊「再次辨識」時，可以從頭開始。
-        """
-        if not self.db: return
-        # 更新狀態
-        self.db.collection("exam_files").document(file_id).update({"ai_status": "未辨識"})
-        
-        # 為了確保乾淨，我們可以選擇性地刪除 ai_results 子集合，
-        # 但 Firestore 刪除子集合比較麻煩，這裡我們依靠 init_batch_process 的覆蓋機制即可。
-        # 只要狀態變回 "未辨識"，UI 就會顯示 "開始辨識" 按鈕。
+            if not doc_ref.get().exists:
+                doc_ref.set({
+                    "batch_index": i, "status": "pending", "last_error": "", "updated_at": datetime.datetime.now()
+                })
 
     def get_processing_status(self, file_id):
         if not self.db: return []
@@ -190,31 +175,52 @@ class CloudManager:
         return batches
 
     def save_batch_result(self, file_id, batch_index, candidates_data, status="done", error_msg=""):
+        """
+        儲存單一批次的辨識結果，並解決 Firestore 1MB 限制問題：
+        將 Base64 圖片上傳至 GCS，JSON 中僅保留 URL。
+        """
         if not self.db: return
 
         # 1. 圖片處理：Base64 -> GCS URL
         if status == "done" and candidates_data:
+            # 遍歷每個題目
             for item in candidates_data:
-                image_keys = ['image_b64', 'ref_image_b64', 'full_page_b64', 'ai_crop_backup_b64']
+                # 定義所有可能包含 Base64 圖片的欄位
+                image_keys = ['image_b64', 'ref_image_b64', 'full_page_b64']
                 
                 for key in image_keys:
                     if item.get(key):
                         try:
+                            # 解碼 Base64
                             img_bytes = base64.b64decode(item[key])
+                            
+                            # 定義儲存路徑 (temp_images 用於區分暫存)
                             fname = f"{item.get('number', 'unknown')}_{key}.jpg"
                             folder_path = f"temp_images/{file_id}/{batch_index}"
+                            
+                            # 上傳至 GCS
                             img_url, blob_name = self.upload_bytes(img_bytes, fname, folder=folder_path, content_type="image/jpeg")
                             
                             if img_url:
+                                # 替換為 URL
                                 url_key = key.replace('_b64', '_url')
                                 item[url_key] = img_url
+                                # 儲存 blob_name 以便後端下載 (如果 URL 無法公開存取)
                                 item[key.replace('_b64', '_blob_name')] = blob_name
+                                
+                                # 重要：刪除原始 Base64 資料，釋放 JSON 空間
                                 del item[key]
-                        except Exception as e: pass
+                                
+                        except Exception as e:
+                            print(f"圖片轉存失敗 ({key}): {e}")
+                            # 若失敗，至少保留 Base64 以免資料遺失 (但可能導致 Save 失敗)
+                            pass
 
+            # 2. 寫入輕量化後的 JSON 至 Firestore
             results_ref = self.db.collection("exam_files").document(file_id).collection("ai_results").document(str(batch_index))
             results_ref.set({"data": candidates_data})
 
+        # 3. 更新批次狀態
         batch_ref = self.db.collection("exam_files").document(file_id).collection("batches").document(str(batch_index))
         batch_ref.update({
             "status": status,
@@ -246,6 +252,7 @@ class CloudManager:
     # --- Question Management ---
     def save_question(self, question_dict):
         if not self.db: return False
+        # 若是正式入庫，也做一次 Base64 -> URL (如果有的話)
         if question_dict.get("image_data_b64"):
             try:
                 img_bytes = base64.b64decode(question_dict["image_data_b64"])
