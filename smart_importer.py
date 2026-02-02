@@ -100,21 +100,21 @@ def check_is_group_header(text):
         return True, f"{match.group(1)}~{match.group(2)}"
     return False, ""
 
-def crop_image(original_img, box_2d, force_full_width=False, padding_y=0): # [FIX] 將預設 padding 改為 0
+def crop_image(original_img, box_2d, force_full_width=False, padding_y=10):
     if not box_2d or len(box_2d) != 4: return None
     width, height = original_img.size
     ymin, xmin, ymax, xmax = box_2d
     
-    # 修正：即使有 padding，也只在非強制全寬時考慮，或者這裡直接設為 0 以相信 AI 的判斷
+    # [Restore] 還原原始邊距邏輯
     ymin = max(0, ymin - padding_y)
     ymax = min(1000, ymax + padding_y)
     
     if force_full_width:
         left, right = 0, width
     else:
-        # X 軸保持微小留白以免切到字，但 Y 軸嚴格
-        xmin = max(0, xmin - 5)
-        xmax = min(1000, xmax + 5)
+        # [Restore] 還原左右邊距 10
+        xmin = max(0, xmin - 10)
+        xmax = min(1000, xmax + 10)
         left = (xmin / 1000) * width
         right = (xmax / 1000) * width
     
@@ -187,15 +187,13 @@ def process_single_batch(batch_images, batch_index, api_key, start_page_idx):
         genai.configure(api_key=api_key)
         chapters_str = "\n".join([c for c in PHYSICS_CHAPTERS_LIST if c != "未分類"])
         
-        # [FIX] 強化 Prompt 指令，要求精準座標
+        # [Restore] 還原為原始 Prompt
         prompt = f"""
-        分析圖片中的高中物理試題。請極度精準地標示題目座標。
+        分析圖片中的高中物理試題。
         規則：
         1. 包含「應選X項」為 Multi (多選)；無選項為 Fill (填充)；題組共用文為 Group。
         2. 若為題組，主內容放 content，子題放 sub_questions。
-        3. 座標規則 (0-1000)：
-           - box_2d: 僅包含該題的「題目文本」與「圖片」的最小矩形。嚴禁包含上一題或下一題的文字。
-           - full_question_box_2d: 該題在整頁的垂直範圍 [y1, 0, y2, 1000]。確保 y1 不會切到上一題，y2 不會切到下一題。
+        3. box_2d 為圖片範圍 (0-1000)。
         
         JSON 格式:
         [
@@ -244,11 +242,11 @@ def process_single_batch(batch_images, batch_index, api_key, start_page_idx):
                     full_b = img_to_bytes(src)
                     
                     if 'box_2d' in item: 
-                        img_b = crop_image(src, item['box_2d']) # 使用預設 padding=0
+                        img_b = crop_image(src, item['box_2d'])
                     
                     if 'full_question_box_2d' in item:
-                        # [FIX] 將參考圖的 padding 從 150 降為 10
-                        ref_b = crop_image(src, item['full_question_box_2d'], True, 10)
+                        # [Restore] 還原 padding 為 150
+                        ref_b = crop_image(src, item['full_question_box_2d'], True, 150)
                     else:
                         ref_b = full_b
             except: pass
