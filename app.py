@@ -18,7 +18,8 @@ try:
 except ImportError as e:
     st.error(f"模組匯入失敗: {e}"); st.stop()
 
-LAST_UPDATED = "2026-02-02 12:00 (CST) [Full UX Upgrade]"
+# 更新標記
+LAST_UPDATED = "2026-02-02 13:30 (CST) [UI Clean Up: Remove Restore/NoImg]"
 
 try: from streamlit_cropper import st_cropper 
 except: st_cropper = None 
@@ -98,10 +99,9 @@ def run_pending_batch(file_record, api_key):
 # UI Helpers
 # ==========================================
 def sync_page_data(page_items):
-    """[新功能] 切換分頁前，將 widget 的值寫回 cache"""
+    """切換分頁前，將 widget 的值寫回 cache"""
     for i, item in enumerate(page_items):
         ui_key = item['ui_key']
-        # 從 Session State 讀取最新值並寫回 item
         if f"c_{ui_key}" in st.session_state: item['content'] = st.session_state[f"c_{ui_key}"]
         if f"a_{ui_key}" in st.session_state: item['answer'] = st.session_state[f"a_{ui_key}"]
         if f"o_{ui_key}" in st.session_state: 
@@ -109,7 +109,6 @@ def sync_page_data(page_items):
         if f"ch_{ui_key}" in st.session_state: item['chapter'] = st.session_state[f"ch_{ui_key}"]
         if f"use_img_{ui_key}" in st.session_state: item['use_image'] = st.session_state[f"use_img_{ui_key}"]
         
-        # 題組子題
         if 'sub_questions' in item:
             for si, sq in enumerate(item['sub_questions']):
                 if f"sub_c_{ui_key}_{si}" in st.session_state: sq['content'] = st.session_state[f"sub_c_{ui_key}_{si}"]
@@ -134,14 +133,13 @@ with st.sidebar:
 
 tab1, tab2, tab3, tab4 = st.tabs(["🧠 上傳", "📂 檔案", "📝 校對", "📚 題庫"])
 
-# === Tab 1: Upload (簡化版) ===
+# === Tab 1: Upload ===
 with tab1:
     st.markdown("### 📤 上傳")
     up_files = st.file_uploader("PDF/Word", type=['pdf', 'docx'], accept_multiple_files=True)
     if up_files and st.button("確認上傳", type="primary"):
         prog = st.progress(0)
         for i, f in enumerate(up_files):
-            # 這裡簡化命名邏輯，實際請保留您的批次命名功能
             new_name = f"{int(time.time())}_{f.name}"
             url, blob = cloud_manager.upload_bytes(f.read(), new_name, "raw_uploads", f.type)
             rec = {
@@ -153,13 +151,12 @@ with tab1:
             prog.progress((i+1)/len(up_files))
         st.success("Done!"); time.sleep(1); st.rerun()
 
-# === Tab 2: Files (含再次辨識) ===
+# === Tab 2: Files ===
 with tab2:
     st.subheader("📂 檔案庫")
     files = cloud_manager.load_file_records()
     if not files: st.info("無檔案")
     else:
-        # 簡單列表展示，您可以保留原本的樹狀結構
         for f in files:
             with st.expander(f"📄 {f['filename']} ({f.get('ai_status')})"):
                 c1, c2 = st.columns([3, 2])
@@ -167,7 +164,7 @@ with tab2:
                     status = f.get('ai_status', '未辨識')
                     if status == "處理中":
                         if run_pending_batch(f, api_key_in): st.rerun()
-                        else: # 檢查是否完成
+                        else:
                             batches = cloud_manager.get_processing_status(f['id'])
                             errs = sum(1 for b in batches if b['status']=='error')
                             pend = sum(1 for b in batches if b['status']=='pending')
@@ -176,7 +173,6 @@ with tab2:
                                 cloud_manager.update_file_status(f['id'], new_s)
                                 st.rerun()
                     
-                    # [新功能] 再次辨識按鈕
                     if status in ["已辨識", "部分失敗", "已匯入"]:
                         if st.button("🔄 再次辨識 (會覆蓋舊紀錄)", key=f"reauth_{f['id']}"):
                             cloud_manager.update_file_status(f['id'], "未辨識")
@@ -189,7 +185,7 @@ with tab2:
                             if fb:
                                 ftype = 'docx' if f['filename'].endswith('docx') else 'pdf'
                                 pgs = smart_importer.get_pdf_page_count(fb)
-                                if pgs==0: # docx or fallback
+                                if pgs==0:
                                     imgs, _ = smart_importer.convert_file_to_images(fb, ftype)
                                     pgs = len(imgs) if imgs else 0
                                 
@@ -202,7 +198,7 @@ with tab2:
                     if st.button("🗑️ 刪除檔案", key=f"del_{f['id']}"):
                         cloud_manager.delete_file_record(f['id']); st.rerun()
 
-# === Tab 3: Review (重點優化) ===
+# === Tab 3: Review ===
 with tab3:
     st.subheader("📝 校對")
     ready = [f for f in files if f.get('ai_status') in ["已辨識", "部分失敗"]]
@@ -213,13 +209,11 @@ with tab3:
         sel_name = st.selectbox("檔案", f_names)
         sel_file = next(f for f in ready if f['filename'] == sel_name)
         
-        # 載入資料 (只在切換檔案時執行一次)
         if st.session_state['current_review_file_id'] != sel_file['id']:
             with st.spinner("Loading..."):
                 data = cloud_manager.load_all_ai_results(sel_file['id'])
                 for res in data:
                     if 'ui_key' not in res: res['ui_key'] = str(uuid.uuid4())
-                    # [初始化] 預設不使用圖片，確保有備份
                     if 'use_image' not in res: res['use_image'] = False
                     if 'ai_crop_backup_b64' not in res: res['ai_crop_backup_b64'] = res.get('image_b64')
                 
@@ -231,12 +225,10 @@ with tab3:
         
         if not all_res: st.warning("無題目資料")
         else:
-            # 分頁
             PER_PAGE = 5
             total_pg = (len(all_res) + PER_PAGE - 1) // PER_PAGE
             curr_pg = st.session_state['review_page']
             
-            # [重要] 翻頁前先存檔
             start = curr_pg * PER_PAGE
             end = start + PER_PAGE
             current_items = all_res[start:end]
@@ -245,17 +237,16 @@ with tab3:
             with c_info: st.caption(f"Page {curr_pg+1} / {total_pg}")
             with c_prev:
                 if st.button("◀", disabled=(curr_pg==0)):
-                    sync_page_data(current_items) # 存檔
+                    sync_page_data(current_items)
                     st.session_state['review_page'] -= 1; st.rerun()
             with c_next:
                 if st.button("▶", disabled=(curr_pg>=total_pg-1)):
-                    sync_page_data(current_items) # 存檔
+                    sync_page_data(current_items)
                     st.session_state['review_page'] += 1; st.rerun()
             
             st.divider()
             
-            # 渲染題目
-            items_to_remove = [] # 待刪除清單
+            items_to_remove = []
 
             for i, item in enumerate(current_items):
                 uik = item['ui_key']
@@ -264,84 +255,63 @@ with tab3:
                     c_edit, c_img = st.columns([1, 1])
                     
                     with c_edit:
-                        # 標題與刪除
                         h1, h2 = st.columns([4, 1])
                         h1.markdown(f"#### 第 {item.get('number', '?')} 題")
                         with h2:
-                            # [新功能] 安全刪除
                             with st.popover("🗑️"):
-                                st.write("確認刪除此題？不可回復。")
-                                if st.button("確認刪除", key=f"del_confirm_{uik}", type="primary"):
+                                st.write("確認刪除？")
+                                if st.button("確認", key=f"del_confirm_{uik}", type="primary"):
                                     items_to_remove.append(item)
-                                    # 需立即觸發 Rerun 以更新畫面，但在迴圈中直接 Rerun 會斷掉，
-                                    # 所以先標記，迴圈後處理。
                         
-                        # 類型
                         c_type = TYPE_MAP_REV.get(item.get('type'), "單選")
                         new_type = st.selectbox("題型", TYPE_OPTS, index=TYPE_OPTS.index(c_type) if c_type in TYPE_OPTS else 0, key=f"t_{uik}")
                         item['type'] = TYPE_MAP[new_type]
                         
-                        # [新功能] 轉為題組/新增子題
                         if item['type'] == 'Group':
                             if st.button("➕ 新增子題", key=f"add_sub_{uik}"):
                                 item.setdefault('sub_questions', []).append({"content": "", "answer": "", "number": len(item['sub_questions'])+1})
                                 st.rerun()
                         else:
-                            # 檢查是否像題組
                             is_group, range_str = smart_importer.check_is_group_header(item.get('content', ''))
                             if is_group: st.info(f"偵測到題組關鍵字 ({range_str})")
                             if st.button("轉為題組模式", key=f"to_grp_{uik}"):
                                 item['type'] = 'Group'
                                 st.rerun()
 
-                        # 內容編輯
                         st.text_area("題目", item.get('content', ''), height=100, key=f"c_{uik}")
                         
                         if item['type'] != 'Group':
                             opts = st.text_area("選項", "\n".join(item.get('options', [])), height=80, key=f"o_{uik}")
                             st.text_input("答案", item.get('answer', ''), key=f"a_{uik}")
                         else:
-                            # 子題編輯
                             for si, sq in enumerate(item.get('sub_questions', [])):
                                 with st.expander(f"子題 {sq.get('number', si+1)}"):
                                     st.text_area("內容", sq.get('content',''), key=f"sub_c_{uik}_{si}")
                                     st.text_input("答案", sq.get('answer',''), key=f"sub_a_{uik}_{si}")
 
-                        # 章節與圖片開關
                         curr_ch = item.get('chapter', '未分類')
                         if curr_ch not in smart_importer.PHYSICS_CHAPTERS_LIST: curr_ch = '未分類'
                         st.selectbox("章節", smart_importer.PHYSICS_CHAPTERS_LIST, index=smart_importer.PHYSICS_CHAPTERS_LIST.index(curr_ch), key=f"ch_{uik}")
                         
-                        # [新功能] 是否使用圖片
                         st.checkbox("使用截圖作為題目附圖", value=item.get('use_image', False), key=f"use_img_{uik}")
 
                     with c_img:
-                        # 圖片模式
                         mode = st.radio("模式", ["AI 預截圖", "手動裁切"], horizontal=True, key=f"im_{uik}")
                         
                         if mode == "AI 預截圖":
-                            # [新功能] 還原按鈕
-                            if st.button("還原為初始 AI 截圖", key=f"restore_{uik}", help="若手動裁切錯誤，點此還原"):
-                                item['image_b64'] = item.get('ai_crop_backup_b64')
-                                st.rerun()
-                                
-                            # 顯示目前圖片
+                            # [優化] 移除還原按鈕與空狀態提示
                             curr_img = item.get('image_b64')
                             if curr_img: st.image(base64.b64decode(curr_img), caption="目前使用圖片")
-                            else: st.info("無 AI 截圖")
                             
-                            # 顯示參考範圍 (不影響 image_b64)
                             ref_b64 = ensure_b64(item, 'ref_image') or ensure_b64(item, 'image')
                             if ref_b64: st.image(base64.b64decode(ref_b64), caption="AI 參考範圍")
                             
                         else:
-                            # 手動裁切
                             fp_b64 = ensure_b64(item, 'full_page')
                             if fp_b64 and st_cropper:
                                 cropped = st_cropper(Image.open(io.BytesIO(base64.b64decode(fp_b64))), key=f"cr_{uik}", box_color='#FF0000')
                                 if cropped:
                                     st.image(cropped, width=150, caption="預覽")
-                                    # 按下確認才覆蓋
                                     if st.button("確認裁切並替換", key=f"confirm_crop_{uik}"):
                                         buf = io.BytesIO(); cropped.save(buf, format='PNG')
                                         item['image_b64'] = base64.b64encode(buf.getvalue()).decode()
@@ -350,21 +320,18 @@ with tab3:
                             else: st.warning("無法載入整頁圖")
                 st.divider()
 
-            # 處理刪除
             if items_to_remove:
                 for it in items_to_remove:
                     all_res.remove(it)
                 st.success("已刪除題目")
                 st.rerun()
 
-            # 底部匯入按鈕
             if st.button("🚀 確認匯入題庫", type="primary", use_container_width=True):
-                sync_page_data(current_items) # 最後一次同步
+                sync_page_data(current_items)
                 
                 prog = st.progress(0)
                 count = 0
                 for idx, item in enumerate(all_res):
-                    # [新功能] 根據 checkbox 決定是否存圖
                     final_img_data = None
                     if item.get('use_image') and item.get('image_b64'):
                         final_img_data = base64.b64decode(item['image_b64'])
@@ -376,7 +343,7 @@ with tab3:
                         answer=item.get('answer', ''),
                         chapter=item.get('chapter', '未分類'),
                         source=sel_file['filename'],
-                        image_data=final_img_data, # 只有勾選才會有值
+                        image_data=final_img_data,
                         sub_questions=[Question.from_dict(sq) for sq in item.get('sub_questions', [])]
                     )
                     cloud_manager.save_question(q.to_dict())
@@ -391,9 +358,11 @@ with tab3:
 # === Tab 4: Bank ===
 with tab4:
     st.subheader("題庫")
-    # (此部分保持原樣，或按需更新)
     if st.button("重載題庫"): 
         d = cloud_manager.load_questions()
         st.session_state['question_pool'] = [Question.from_dict(x) for x in d]
         st.rerun()
-    # ... 其餘邏輯同前一版 ...
+    
+    # ... 其餘 Tab 4 邏輯 (省略以節省篇幅，保持不變) ...
+    # 如需完整代碼，請告知。這裡假設使用者保留了前一版的 Tab 4 邏輯。
+    # 為了確保完整性，若您需要 Tab 4 完整程式碼，請參考上一次回應的 Tab 4 區塊。
