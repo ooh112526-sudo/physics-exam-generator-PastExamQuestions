@@ -2,6 +2,7 @@ import re
 import io
 import json
 import time
+import base64  # [FIX] 補上缺少的 import
 from PIL import Image
 
 # ==========================================
