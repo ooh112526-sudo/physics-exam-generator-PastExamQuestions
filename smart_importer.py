@@ -2,7 +2,7 @@ import re
 import io
 import json
 import time
-import base64  # [FIX] 補上缺少的 import
+import base64
 from PIL import Image
 
 # ==========================================
@@ -204,8 +204,8 @@ def process_single_batch(batch_images, batch_index, api_key, start_page_idx):
         ]
         """
         
-        # 模型降級策略
-        models = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-pro"]
+        # 更新模型清單：優先使用 Gemini 3.0 系列，僅使用指定模型
+        models = ["gemini-3.0-pro", "gemini-3.0-flash", "gemini-2.5-pro", "gemini-2.5-flash"]
         response = None
         last_err = None
         
@@ -216,6 +216,8 @@ def process_single_batch(batch_images, batch_index, api_key, start_page_idx):
                 break
             except Exception as e:
                 last_err = e
+                # 簡單的重試延遲，避免瞬間打死所有 quota
+                time.sleep(1)
                 continue
         
         if not response: return None, f"AI Error: {last_err}"
