@@ -249,6 +249,21 @@ class CloudManager:
                 "status": "pending", "last_error": ""
             })
 
+    def clean_old_batch_data(self, file_id):
+        """清除舊的批次處理資料，以便重新辨識"""
+        if not self.db: return
+        try:
+            # 1. 刪除 batches 子集合
+            batches_ref = self.db.collection("exam_files").document(file_id).collection("batches")
+            for doc in batches_ref.stream():
+                doc.reference.delete()
+            # 2. 刪除 ai_results 子集合
+            results_ref = self.db.collection("exam_files").document(file_id).collection("ai_results")
+            for doc in results_ref.stream():
+                doc.reference.delete()
+        except Exception as e:
+            print(f"Cleanup Error: {e}")
+
     # --- Question Management ---
     def save_question(self, question_dict):
         if not self.db: return False
