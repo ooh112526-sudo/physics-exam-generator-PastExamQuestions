@@ -19,7 +19,7 @@ except ImportError as e:
     st.stop()
 
 # 標記修復版本
-LAST_UPDATED = "2026-02-02 00:50 (CST) [CRITICAL FIX: File Type Detection]"
+LAST_UPDATED = "2026-02-02 21:50 (CST) [FEATURE: Re-ID, Img Backup, Page Sync]"
 
 try:
     from streamlit_cropper import st_cropper 
@@ -48,16 +48,26 @@ if 'current_review_file_id' not in st.session_state: st.session_state['current_r
 if 'selected_export_ids' not in st.session_state: st.session_state['selected_export_ids'] = set()
 
 def ensure_b64(item, key_prefix):
+    """
+    確保從 URL 或 Blob Name 載入 Base64 圖片數據 (Lazy Loading)
+    支援 key_prefix 如: 'image', 'full_page', 'ai_crop_backup'
+    """
     b64_key = f"{key_prefix}_b64"
     url_key = f"{key_prefix}_url"
     blob_key = f"{key_prefix}_blob_name"
+    
+    # 1. 記憶體中已有
     if item.get(b64_key): return item[b64_key]
+    
+    # 2. 從 GCS Blob 下載
     if item.get(blob_key):
         b_data = cloud_manager.download_blob(item[blob_key])
         if b_data:
             b64 = base64.b64encode(b_data).decode('utf-8')
             item[b64_key] = b64
             return b64
+            
+    # 3. 從 URL 下載 (Fallback)
     if item.get(url_key):
         try:
             resp = requests.get(item[url_key], timeout=5)
@@ -68,21 +78,49 @@ def ensure_b64(item, key_prefix):
         except: pass
     return None
 
+def sync_page_data(items_per_page):
+    """
+    [關鍵修復] 切換頁面或匯入前，將 Widget 的當前值寫回 session_state 的資料緩存中。
+    避免換頁後資料遺失。
+    """
+    if not st.session_state.get('review_data_cache'): return
+    
+    start = st.session_state['review_page'] * items_per_page
+    end = start + items_per_page
+    current_data = st.session_state['review_data_cache']
+    
+    for i in range(start, min(end, len(current_data))):
+        item = current_data[i]
+        k = item['ui_key']
+        
+        # 同步題目內容
+        if f"c_{k}" in st.session_state: item['content'] = st.session_state[f"c_{k}"]
+        # 同步答案
+        if f"a_{k}" in st.session_state: item['answer'] = st.session_state[f"a_{k}"]
+        # 同步選項
+        if f"o_{k}" in st.session_state:
+            opts_txt = st.session_state[f"o_{k}"]
+            item['options'] = opts_txt.split('\n') if opts_txt.strip() else []
+        # 同步類型
+        if f"t_{k}" in st.session_state: 
+            item['type'] = TYPE_MAP_ZH_TO_EN.get(st.session_state[f"t_{k}"], "Single")
+        # 同步章節
+        if f"ch_{k}" in st.session_state: item['chapter'] = st.session_state[f"ch_{k}"]
+        # 同步是否使用圖片
+        if f"uimg_{k}" in st.session_state: item['use_image'] = st.session_state[f"uimg_{k}"]
+
 # ==========================================
-# Batch Job Runner (AI 處理核心 - 修復版)
+# Batch Job Runner (AI 處理核心)
 # ==========================================
 def run_pending_batch(file_record, api_key):
     file_id, fname = file_record['id'], file_record['filename']
     batches = cloud_manager.get_processing_status(file_id)
     if not batches: return False 
     
-    # 找出第一個 pending 的批次
     pending_batch = next((b for b in batches if b['status'] == 'pending'), None)
     if not pending_batch: return False 
     
     batch_idx = pending_batch['batch_index']
-    
-    # 計算頁碼範圍
     BATCH_SIZE = smart_importer.BATCH_SIZE
     start_page = (batch_idx * BATCH_SIZE) + 1
     end_page = start_page + BATCH_SIZE - 1
@@ -95,21 +133,18 @@ def run_pending_batch(file_record, api_key):
                 cloud_manager.save_batch_result(file_id, batch_idx, None, "error", "檔案下載失敗")
                 return True
 
-            # [BUG FIX] 自動偵測副檔名，而不是使用 exam_type (如: '中模')
             ftype = 'pdf'
             if fname.lower().endswith('.docx'):
                 ftype = 'docx'
 
-            # 切換頁面
             batch_imgs, err = smart_importer.convert_file_to_images(
                 file_bytes, 
-                ftype, # 修正這裡：傳入正確的 'pdf' 或 'docx'
+                ftype, 
                 first_page=start_page, 
                 last_page=end_page
             )
             
             if not batch_imgs:
-                # 可能是頁數超過範圍(正常結束)或是真的失敗
                 status = "done" if not err else "error"
                 cloud_manager.save_batch_result(file_id, batch_idx, [], status, err or "無圖片")
                 return True
@@ -211,7 +246,7 @@ with tab_upload:
                 prog.progress((idx+1)/len(files_to_process))
             st.success("上傳完成！"); st.session_state['upload_configs'] = {}; time.sleep(1); st.rerun()
 
-# === Tab 2: 檔案管理 (修復: 卡死與單獨重試) ===
+# === Tab 2: 檔案管理 ===
 with tab_files:
     st.subheader("📂 檔案庫與 AI 處理狀態")
     files = cloud_manager.load_file_records()
@@ -240,7 +275,6 @@ with tab_files:
                     for f in files_in_year:
                         status = f.get('ai_status', '未辨識')
                         
-                        # [修復] 自動檢查狀態邏輯
                         if status == "處理中":
                             batches = cloud_manager.get_processing_status(f['id'])
                             if batches: 
@@ -252,7 +286,7 @@ with tab_files:
                                     status = new_status
                                     st.rerun()
 
-                        icon = {"已辨識": "✅", "處理中": "🔄", "部分失敗": "⚠️"}.get(status, "⬜")
+                        icon = {"已辨識": "✅", "處理中": "🔄", "部分失敗": "⚠️", "已匯入": "📥"}.get(status, "⬜")
                         
                         col_file, col_batches, col_action = st.columns([3, 4, 2])
                         
@@ -261,7 +295,7 @@ with tab_files:
                             st.caption(f"狀態: {status}")
 
                         with col_batches:
-                            if status != "未辨識":
+                            if status not in ["未辨識"]:
                                 batches = cloud_manager.get_processing_status(f['id'])
                                 if batches:
                                     done_cnt = sum(1 for b in batches if b['status'] == 'done')
@@ -281,7 +315,6 @@ with tab_files:
                                                 elif b_stat == 'error': st.error(f"Batch {b_idx+1}: ❌ 失敗 ({b_msg})")
                                             
                                             with bc2:
-                                                # [功能確認] 這是個別重試按鈕，請確認是否能點擊
                                                 if b_stat == 'error':
                                                     if st.button("🔄", key=f"r_b_{f['id']}_{b_idx}", help="重試此批次"):
                                                         cloud_manager.reset_batch_status(f['id'], b_idx)
@@ -299,7 +332,6 @@ with tab_files:
                                             f_bytes = cloud_manager.download_blob(f.get('blob_name'))
                                             if f_bytes:
                                                 status_ph.info("⏳ 分析頁數...")
-                                                # [BUG FIX] 這裡也要修正檔案格式判斷
                                                 ftype = 'pdf'
                                                 if f.get('filename', '').lower().endswith('.docx'):
                                                     ftype = 'docx'
@@ -334,7 +366,13 @@ with tab_files:
                                 elif status == "已辨識":
                                     if st.button("重設", key=f"rst_{f['id']}", use_container_width=True):
                                         cloud_manager.update_file_status(f['id'], "未辨識"); st.rerun()
-                            
+                                
+                                # (1) 新增功能：已匯入的檔案可以重新辨識
+                                elif status == "已匯入":
+                                    if st.button("🔄 再次辨識", key=f"reid_{f['id']}", use_container_width=True, help="這將會重新啟動辨識流程"):
+                                        cloud_manager.update_file_status(f['id'], "未辨識")
+                                        st.rerun()
+
                             with btn_col_del:
                                 if st.button("🗑️", key=f"d_{f['id']}", use_container_width=True):
                                     cloud_manager.delete_file_record(f['id']); st.rerun()
@@ -344,7 +382,7 @@ with tab_files:
 # === Tab 3: 校對 ===
 with tab_review:
     st.subheader("📝 匯入校對與編輯")
-    ready_files = [f for f in files if f.get('ai_status') in ["已辨識", "部分失敗"]]
+    ready_files = [f for f in files if f.get('ai_status') in ["已辨識", "部分失敗", "已匯入"]] # 允許已匯入的檔案再次檢視
     if not ready_files: st.info("暫無可校對的檔案。")
     else:
         file_names = [f['filename'] for f in ready_files]
@@ -356,6 +394,7 @@ with tab_review:
                 results_data = cloud_manager.load_all_ai_results(sel_file['id'])
                 for res in results_data:
                     if 'ui_key' not in res: res['ui_key'] = str(uuid.uuid4())
+                    if 'use_image' not in res: res['use_image'] = False # 預設不使用截圖
                 st.session_state['review_data_cache'] = results_data
                 st.session_state['current_review_file_id'] = sel_file['id']
                 st.session_state['review_page'] = 0
@@ -365,23 +404,45 @@ with tab_review:
         else:
             ITEMS_PER_PAGE = 5
             total_pages = (len(all_results) + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE
+            
+            # 分頁控制區
             c_info, c_prev, c_next = st.columns([6, 1, 1])
             with c_info: st.caption(f"第 {st.session_state['review_page'] + 1} / {total_pages} 頁")
             with c_prev: 
-                if st.button("◀", disabled=(st.session_state['review_page']==0)): st.session_state['review_page'] -= 1; st.rerun()
+                if st.button("◀", disabled=(st.session_state['review_page']==0)): 
+                    sync_page_data(ITEMS_PER_PAGE) # (3) 換頁前暫存
+                    st.session_state['review_page'] -= 1
+                    st.rerun()
             with c_next: 
-                if st.button("▶", disabled=(st.session_state['review_page']>=total_pages-1)): st.session_state['review_page'] += 1; st.rerun()
+                if st.button("▶", disabled=(st.session_state['review_page']>=total_pages-1)): 
+                    sync_page_data(ITEMS_PER_PAGE) # (3) 換頁前暫存
+                    st.session_state['review_page'] += 1
+                    st.rerun()
             st.divider()
 
             start_idx = st.session_state['review_page'] * ITEMS_PER_PAGE
-            current_page_items = all_results[start_idx:start_idx+ITEMS_PER_PAGE]
+            # 注意：這裡使用切片，但我們需要知道真實 index 以便刪除
+            current_page_indices = range(start_idx, min(start_idx + ITEMS_PER_PAGE, len(all_results)))
             
-            for i, res in enumerate(current_page_items):
-                real_idx = start_idx + i
+            for real_idx in current_page_indices:
+                res = all_results[real_idx]
+                
                 with st.container():
                     col_edit, col_img = st.columns([1, 1])
                     with col_edit:
-                        st.markdown(f"#### 第 {res.get('number', real_idx+1)} 題")
+                        # (4) 刪除按鈕與確認機制
+                        col_title, col_del = st.columns([8, 2])
+                        with col_title:
+                            st.markdown(f"#### 第 {res.get('number', real_idx+1)} 題")
+                        with col_del:
+                            with st.popover("🗑️ 刪除", help="刪除此題"):
+                                st.warning("刪除後不可回復，確認刪除此題嗎？")
+                                if st.button("確認刪除", key=f"del_conf_{res['ui_key']}", type="primary"):
+                                    sync_page_data(ITEMS_PER_PAGE) # 刪除前先同步其他題目，避免遺失
+                                    all_results.pop(real_idx)
+                                    st.session_state['review_data_cache'] = all_results
+                                    st.rerun()
+
                         curr_type = TYPE_MAP_EN_TO_ZH.get(res.get('type'), "單選")
                         new_type = st.selectbox(f"題型", TYPE_OPTIONS, index=TYPE_OPTIONS.index(curr_type) if curr_type in TYPE_OPTIONS else 0, key=f"t_{res['ui_key']}")
                         res['type'] = TYPE_MAP_ZH_TO_EN[new_type]
@@ -394,31 +455,55 @@ with tab_review:
                         res['chapter'] = st.selectbox("章節", smart_importer.PHYSICS_CHAPTERS_LIST, index=smart_importer.PHYSICS_CHAPTERS_LIST.index(curr_chap) if curr_chap in smart_importer.PHYSICS_CHAPTERS_LIST else 0, key=f"ch_{res['ui_key']}")
 
                     with col_img:
-                        img_mode = st.radio("圖片模式", ["AI 預截圖", "整頁手動裁切"], horizontal=True, key=f"im_{res['ui_key']}")
+                        # (2) 圖片模式與使用開關
+                        st.markdown("**圖片設定**")
+                        use_img = st.checkbox("使用截圖", value=res.get('use_image', False), key=f"uimg_{res['ui_key']}")
+                        
+                        img_mode = st.radio("模式", ["AI 預截圖", "整頁手動裁切"], horizontal=True, key=f"im_{res['ui_key']}")
+                        
                         if img_mode == "AI 預截圖":
-                            target_url = res.get('ref_image_url') or res.get('image_url')
-                            if target_url: st.image(target_url, caption="AI 自動截取範圍")
-                            else: st.info("無 AI 截圖")
+                            # 嘗試從備份還原 (如果之前被手動裁切覆蓋過)
+                            backup_b64 = ensure_b64(res, 'ai_crop_backup')
+                            if backup_b64:
+                                res['image_b64'] = backup_b64 # 恢復顯示 AI 截圖
+                                
+                            target_b64 = ensure_b64(res, 'image')
+                            if target_b64: 
+                                st.image(base64.b64decode(target_b64), caption="AI 自動截取範圍")
+                            else: 
+                                st.info("無 AI 截圖")
                         else:
                             full_page_b64 = ensure_b64(res, 'full_page')
                             if full_page_b64 and st_cropper:
                                 cropped = st_cropper(Image.open(io.BytesIO(base64.b64decode(full_page_b64))), key=f"cr_{res['ui_key']}", box_color='#FF0000')
                                 if cropped:
-                                    st.image(cropped, width=150)
+                                    st.image(cropped, width=150, caption="裁切預覽")
+                                    # 即時更新當前顯示的圖片資料，但不覆蓋 ai_crop_backup
                                     buf = io.BytesIO(); cropped.save(buf, format='PNG')
                                     res['image_b64'] = base64.b64encode(buf.getvalue()).decode('utf-8')
                                     res['ref_image_url'] = None 
                             else: st.warning("無法載入整頁圖")
                 st.divider()
 
-            if st.button("🚀 確認匯入", type="primary", use_container_width=True):
+            if st.button("🚀 確認匯入題庫", type="primary", use_container_width=True):
+                sync_page_data(ITEMS_PER_PAGE) # (3) 匯入前最後一次同步
                 with st.spinner("匯入中..."):
                     count = 0
                     total = len(all_results)
                     progress = st.progress(0)
                     for idx, item in enumerate(all_results):
-                        final_img = item.get('image_b64')
-                        final_url = item.get('ref_image_url') or item.get('image_url')
+                        # 檢查是否啟用截圖
+                        final_img = None
+                        final_url = None
+                        
+                        if item.get('use_image', False):
+                            final_img = item.get('image_b64')
+                            # 如果是 AI 截圖且有 URL，優先用 URL
+                            if not final_img and item.get('image_url'):
+                                final_url = item.get('image_url')
+                            elif not final_img and item.get('ref_image_url'):
+                                final_url = item.get('ref_image_url')
+                        
                         img_data = base64.b64decode(final_img) if final_img else None
                         
                         q = Question(
