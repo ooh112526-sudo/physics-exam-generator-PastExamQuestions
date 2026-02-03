@@ -2,7 +2,7 @@ import re
 import io
 import json
 import time
-import base64
+import base64  # [FIX] 補回遺失的 import，否則圖片處理會報錯
 from PIL import Image
 
 # ==========================================
@@ -101,31 +101,21 @@ def check_is_group_header(text):
     return False, ""
 
 def crop_image(original_img, box_2d, force_full_width=False, padding_y=10):
-    """
-    裁切圖片函式 (已針對全寬需求優化)
-    padding_y: 上下擴張的範圍 (千分比)
-    force_full_width: 是否強制使用整頁寬度
-    """
     if not box_2d or len(box_2d) != 4: return None
     width, height = original_img.size
     ymin, xmin, ymax, xmax = box_2d
     
-    # 1. 高度調整：上下擴張 padding_y，確保不切到文字
     ymin = max(0, ymin - padding_y)
     ymax = min(1000, ymax + padding_y)
     
-    # 2. 寬度調整
     if force_full_width:
-        # 強制全寬：左右直接切齊頁面邊緣 (0~1000)
         left, right = 0, width
     else:
-        # 非全寬：左右依照座標並微調
         xmin = max(0, xmin - 10)
         xmax = min(1000, xmax + 10)
         left = (xmin / 1000) * width
         right = (xmax / 1000) * width
     
-    # 計算實際像素高度
     top = (ymin / 1000) * height
     bottom = (ymax / 1000) * height
     
@@ -195,24 +185,51 @@ def process_single_batch(batch_images, batch_index, api_key, start_page_idx):
         genai.configure(api_key=api_key)
         chapters_str = "\n".join([c for c in PHYSICS_CHAPTERS_LIST if c != "未分類"])
         
+        # [核心修改] 整合「題組結構」與「填滿間隙」的 Prompt
         prompt = f"""
-        分析圖片中的高中物理試題。
-        規則：
-        1. 包含「應選X項」為 Multi (多選)；無選項為 Fill (填充)；題組共用文為 Group。
-        2. 若為題組，主內容放 content，子題放 sub_questions。
-        3. box_2d 為圖片範圍 (0-1000)。
+        請分析圖片中的高中物理試題，並將其轉為 JSON 格式。
         
-        JSON 格式:
+        【重要規則：題組處理】
+        1. 辨識題型：
+           - 一般題目：type 為 "Single" (單選), "Multi" (多選), "Fill" (填充)。
+           - 題組母題：當偵測到「第X-Y題為題組」或一段共用文章時，type 設為 "Group"。
+        
+        2. 題組 (Group) 的結構要求：
+           - content: 只放「題組說明」與「共用文章內容」。
+           - sub_questions: 必須是一個列表 (List)，包含該題組下的所有子題目。
+           - 嚴禁將子題目文字直接合併在 content 裡，必須拆解。
+
+        3. 子題目 (sub_questions) 內的物件結構：
+           - 必須包含完整的: number (題號), type (題型), content (子題敘述), options (選項), answer (答案)。
+
+        4. box_2d 為圖片範圍 (0-1000)：
+           - 垂直範圍(y1, y2)需「最大化」以填滿題目間的空隙。
+           - y1(上界)應緊接在上一題的結束處(或頁首)。
+           - y2(下界)應緊接在下一題的開始處(或頁尾)。
+           - 嚴禁切到鄰近題目的文字。
+           - Group 母題：框選整個題組範圍（含文章與所有子題）。
+
+        【JSON 輸出範例】：
         [
             {{
-                "number": 1, "type": "Single", "content": "...", "options": ["(A).."], "answer": "A",
-                "chapter": "...", "full_question_box_2d": [y1,0,y2,1000], "box_2d": [y1,x1,y2,x2], "page_index": 0 
+                "number": 1, "type": "Single", "content": "第一題...", "options": ["(A).."], "answer": "A", "box_2d": [...]
+            }},
+            {{
+                "number": 58, 
+                "type": "Group", 
+                "content": "第58-60題為題組\\n這是共用的文章內容...", 
+                "sub_questions": [
+                    {{ "number": 58, "type": "Fill", "content": "子題1敘述...", "answer": "答案", "options": [] }},
+                    {{ "number": 59, "type": "Single", "content": "子題2敘述...", "options": ["(A)..", "(B).."], "answer": "B" }}
+                ],
+                "box_2d": [100, 0, 500, 1000],
+                "page_index": 0 
             }}
         ]
         """
         
-        # 指定使用 Gemini 3.0 系列與 2.5 系列
-        models = ["gemini-3.0-pro", "gemini-3.0-flash", "gemini-2.5-pro", "gemini-2.5-flash"]
+        # 模型降級策略
+        models = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-pro"]
         response = None
         last_err = None
         
@@ -223,8 +240,6 @@ def process_single_batch(batch_images, batch_index, api_key, start_page_idx):
                 break
             except Exception as e:
                 last_err = e
-                # 簡單的重試延遲，避免瞬間打死所有 quota
-                time.sleep(1)
                 continue
         
         if not response: return None, f"AI Error: {last_err}"
@@ -251,11 +266,9 @@ def process_single_batch(batch_images, batch_index, api_key, start_page_idx):
                     full_b = img_to_bytes(src)
                     
                     if 'box_2d' in item: 
-                        # [修改點] 強制題目圖使用全寬模式 (force_full_width=True)，上下保留 10 (1%) 的緩衝
-                        img_b = crop_image(src, item['box_2d'], force_full_width=True, padding_y=10)
+                        img_b = crop_image(src, item['box_2d'])
                     
                     if 'full_question_box_2d' in item:
-                        # 參考圖原本就是全寬，且上下緩衝較大 (150)
                         ref_b = crop_image(src, item['full_question_box_2d'], True, 150)
                     else:
                         ref_b = full_b
