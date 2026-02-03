@@ -251,7 +251,7 @@ def process_single_batch(batch_images, batch_index, api_key, start_page_idx):
                     full_b = img_to_bytes(src)
                     
                     if 'box_2d' in item: 
-                        # [修改點] 強制題目圖使用全寬模式，上下保留 10 (1%) 的緩衝
+                        # [修改點] 強制題目圖使用全寬模式 (force_full_width=True)，上下保留 10 (1%) 的緩衝
                         img_b = crop_image(src, item['box_2d'], force_full_width=True, padding_y=10)
                     
                     if 'full_question_box_2d' in item:
