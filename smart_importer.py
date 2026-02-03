@@ -101,23 +101,31 @@ def check_is_group_header(text):
     return False, ""
 
 def crop_image(original_img, box_2d, force_full_width=False, padding_y=10):
+    """
+    裁切圖片函式 (已針對全寬需求優化)
+    padding_y: 上下擴張的範圍 (千分比)
+    force_full_width: 是否強制使用整頁寬度
+    """
     if not box_2d or len(box_2d) != 4: return None
     width, height = original_img.size
     ymin, xmin, ymax, xmax = box_2d
     
-    # [Restore] 還原原始邊距邏輯
+    # 1. 高度調整：上下擴張 padding_y，確保不切到文字
     ymin = max(0, ymin - padding_y)
     ymax = min(1000, ymax + padding_y)
     
+    # 2. 寬度調整
     if force_full_width:
+        # 強制全寬：左右直接切齊頁面邊緣 (0~1000)
         left, right = 0, width
     else:
-        # [Restore] 還原左右邊距 10
+        # 非全寬：左右依照座標並微調
         xmin = max(0, xmin - 10)
         xmax = min(1000, xmax + 10)
         left = (xmin / 1000) * width
         right = (xmax / 1000) * width
     
+    # 計算實際像素高度
     top = (ymin / 1000) * height
     bottom = (ymax / 1000) * height
     
@@ -187,7 +195,6 @@ def process_single_batch(batch_images, batch_index, api_key, start_page_idx):
         genai.configure(api_key=api_key)
         chapters_str = "\n".join([c for c in PHYSICS_CHAPTERS_LIST if c != "未分類"])
         
-        # [Restore] 還原為原始 Prompt
         prompt = f"""
         分析圖片中的高中物理試題。
         規則：
@@ -204,7 +211,7 @@ def process_single_batch(batch_images, batch_index, api_key, start_page_idx):
         ]
         """
         
-        # 更新模型清單：優先使用 Gemini 3.0 系列，僅使用指定模型
+        # 指定使用 Gemini 3.0 系列與 2.5 系列
         models = ["gemini-3.0-pro", "gemini-3.0-flash", "gemini-2.5-pro", "gemini-2.5-flash"]
         response = None
         last_err = None
@@ -244,10 +251,11 @@ def process_single_batch(batch_images, batch_index, api_key, start_page_idx):
                     full_b = img_to_bytes(src)
                     
                     if 'box_2d' in item: 
-                        img_b = crop_image(src, item['box_2d'])
+                        # [修改點] 強制題目圖使用全寬模式，上下保留 10 (1%) 的緩衝
+                        img_b = crop_image(src, item['box_2d'], force_full_width=True, padding_y=10)
                     
                     if 'full_question_box_2d' in item:
-                        # [Restore] 還原 padding 為 150
+                        # 參考圖原本就是全寬，且上下緩衝較大 (150)
                         ref_b = crop_image(src, item['full_question_box_2d'], True, 150)
                     else:
                         ref_b = full_b
