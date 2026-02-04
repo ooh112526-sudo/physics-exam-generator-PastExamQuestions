@@ -19,7 +19,7 @@ except ImportError as e:
     st.stop()
 
 # 標記修復版本
-LAST_UPDATED = "2026-02-03 00:05 (CST) [FIX: Reset Button Logic]"
+LAST_UPDATED = "2026-02-03 00:05 (CST) [FIX: Reset Button Logic + Auto Delete]"
 
 try:
     from streamlit_cropper import st_cropper 
@@ -519,10 +519,13 @@ with tab_review:
                         cloud_manager.save_question(q.to_dict())
                         count += 1
                         progress.progress((idx+1)/total)
-                    cloud_manager.update_file_status(sel_file['id'], "已匯入")
+                    
+                    # [新增] 匯入完成後，刪除檔案紀錄
+                    cloud_manager.delete_file_record(sel_file['id'])
+                    
                     del st.session_state['review_data_cache']
                     st.session_state['current_review_file_id'] = None
-                    st.success(f"匯入 {count} 題！"); time.sleep(2); st.rerun()
+                    st.success(f"匯入 {count} 題並已自動刪除暫存檔！"); time.sleep(2); st.rerun()
 
 # === Tab 4: 題庫 ===
 with tab_bank:
