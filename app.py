@@ -19,7 +19,7 @@ except ImportError as e:
     st.stop()
 
 # 標記修復版本
-LAST_UPDATED = "2026-02-03 00:30 (CST) [FIX: Import Logic - Keep File, Clear AI Cache]"
+LAST_UPDATED = "2026-02-05 01:30 (CST) [FIX: Cache Invalidation on Re-ID]"
 
 try:
     from streamlit_cropper import st_cropper 
@@ -368,12 +368,16 @@ with tab_files:
                                         # [FIX] 重設時一併清除舊資料，確保再次辨識可以正常運作
                                         cloud_manager.clean_old_batch_data(f['id'])
                                         cloud_manager.update_file_status(f['id'], "未辨識")
+                                        # [FIX] 強制清除校對頁面的快取指標，強迫 Tab 3 重新載入新資料
+                                        st.session_state['current_review_file_id'] = None
                                         st.rerun()
                                 
                                 elif status == "已匯入":
                                     if st.button("🔄 再次辨識", key=f"reid_{f['id']}", use_container_width=True, help="這將會清除舊資料並重新啟動辨識流程"):
                                         cloud_manager.clean_old_batch_data(f['id']) 
                                         cloud_manager.update_file_status(f['id'], "未辨識") 
+                                        # [FIX] 強制清除校對頁面的快取指標，強迫 Tab 3 重新載入新資料
+                                        st.session_state['current_review_file_id'] = None
                                         st.rerun()
 
                             with btn_col_del:
