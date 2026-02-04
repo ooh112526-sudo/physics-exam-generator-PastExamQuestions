@@ -212,11 +212,10 @@ def process_single_batch(batch_images, batch_index, api_key, start_page_idx):
         3. 子題目 (sub_questions) 內的物件結構：
            - 必須包含完整的: number (題號), type (題型), content (子題敘述), options (選項), answer (答案)。
 
-        4. box_2d 為圖片範圍 (0-1000)：
+        4. box_2d 為試題圖片範圍 (0-1000)：包含題號、題目文字、選項與圖片的完整區域。請盡量寬鬆，包含到上一題結束與下一題開始的空白處。
            - 垂直範圍(y1, y2)需「最大化」以填滿題目間的空隙。
            - y1(上界)應緊接在上一題的結束的最後一行(選項E)。
            - y2(下界)應緊接在下一題的開始的第一行。
-           - 嚴禁切到鄰近題目的文字。
            - Group 母題：框選整個題組範圍（含文章與所有子題）。
         5. 章節 (chapter): 選擇最接近的: {chapters_str}
         【JSON 輸出範例】：
@@ -307,5 +306,6 @@ def process_single_batch(batch_images, batch_index, api_key, start_page_idx):
         return processed, None
 
     except Exception as e: return None, str(e)
+
 
 
