@@ -218,7 +218,7 @@ def process_single_batch(batch_images, batch_index, api_key, start_page_idx):
            - y2(下界)應緊接在下一題的開始的第一行。
            - 嚴禁切到鄰近題目的文字。
            - Group 母題：框選整個題組範圍（含文章與所有子題）。
-
+        5. 章節 (chapter): 選擇最接近的: {chapters_str}
         【JSON 輸出範例】：
         [
             {{
@@ -307,4 +307,5 @@ def process_single_batch(batch_images, batch_index, api_key, start_page_idx):
         return processed, None
 
     except Exception as e: return None, str(e)
+
 
