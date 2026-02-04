@@ -2,7 +2,7 @@ import re
 import io
 import json
 import time
-import base64  # [FIX] 補回遺失的 import，否則圖片處理會報錯
+import base64
 from PIL import Image
 
 # ==========================================
@@ -101,21 +101,31 @@ def check_is_group_header(text):
     return False, ""
 
 def crop_image(original_img, box_2d, force_full_width=False, padding_y=10):
+    """
+    裁切圖片函式 (已針對全寬需求優化)
+    padding_y: 上下擴張的範圍 (千分比)
+    force_full_width: 是否強制使用整頁寬度
+    """
     if not box_2d or len(box_2d) != 4: return None
     width, height = original_img.size
     ymin, xmin, ymax, xmax = box_2d
     
+    # 1. 高度調整：上下擴張 padding_y，確保不切到文字
     ymin = max(0, ymin - padding_y)
     ymax = min(1000, ymax + padding_y)
     
+    # 2. 寬度調整
     if force_full_width:
+        # 強制全寬：左右直接切齊頁面邊緣 (0~1000)
         left, right = 0, width
     else:
+        # 非全寬：左右依照座標並微調
         xmin = max(0, xmin - 10)
         xmax = min(1000, xmax + 10)
         left = (xmin / 1000) * width
         right = (xmax / 1000) * width
     
+    # 計算實際像素高度
     top = (ymin / 1000) * height
     bottom = (ymax / 1000) * height
     
@@ -228,8 +238,8 @@ def process_single_batch(batch_images, batch_index, api_key, start_page_idx):
         ]
         """
         
-        # 模型降級策略
-        models = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-pro"]
+        # 指定使用 Gemini 3.0 系列與 2.5 系列
+        models = ["gemini-3.0-pro", "gemini-3.0-flash", "gemini-2.5-pro", "gemini-2.5-flash"]
         response = None
         last_err = None
         
@@ -240,6 +250,8 @@ def process_single_batch(batch_images, batch_index, api_key, start_page_idx):
                 break
             except Exception as e:
                 last_err = e
+                # 簡單的重試延遲，避免瞬間打死所有 quota
+                time.sleep(1)
                 continue
         
         if not response: return None, f"AI Error: {last_err}"
@@ -266,9 +278,11 @@ def process_single_batch(batch_images, batch_index, api_key, start_page_idx):
                     full_b = img_to_bytes(src)
                     
                     if 'box_2d' in item: 
-                        img_b = crop_image(src, item['box_2d'])
+                        # [確認]: 使用 force_full_width=True 確保寬度正確
+                        img_b = crop_image(src, item['box_2d'], force_full_width=True, padding_y=10)
                     
                     if 'full_question_box_2d' in item:
+                        # 參考圖原本就是全寬，且上下緩衝較大 (150)
                         ref_b = crop_image(src, item['full_question_box_2d'], True, 150)
                     else:
                         ref_b = full_b
