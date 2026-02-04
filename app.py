@@ -19,7 +19,7 @@ except ImportError as e:
     st.stop()
 
 # 標記修復版本
-LAST_UPDATED = "2026-02-03 00:05 (CST) [FIX: Reset Button Logic + Auto Delete]"
+LAST_UPDATED = "2026-02-03 00:30 (CST) [FIX: Import Logic - Keep File, Clear AI Cache]"
 
 try:
     from streamlit_cropper import st_cropper 
@@ -520,12 +520,16 @@ with tab_review:
                         count += 1
                         progress.progress((idx+1)/total)
                     
-                    # [新增] 匯入完成後，刪除檔案紀錄
-                    cloud_manager.delete_file_record(sel_file['id'])
+                    # [修正邏輯]: 匯入完成後，清除 AI 的暫存結果 (Batches/Results)，但保留檔案紀錄
+                    # 使用 clean_old_batch_data 清除舊資料，確保檔案紀錄乾淨，等待下次可能的重新辨識
+                    cloud_manager.clean_old_batch_data(sel_file['id'])
+                    
+                    # 將檔案狀態更新為「已匯入」
+                    cloud_manager.update_file_status(sel_file['id'], "已匯入")
                     
                     del st.session_state['review_data_cache']
                     st.session_state['current_review_file_id'] = None
-                    st.success(f"匯入 {count} 題並已自動刪除暫存檔！"); time.sleep(2); st.rerun()
+                    st.success(f"匯入 {count} 題並已自動清除 AI 暫存資料！"); time.sleep(2); st.rerun()
 
 # === Tab 4: 題庫 ===
 with tab_bank:
