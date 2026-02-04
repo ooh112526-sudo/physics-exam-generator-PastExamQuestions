@@ -197,7 +197,7 @@ def process_single_batch(batch_images, batch_index, api_key, start_page_idx):
         
         # [核心修改] 整合「題組結構」與「填滿間隙」的 Prompt
         prompt = f"""
-        請分析圖片中的高中物理試題，並將其轉為 JSON 格式。
+        你是一個高中物理題庫分析專家，請分析圖片中的高中物理試題，並將其轉為 JSON 格式。
         
         【重要規則：題組處理】
         1. 辨識題型：
@@ -214,8 +214,8 @@ def process_single_batch(batch_images, batch_index, api_key, start_page_idx):
 
         4. box_2d 為圖片範圍 (0-1000)：
            - 垂直範圍(y1, y2)需「最大化」以填滿題目間的空隙。
-           - y1(上界)應緊接在上一題的結束處(或頁首)。
-           - y2(下界)應緊接在下一題的開始處(或頁尾)。
+           - y1(上界)應緊接在上一題的結束的最後一行(選項E)。
+           - y2(下界)應緊接在下一題的開始的第一行。
            - 嚴禁切到鄰近題目的文字。
            - Group 母題：框選整個題組範圍（含文章與所有子題）。
 
@@ -307,3 +307,4 @@ def process_single_batch(batch_images, batch_index, api_key, start_page_idx):
         return processed, None
 
     except Exception as e: return None, str(e)
+
