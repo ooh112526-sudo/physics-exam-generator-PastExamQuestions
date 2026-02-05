@@ -195,41 +195,44 @@ def process_single_batch(batch_images, batch_index, api_key, start_page_idx):
         genai.configure(api_key=api_key)
         chapters_str = "\n".join([c for c in PHYSICS_CHAPTERS_LIST if c != "未分類"])
         
-        # [核心修改] 整合「題組結構」與「填滿間隙」的 Prompt
+        # [核心修改] 優化 Prompt 以支援題組圖片歸屬與局部題號辨識
         prompt = f"""
         你是一個高中物理題庫分析專家，請分析圖片中的高中物理試題，並將其轉為 JSON 格式。
         
         【重要規則：題組處理】
         1. 辨識題型：
            - 一般題目：type 為 "Single" (單選), "Multi" (多選), "Fill" (填充)。
-           - 題組母題：當偵測到「第X-Y題為題組」或一段共用文章時，type 設為 "Group"。
+           - 題組母題：當偵測到「第X-Y題為題組」或「一段共用文章/圖片後接續數個小題」時，type 設為 "Group"。
         
         2. 題組 (Group) 的結構要求：
-           - content: 只放「題組說明」與「共用文章內容」。
+           - content: 包含「題組說明」、「共用文章」及「共用圖片描述」。
+             **關鍵規則：若圖片位於所有子題目之前，該圖片屬於母題 (content)，絕不可切給第一個子題。**
            - sub_questions: 必須是一個列表 (List)，包含該題組下的所有子題目。
            - 嚴禁將子題目文字直接合併在 content 裡，必須拆解。
 
         3. 子題目 (sub_questions) 內的物件結構：
            - 必須包含完整的: number (題號), type (題型), content (子題敘述), options (選項), answer (答案)。
+           - **針對 (1), (2) 這類局部題號：請將其文字保留在 content 中 (例如 "(1) 下列何者...")，number 欄位可依序填入整數。**
 
         4. box_2d 為試題圖片範圍 (0-1000)：包含題號、題目文字、選項與圖片的完整區域。請盡量寬鬆，包含到上一題結束與下一題開始的空白處。
            - 垂直範圍(y1, y2)需「最大化」以填滿題目間的空隙。
            - y1(上界)應緊接在上一題的結束的最後一行(選項E)。
            - y2(下界)應緊接在下一題的開始的第一行。
-           - Group 母題：框選整個題組範圍（含文章與所有子題）。
+           - **Group 母題：框選整個題組範圍（含文章、共用圖片與所有子題）。**
         5. 章節 (chapter): 選擇最接近的: {chapters_str}
+        
         【JSON 輸出範例】：
         [
             {{
                 "number": 1, "type": "Single", "content": "第一題...", "options": ["(A).."], "answer": "A", "box_2d": [...]
             }},
             {{
-                "number": 58, 
+                "number": 2, 
                 "type": "Group", 
-                "content": "第58-60題為題組\\n這是共用的文章內容...", 
+                "content": "兩塊質量不同的磁鐵... (這是共用題幹與圖片)", 
                 "sub_questions": [
-                    {{ "number": 58, "type": "Fill", "content": "子題1敘述...", "answer": "答案", "options": [] }},
-                    {{ "number": 59, "type": "Single", "content": "子題2敘述...", "options": ["(A)..", "(B).."], "answer": "B" }}
+                    {{ "number": 1, "type": "Single", "content": "(1) 下列哪一對...", "answer": "A", "options": ["(A).."] }},
+                    {{ "number": 2, "type": "Single", "content": "(2) 設重力加速度...", "options": ["(A)..", "(B).."], "answer": "E" }}
                 ],
                 "box_2d": [100, 0, 500, 1000],
                 "page_index": 0 
@@ -306,6 +309,3 @@ def process_single_batch(batch_images, batch_index, api_key, start_page_idx):
         return processed, None
 
     except Exception as e: return None, str(e)
-
-
-
