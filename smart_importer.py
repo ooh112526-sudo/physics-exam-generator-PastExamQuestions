@@ -35,9 +35,9 @@ PHYSICS_CHAPTERS_LIST = [
     "未分類", 
     "第一章.科學的態度與方法", 
     "第二章.物體的運動", 
-    "第三章. 物質的組成與交互作用",
+    "第三章.物質的組成與交互作用",
     "第四章.電與磁的統一", 
-    "第五章. 能　量", 
+    "第五章.能量", 
     "第六章.量子現象"
 ]
 
@@ -194,49 +194,52 @@ def process_single_batch(batch_images, batch_index, api_key, start_page_idx):
     try:
         genai.configure(api_key=api_key)
         chapters_str = "\n".join([c for c in PHYSICS_CHAPTERS_LIST if c != "未分類"])
-        
-        # [核心修改] 優化 Prompt 以支援「全域題號」與「簡答題」的題組辨識
+
+        # [核心修改] 優化 Prompt 以支援題組圖片歸屬與局部題號辨識
         prompt = f"""
         你是一個高中物理題庫分析專家，請分析圖片中的高中物理試題，並將其轉為 JSON 格式。
         
-        【關鍵任務：精準辨識題組結構】
-        1. 偵測題組 (Group)：
-           - 當看到「第X-Y題為題組」或「X-Y題為題組」時，這是一個 Group 母題。
-           - 題組範圍：從標題開始，包含共用文章、共用圖片，直到**第一個子題題號**出現之前，都屬於母題的 content。
+        【重要規則：題組處理】
+        1. 辨識題型：
+           - 一般題目：type 為 "Single" (單選), "Multi" (多選), "Fill" (填充)。
+           - 題組母題：當偵測到「第X-Y題為題組」或「一段共用文章/圖片後接續數個小題」時，type 設為 "Group"。
         
-        2. 處理子題目 (sub_questions) - 這是最容易出錯的地方，請仔細執行：
-           - **情況 A (全域題號)**：若標題是「40-42題為題組」，則必須在下方尋找 **40.**, **41.**, **42.** 開頭的段落。這些就是子題目，**嚴禁**將它們合併到母題內容中。
-           - **情況 B (局部題號)**：若標題無具體題號，或子題以 (1), (2) 開頭，則以 (1), (2) 為子題目。
-           - **絕對禁止**遺漏子題目。若標題說 40-42，sub_questions 列表裡必須要有 3 個物件 (40, 41, 42)。
+        2. 題組 (Group) 的結構要求：
+           - content: 包含「題組說明」、「共用文章」及「共用圖片描述」。
+             **關鍵規則：若圖片位於所有子題目之前，該圖片屬於母題 (content)，絕不可切給第一個子題。**
+           - sub_questions: 必須是一個列表 (List)，包含該題組下的所有子題目。
+           - 嚴禁將子題目文字直接合併在 content 裡，必須拆解。
 
-        3. 圖片歸屬規則：
-           - 若圖片位於所有子題題號之前 --> 歸屬母題 (content)。
-           - 若圖片位於特定子題文字之間 --> 歸屬該子題。
-           - **針對並排圖片：如圖15、圖16位於文字下方、第40題上方，因此這兩張圖屬於母題 content。**
+        3. 子題目 (sub_questions) 內的物件結構：
+           - 必須包含完整的: number (題號), type (題型), content (子題敘述), options (選項), answer (答案)。
+           - **針對 (1), (2) 這類局部題號：請將其文字保留在 content 中 (例如 "(1) 下列何者...")，number 欄位可依序填入整數。**
 
-        4. 輸出格式要求 (JSON)：
-           - Group 母題：type="Group", content="共用文案...", sub_questions=[...]
-           - 子題目：type="Single"(有選項)/"Multi"(多選)/"Fill"(無選項/簡答/計算/作圖), number=題號(整數), content="題目敘述", options=[], answer=""
-           - box_2d: 母題框選包含所有子題的大範圍；子題框選各自範圍。
-
+        4. box_2d 為試題圖片範圍 (0-1000)：包含題號、題目文字、選項與圖片的完整區域。請盡量寬鬆，包含到上一題結束與下一題開始的空白處。
+           - 垂直範圍(y1, y2)需「最大化」以填滿題目間的空隙。
+           - y1(上界)應緊接在上一題的結束的最後一行(選項E)。
+           - y2(下界)應緊接在下一題的開始的第一行。
+           - **Group 母題：框選整個題組範圍（含文章、共用圖片與所有子題）。**
         5. 章節 (chapter): 選擇最接近的: {chapters_str}
-
-        【JSON 輸出範例 - 全域題號題組】：
+        
+        【JSON 輸出範例】：
         [
             {{
-                "number": 40, 
+                "number": 1, "type": "Single", "content": "第一題...", "options": ["(A).."], "answer": "A", "box_2d": [...]
+            }},
+            {{
+                "number": 2, 
                 "type": "Group", 
-                "content": "40-42題為題組\\n19世紀末實驗發現... (包含圖15, 圖16)", 
+                "content": "兩塊質量不同的磁鐵... (這是共用題幹與圖片)", 
                 "sub_questions": [
-                    {{ "number": 40, "type": "Single", "content": "40. 有一紅光雷射...", "options": ["(A)...", "(E)..."], "answer": "A" }},
-                    {{ "number": 41, "type": "Fill", "content": "41. 如圖15...", "options": [], "answer": "" }},
-                    {{ "number": 42, "type": "Fill", "content": "42. 圖16為光電效應...", "options": [], "answer": "" }}
+                    {{ "number": 1, "type": "Single", "content": "(1) 下列哪一對...", "answer": "A", "options": ["(A).."] }},
+                    {{ "number": 2, "type": "Single", "content": "(2) 設重力加速度...", "options": ["(A)..", "(B).."], "answer": "E" }}
                 ],
-                "box_2d": [100, 0, 900, 1000]
+                "box_2d": [100, 0, 500, 1000],
+                "page_index": 0 
             }}
         ]
         """
-        
+           
         # 指定使用 Gemini 3.0 系列與 2.5 系列
         models = ["gemini-3.0-pro", "gemini-3.0-flash", "gemini-2.5-pro", "gemini-2.5-flash"]
         response = None
@@ -306,3 +309,5 @@ def process_single_batch(batch_images, batch_index, api_key, start_page_idx):
         return processed, None
 
     except Exception as e: return None, str(e)
+
+
