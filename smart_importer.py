@@ -35,9 +35,9 @@ PHYSICS_CHAPTERS_LIST = [
     "未分類", 
     "第一章.科學的態度與方法", 
     "第二章.物體的運動", 
-    "第三章. 物質的組成與交互作用",
+    "第三章.物質的組成與交互作用",
     "第四章.電與磁的統一", 
-    "第五章. 能　量", 
+    "第五章.能量", 
     "第六章.量子現象"
 ]
 
@@ -194,7 +194,7 @@ def process_single_batch(batch_images, batch_index, api_key, start_page_idx):
     try:
         genai.configure(api_key=api_key)
         chapters_str = "\n".join([c for c in PHYSICS_CHAPTERS_LIST if c != "未分類"])
-        
+
         # [核心修改] 優化 Prompt 以支援題組圖片歸屬與局部題號辨識
         prompt = f"""
         你是一個高中物理題庫分析專家，請分析圖片中的高中物理試題，並將其轉為 JSON 格式。
@@ -239,7 +239,7 @@ def process_single_batch(batch_images, batch_index, api_key, start_page_idx):
             }}
         ]
         """
-        
+           
         # 指定使用 Gemini 3.0 系列與 2.5 系列
         models = ["gemini-3.0-pro", "gemini-3.0-flash", "gemini-2.5-pro", "gemini-2.5-flash"]
         response = None
@@ -309,3 +309,6 @@ def process_single_batch(batch_images, batch_index, api_key, start_page_idx):
         return processed, None
 
     except Exception as e: return None, str(e)
+
+
+
