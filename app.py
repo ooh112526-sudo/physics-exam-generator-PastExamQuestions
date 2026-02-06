@@ -7,7 +7,6 @@ import os
 import base64
 import uuid
 from PIL import Image
-
 # 匯入分離後的模組
 try:
     from cloud_service import CloudManager
@@ -17,36 +16,28 @@ try:
 except ImportError as e:
     st.error(f"模組匯入失敗: {e}")
     st.stop()
-
 # 標記修復版本
-LAST_UPDATED = "2026-02-05 01:30 (CST) [FIX: Cache Invalidation on Re-ID]"
-
+LAST_UPDATED = "2026-02-05 02:45 (CST) [FIX: Group Sub-question UI]"
 try:
     from streamlit_cropper import st_cropper 
 except: st_cropper = None 
-
 st.set_page_config(page_title="物理題庫系統 (Pro)", layout="wide", page_icon="🧲")
-
 TYPE_MAP_ZH_TO_EN = {"單選": "Single", "多選": "Multi", "填充": "Fill", "題組": "Group"}
 TYPE_MAP_EN_TO_ZH = {v: k for k, v in TYPE_MAP_ZH_TO_EN.items()}
 TYPE_OPTIONS = ["單選", "多選", "填充", "題組"]
-
 cloud_manager = CloudManager()
-
 if 'question_pool' not in st.session_state:
     st.session_state['question_pool'] = []
     try:
         data = cloud_manager.load_questions()
         if data: st.session_state['question_pool'] = [Question.from_dict(d) for d in data]
     except: pass
-
 if 'file_queue' not in st.session_state: st.session_state['file_queue'] = {}
 if 'upload_configs' not in st.session_state: st.session_state['upload_configs'] = {}
 if 'review_page' not in st.session_state: st.session_state['review_page'] = 0
 if 'review_data_cache' not in st.session_state: st.session_state['review_data_cache'] = None
 if 'current_review_file_id' not in st.session_state: st.session_state['current_review_file_id'] = None
 if 'selected_export_ids' not in st.session_state: st.session_state['selected_export_ids'] = set()
-
 def ensure_b64(item, key_prefix):
     """
     確保從 URL 或 Blob Name 載入 Base64 圖片數據 (Lazy Loading)
@@ -77,11 +68,10 @@ def ensure_b64(item, key_prefix):
                 return b64
         except: pass
     return None
-
 def sync_page_data(items_per_page):
     """
     [關鍵修復] 切換頁面或匯入前，將 Widget 的當前值寫回 session_state 的資料緩存中。
-    避免換頁後資料遺失。
+    包含題組內子題的遞迴儲存邏輯。
     """
     if not st.session_state.get('review_data_cache'): return
     
@@ -93,22 +83,41 @@ def sync_page_data(items_per_page):
         item = current_data[i]
         k = item['ui_key']
         
-        # 同步題目內容
+        # 1. 同步母題資料
         if f"c_{k}" in st.session_state: item['content'] = st.session_state[f"c_{k}"]
-        # 同步答案
-        if f"a_{k}" in st.session_state: item['answer'] = st.session_state[f"a_{k}"]
-        # 同步選項
-        if f"o_{k}" in st.session_state:
-            opts_txt = st.session_state[f"o_{k}"]
-            item['options'] = opts_txt.split('\n') if opts_txt.strip() else []
-        # 同步類型
         if f"t_{k}" in st.session_state: 
             item['type'] = TYPE_MAP_ZH_TO_EN.get(st.session_state[f"t_{k}"], "Single")
-        # 同步章節
         if f"ch_{k}" in st.session_state: item['chapter'] = st.session_state[f"ch_{k}"]
-        # 同步是否使用圖片
         if f"uimg_{k}" in st.session_state: item['use_image'] = st.session_state[f"uimg_{k}"]
-
+        # 2. 分流處理
+        if item['type'] != 'Group':
+            # 非題組：同步答案與選項
+            if f"a_{k}" in st.session_state: item['answer'] = st.session_state[f"a_{k}"]
+            if f"o_{k}" in st.session_state:
+                opts_txt = st.session_state[f"o_{k}"]
+                item['options'] = opts_txt.split('\n') if opts_txt.strip() else []
+        else:
+            # 題組：同步子題資料
+            if 'sub_questions' in item and item['sub_questions']:
+                for idx, sub in enumerate(item['sub_questions']):
+                    sub_k = f"{k}_{idx}" # 子題的 unique key
+                    
+                    # 子題類型
+                    if f"st_{sub_k}" in st.session_state:
+                        sub['type'] = TYPE_MAP_ZH_TO_EN.get(st.session_state[f"st_{sub_k}"], "Single")
+                    
+                    # 子題內容
+                    if f"sc_{sub_k}" in st.session_state:
+                        sub['content'] = st.session_state[f"sc_{sub_k}"]
+                        
+                    # 子題答案
+                    if f"sa_{sub_k}" in st.session_state:
+                        sub['answer'] = st.session_state[f"sa_{sub_k}"]
+                        
+                    # 子題選項 (若非填充)
+                    if f"so_{sub_k}" in st.session_state:
+                        opts_txt = st.session_state[f"so_{sub_k}"]
+                        sub['options'] = opts_txt.split('\n') if opts_txt.strip() else []
 # ==========================================
 # Batch Job Runner (AI 處理核心)
 # ==========================================
@@ -132,11 +141,9 @@ def run_pending_batch(file_record, api_key):
             if not file_bytes:
                 cloud_manager.save_batch_result(file_id, batch_idx, None, "error", "檔案下載失敗")
                 return True
-
             ftype = 'pdf'
             if fname.lower().endswith('.docx'):
                 ftype = 'docx'
-
             batch_imgs, err = smart_importer.convert_file_to_images(
                 file_bytes, 
                 ftype, 
@@ -148,7 +155,6 @@ def run_pending_batch(file_record, api_key):
                 status = "done" if not err else "error"
                 cloud_manager.save_batch_result(file_id, batch_idx, [], status, err or "無圖片")
                 return True
-
             candidates, error = smart_importer.process_single_batch(batch_imgs, batch_idx, api_key, start_page)
             if error:
                 cloud_manager.save_batch_result(file_id, batch_idx, None, "error", error)
@@ -158,12 +164,10 @@ def run_pending_batch(file_record, api_key):
             cloud_manager.save_batch_result(file_id, batch_idx, None, "error", f"System Error: {str(e)}")
             
     return True 
-
 # ==========================================
 # UI 介面
 # ==========================================
 st.title("🧲 物理題庫系統 Pro (Cloud Storage)")
-
 with st.sidebar:
     st.header("設定")
     env_api_key = os.getenv("GOOGLE_API_KEY", "")
@@ -175,9 +179,7 @@ with st.sidebar:
         for q in st.session_state['question_pool']: cloud_manager.save_question(q.to_dict())
         st.success("已儲存")
     st.caption(f"🚀 Last Updated: {LAST_UPDATED}")
-
 tab_upload, tab_files, tab_review, tab_bank = st.tabs(["🧠 考古題上傳", "📂 檔案管理與辨識", "📝 AI匯入校對", "📚 題庫管理與輸出"])
-
 # === Tab 1: 考古題上傳 ===
 with tab_upload:
     st.markdown("### 📤 上傳新考古題")
@@ -188,7 +190,6 @@ with tab_upload:
         for f in uploaded_files:
             if f.name not in st.session_state['upload_configs']:
                 st.session_state['upload_configs'][f.name] = {"type": "學測", "year": "112", "exam_no": "正式考試"}
-
         with st.expander("⚡ 批次設定"):
             c1, c2, c3, c4 = st.columns(4)
             with c1: b_type = st.selectbox("統一類型", ["學測", "分科", "北模", "中模", "全模", "其他"], key="batch_type")
@@ -199,7 +200,6 @@ with tab_upload:
                     for f in uploaded_files:
                         st.session_state['upload_configs'][f.name] = {"type": b_type, "year": b_year, "exam_no": b_exam_no}
                     st.toast("已套用！")
-
         files_to_process = []
         has_dup = False
         st.markdown("---")
@@ -227,7 +227,6 @@ with tab_upload:
                     st.session_state['upload_configs'][f.name]['exam_no'] = new_no
             files_to_process.append({"file": f, "name": new_fname, "config": st.session_state['upload_configs'][f.name]})
             st.divider()
-
         btn_txt = "確認並覆蓋上傳" if has_dup else "確認上傳"
         if st.button(btn_txt, type="primary"):
             prog = st.progress(0)
@@ -245,7 +244,6 @@ with tab_upload:
                 cloud_manager.save_file_record(rec, overwrite_id=old['id'] if old else None)
                 prog.progress((idx+1)/len(files_to_process))
             st.success("上傳完成！"); st.session_state['upload_configs'] = {}; time.sleep(1); st.rerun()
-
 # === Tab 2: 檔案管理 ===
 with tab_files:
     st.subheader("📂 檔案庫與 AI 處理狀態")
@@ -271,7 +269,6 @@ with tab_files:
                     st.markdown(f"&nbsp;&nbsp;&nbsp;&nbsp;📂 **{fyear} 年度**", unsafe_allow_html=True)
                     files_in_year = tree[ftype][fyear]
                     files_in_year.sort(key=lambda f: exam_order.get(f.get('exam_no'), 99))
-
                     for f in files_in_year:
                         status = f.get('ai_status', '未辨識')
                         
@@ -285,7 +282,6 @@ with tab_files:
                                     cloud_manager.update_file_status(f['id'], new_status)
                                     status = new_status
                                     st.rerun()
-
                         icon = {"已辨識": "✅", "處理中": "🔄", "部分失敗": "⚠️", "已匯入": "📥"}.get(status, "⬜")
                         
                         col_file, col_batches, col_action = st.columns([3, 4, 2])
@@ -293,7 +289,6 @@ with tab_files:
                         with col_file:
                             st.markdown(f"&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;📄 {icon} **{f.get('filename')}**")
                             st.caption(f"狀態: {status}")
-
                         with col_batches:
                             if status not in ["未辨識"]:
                                 batches = cloud_manager.get_processing_status(f['id'])
@@ -320,7 +315,6 @@ with tab_files:
                                                         cloud_manager.reset_batch_status(f['id'], b_idx)
                                                         cloud_manager.update_file_status(f['id'], "處理中")
                                                         st.rerun()
-
                         with col_action:
                             btn_col_main, btn_col_del = st.columns([3, 1])
                             with btn_col_main:
@@ -349,7 +343,6 @@ with tab_files:
                                                 else: status_ph.error("❌ 頁數錯誤")
                                             else: status_ph.error("❌ 下載失敗")
                                         except Exception as e: status_ph.error(f"❌ {e}")
-
                                 elif status == "處理中":
                                     st.caption("⚡ 處理中...") 
                                     if run_pending_batch(f, api_key_input): 
@@ -379,17 +372,14 @@ with tab_files:
                                         # [FIX] 強制清除校對頁面的快取指標，強迫 Tab 3 重新載入新資料
                                         st.session_state['current_review_file_id'] = None
                                         st.rerun()
-
                             with btn_col_del:
                                 if st.button("🗑️", key=f"d_{f['id']}", use_container_width=True):
                                     cloud_manager.delete_file_record(f['id']); st.rerun()
-
                     st.markdown("<hr style='margin: 5px 0; border-top: 1px dashed #ddd;'>", unsafe_allow_html=True)
-
 # === Tab 3: 校對 ===
 with tab_review:
     st.subheader("📝 匯入校對與編輯")
-    ready_files = [f for f in files if f.get('ai_status') in ["已辨識", "部分失敗", "已匯入"]] # 允許已匯入的檔案再次檢視
+    ready_files = [f for f in files if f.get('ai_status') in ["已辨識", "部分失敗", "已匯入"]]  # 允許已匯入的檔案再次檢視
     if not ready_files: st.info("暫無可校對的檔案。")
     else:
         file_names = [f['filename'] for f in ready_files]
@@ -401,7 +391,7 @@ with tab_review:
                 results_data = cloud_manager.load_all_ai_results(sel_file['id'])
                 for res in results_data:
                     if 'ui_key' not in res: res['ui_key'] = str(uuid.uuid4())
-                    if 'use_image' not in res: res['use_image'] = False # 預設不使用截圖
+                    if 'use_image' not in res: res['use_image'] = False 
                 st.session_state['review_data_cache'] = results_data
                 st.session_state['current_review_file_id'] = sel_file['id']
                 st.session_state['review_page'] = 0
@@ -417,17 +407,16 @@ with tab_review:
             with c_info: st.caption(f"第 {st.session_state['review_page'] + 1} / {total_pages} 頁")
             with c_prev: 
                 if st.button("◀", disabled=(st.session_state['review_page']==0)): 
-                    sync_page_data(ITEMS_PER_PAGE) # (3) 換頁前暫存
+                    sync_page_data(ITEMS_PER_PAGE) # (3) 換頁前暫存 
                     st.session_state['review_page'] -= 1
                     st.rerun()
             with c_next: 
                 if st.button("▶", disabled=(st.session_state['review_page']>=total_pages-1)): 
-                    sync_page_data(ITEMS_PER_PAGE) # (3) 換頁前暫存
+                    sync_page_data(ITEMS_PER_PAGE) # (3) 換頁前暫存 
                     st.session_state['review_page'] += 1
                     st.rerun()
             st.divider()
-
-            start_idx = st.session_state['review_page'] * ITEMS_PER_PAGE
+            start_idx = st.session_state['review_page'] * ITEMS_PER_PAGE 
             # 注意：這裡使用切片，但我們需要知道真實 index 以便刪除
             current_page_indices = range(start_idx, min(start_idx + ITEMS_PER_PAGE, len(all_results)))
             
@@ -440,27 +429,66 @@ with tab_review:
                         # (4) 刪除按鈕與確認機制
                         col_title, col_del = st.columns([8, 2])
                         with col_title:
-                            st.markdown(f"#### 第 {res.get('number', real_idx+1)} 題")
+                            # 顯示題號 (若為題組則顯示範圍，例如 40~42)
+                            display_num = res.get('number', real_idx+1)
+                            st.markdown(f"#### 第 {display_num} 題")
                         with col_del:
                             with st.popover("🗑️ 刪除", help="刪除此題"):
                                 st.warning("刪除後不可回復，確認刪除此題嗎？")
                                 if st.button("確認刪除", key=f"del_conf_{res['ui_key']}", type="primary"):
-                                    sync_page_data(ITEMS_PER_PAGE) # 刪除前先同步其他題目，避免遺失
+                                    sync_page_data(ITEMS_PER_PAGE) # 刪除前先同步其他題目，避免遺失 
                                     all_results.pop(real_idx)
                                     st.session_state['review_data_cache'] = all_results
                                     st.rerun()
-
+                        # 1. 母題資料編輯
                         curr_type = TYPE_MAP_EN_TO_ZH.get(res.get('type'), "單選")
                         new_type = st.selectbox(f"題型", TYPE_OPTIONS, index=TYPE_OPTIONS.index(curr_type) if curr_type in TYPE_OPTIONS else 0, key=f"t_{res['ui_key']}")
                         res['type'] = TYPE_MAP_ZH_TO_EN[new_type]
-                        res['content'] = st.text_area("題目內容", res.get('content', ''), height=100, key=f"c_{res['ui_key']}")
+                        
+                        label_content = "母題內容 (題組文章/共用資訊)" if res['type'] == "Group" else "題目內容"
+                        res['content'] = st.text_area(label_content, res.get('content', ''), height=120, key=f"c_{res['ui_key']}")
+                        
+                        curr_chap = res.get('chapter', '未分類')
+                        res['chapter'] = st.selectbox("章節", smart_importer.PHYSICS_CHAPTERS_LIST, index=smart_importer.PHYSICS_CHAPTERS_LIST.index(curr_chap) if curr_chap in smart_importer.PHYSICS_CHAPTERS_LIST else 0, key=f"ch_{res['ui_key']}")
+                        # 2. 判斷是否為題組，動態顯示介面
                         if res['type'] != "Group":
+                            # === 一般題目 (Single/Multi/Fill) ===
                             opts = st.text_area("選項", "\n".join(res.get('options', [])), height=80, key=f"o_{res['ui_key']}")
                             res['options'] = opts.split('\n') if opts.strip() else []
                             res['answer'] = st.text_input("答案", res.get('answer', ''), key=f"a_{res['ui_key']}")
-                        curr_chap = res.get('chapter', '未分類')
-                        res['chapter'] = st.selectbox("章節", smart_importer.PHYSICS_CHAPTERS_LIST, index=smart_importer.PHYSICS_CHAPTERS_LIST.index(curr_chap) if curr_chap in smart_importer.PHYSICS_CHAPTERS_LIST else 0, key=f"ch_{res['ui_key']}")
-
+                        
+                        else:
+                            # === 題組 (Group) 子題編輯區 ===
+                            st.markdown("---")
+                            st.markdown("##### 📂 題組子題列表")
+                            
+                            sub_qs = res.get('sub_questions', [])
+                            if not sub_qs: st.warning("此題組目前沒有子題。")
+                            
+                            for idx, sub in enumerate(sub_qs):
+                                sub_key = f"{res['ui_key']}_{idx}"
+                                
+                                with st.expander(f"子題 {idx+1}. (第 {sub.get('number', idx+1)} 題)", expanded=True):
+                                    c_sub_1, c_sub_2 = st.columns([1, 3])
+                                    
+                                    # 子題題型
+                                    sub_curr_type = TYPE_MAP_EN_TO_ZH.get(sub.get('type'), "單選")
+                                    # 避免 index error
+                                    sub_type_idx = TYPE_OPTIONS.index(sub_curr_type) if sub_curr_type in TYPE_OPTIONS else 0
+                                    sub_new_type = c_sub_1.selectbox("類型", TYPE_OPTIONS, index=sub_type_idx, key=f"st_{sub_key}")
+                                    sub['type'] = TYPE_MAP_ZH_TO_EN[sub_new_type]
+                                    
+                                    # 子題答案
+                                    sub['answer'] = c_sub_2.text_input("答案", sub.get('answer', ''), key=f"sa_{sub_key}")
+                                    
+                                    # 子題內容
+                                    sub['content'] = st.text_area("題目敘述", sub.get('content', ''), height=60, key=f"sc_{sub_key}")
+                                    
+                                    # 子題選項 (若非填充)
+                                    if sub['type'] != "Fill":
+                                        sub_opts_str = "\n".join(sub.get('options', []))
+                                        new_sub_opts = st.text_area("選項 (每行一個)", sub_opts_str, height=80, key=f"so_{sub_key}")
+                                        sub['options'] = new_sub_opts.split('\n') if new_sub_opts.strip() else []
                     with col_img:
                         # (2) 圖片模式與使用開關
                         st.markdown("**圖片設定**")
@@ -472,11 +500,11 @@ with tab_review:
                             # 嘗試從備份還原 (如果之前被手動裁切覆蓋過)
                             backup_b64 = ensure_b64(res, 'ai_crop_backup')
                             if backup_b64:
-                                res['image_b64'] = backup_b64 # 恢復顯示 AI 截圖
+                                res['image_b64'] = backup_b64 # 恢復顯示 AI 截圖 
                                 
                             target_b64 = ensure_b64(res, 'image')
                             if target_b64: 
-                                st.image(base64.b64decode(target_b64), caption="AI 自動截取範圍")
+                                st.image(base64.b64decode(target_b64), caption="AI 自動截取範圍 (題組共用大圖)")
                             else: 
                                 st.info("無 AI 截圖")
                         else:
@@ -491,9 +519,8 @@ with tab_review:
                                     res['ref_image_url'] = None 
                             else: st.warning("無法載入整頁圖")
                 st.divider()
-
             if st.button("🚀 確認匯入題庫", type="primary", use_container_width=True):
-                sync_page_data(ITEMS_PER_PAGE) # (3) 匯入前最後一次同步
+                sync_page_data(ITEMS_PER_PAGE) # (3) 匯入前最後一次同步 
                 with st.spinner("匯入中..."):
                     count = 0
                     total = len(all_results)
@@ -518,23 +545,21 @@ with tab_review:
                             options=item.get('options', []), answer=item.get('answer', ''),
                             chapter=item.get('chapter', '未分類'), source=sel_file['filename'],
                             image_data=img_data, image_url=final_url if not img_data else None,
+                            # 確保子題也被正確轉換
                             sub_questions=[Question.from_dict(sq) for sq in item.get('sub_questions', [])] if item.get('sub_questions') else []
                         )
                         cloud_manager.save_question(q.to_dict())
                         count += 1
                         progress.progress((idx+1)/total)
-                    
-                    # [修正邏輯]: 匯入完成後，清除 AI 的暫存結果 (Batches/Results)，但保留檔案紀錄
-                    # 使用 clean_old_batch_data 清除舊資料，確保檔案紀錄乾淨，等待下次可能的重新辨識
+                     # [修正邏輯]: 匯入完成後，清除 AI 的暫存結果 (Batches/Results)，但保留檔案紀錄
+                     # 使用 clean_old_batch_data 清除舊資料，確保檔案紀錄乾淨，等待下次可能的重新辨識
                     cloud_manager.clean_old_batch_data(sel_file['id'])
-                    
                     # 將檔案狀態更新為「已匯入」
                     cloud_manager.update_file_status(sel_file['id'], "已匯入")
-                    
+ 
                     del st.session_state['review_data_cache']
                     st.session_state['current_review_file_id'] = None
                     st.success(f"匯入 {count} 題並已自動清除 AI 暫存資料！"); time.sleep(2); st.rerun()
-
 # === Tab 4: 題庫 ===
 with tab_bank:
     st.subheader("📚 題庫管理與試卷輸出")
@@ -555,7 +580,6 @@ with tab_bank:
                     b1, b2 = st.columns(2)
                     with b1: st.download_button("📄 下載試題", d_ex, "exam.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
                     with b2: st.download_button("📝 下載詳解", d_ans, "ans.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
-
         st.divider()
         qs_by_source = {}
         for q in all_qs:
