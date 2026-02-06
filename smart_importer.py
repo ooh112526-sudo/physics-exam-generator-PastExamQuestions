@@ -190,7 +190,7 @@ def process_single_batch(batch_images, batch_index, api_key, start_page_idx):
         genai.configure(api_key=api_key)
         chapters_str = "\n".join([c for c in PHYSICS_CHAPTERS_LIST if c != "未分類"])
         
-        # [核心 Prompt V3]: 整合四種模式判斷與全域大圖截圖邏輯、修正截圖座標邏輯與科目過濾
+        # [核心 Prompt V4]: 強制 AI 回傳 page_index 解決截圖錯誤問題
         prompt = f"""
         你是一個高中物理題庫分析專家，請分析圖片中的高中物理試題，並將其轉為 JSON 格式。
         
@@ -198,13 +198,13 @@ def process_single_batch(batch_images, batch_index, api_key, start_page_idx):
         - 僅提取「物理科」題目。
         - 若遇到化學、生物、地科題目，請直接跳過，不要輸出到 JSON。
         
-        【任務 2：物理題型精準辨識與結構化 (Structure)】
+        【任務 2：物理題型結構化 (Structure)】
         請依照以下優先順序判斷每一題的模式：
         
         **優先層級 1：題組偵測 (Group Mode)**
-        - 觸發：標題含有「題組」、「X.~Y.題為題組、「閱讀下文」。
+        - 觸發：標題含有「題組」、「X.~Y.題為題組」、「閱讀下文」。
         - 結構：必須包含母題(標題/文章/圖片)與所有子題。
-        - **截圖規則 (重要)**：回傳一個包含「母題+所有子題」的全域大範圍 box_2d。母題與所有子題共用此 box_2d，不需切分。
+        - **截圖規則(重要)**：回傳一個包含「母題+所有子題」的全域大範圍 box_2d。母題與所有子題共用此 box_2d，不需切分。
         - **子題邏輯**：題組內的每一個子題，都必須獨立判斷是 Single/Multi/Fill。
         
         **優先層級 2：單一題型判斷 (Standalone Mode)**
@@ -220,7 +220,13 @@ def process_single_batch(batch_images, batch_index, api_key, start_page_idx):
           - 上界 (Top)：包含題目文字上方到「上一個視覺元素(可能是化學題或其他物理題)」結束處的空白。
           - 下界 (Bottom)：包含題目文字/選項下方到「下一個視覺元素」開始處的空白。
           - **注意**：即使上一題是化學題（被你跳過了），本題的截圖範圍仍應向上延伸至該化學題的邊界，確保不切到本題文字。
-        - **題組**：box_2d 必須包覆整個題組區塊 (母題+子題)。
+          - **題組**：box_2d 必須包覆整個題組區塊 (母題+子題)。
+
+        【任務 4：圖片索引 (Page Index) - 關鍵】
+        - 因為一次輸入多張圖片，請務必標示該題目位於哪一張圖。
+        - **page_index**: 0 代表第一張圖, 1 代表第二張圖...以此類推。
+        - 若無此欄位，截圖將會錯誤。
+        
         【JSON 輸出範例 (Ground Truth)】
         
         // 案例 1: 單選題 (Single)
@@ -230,7 +236,8 @@ def process_single_batch(batch_images, batch_index, api_key, start_page_idx):
             "content": "3. 將ㄇ字型的光滑金屬軌道...",
             "options": ["(A) ...", "(B) ..."],
             "answer": "A",
-            "box_2d": [100, 0, 350, 1000] // 絕對座標，含上下空白
+            "box_2d": [100, 0, 350, 1000],// 絕對座標，含上下空白
+            "page_index": 0 // 位於第1張圖
         }}
         
         // 案例 2: 複選題 (Multi) - 假設第4題是化學題被跳過，故第5題從較下方開始
@@ -240,17 +247,19 @@ def process_single_batch(batch_images, batch_index, api_key, start_page_idx):
             "content": "5. 某分子最外層...有幾種可能的譜線？ (應選2項)",
             "options": ["(A) 10", "(B) 6", "(C) 4", "(D) 3", "(E) 1"],
             "answer": "AB",
-            "box_2d": [550, 0, 700, 1000] // 絕對座標，即使與上一題不連續
+            "box_2d": [550, 0, 700, 1000], // 絕對座標，即使與上一題不連續
+            "page_index": 0 // 位於第1張圖
         }}
         
-        // 案例 3: 填充/簡答題 (Fill)
+        // 案例 3: 填充/簡答題 (Fill) - 假設在下一頁
         {{
             "number": 41,
             "type": "Fill",
             "content": "41. 請說明...意義為何？(2分)",
             "options": [], // 無選項
             "answer": "",
-            "box_2d": [750, 0, 850, 1000] 
+            "box_2d": [100, 0, 250, 1000],
+            "page_index": 1 // 位於第2張圖
         }}
         
         // 案例 4: 題組 (Group) - 混合子題型
@@ -259,6 +268,7 @@ def process_single_batch(batch_images, batch_index, api_key, start_page_idx):
             "type": "Group",
             "content": "40-42題為題組\\n19世紀末實驗發現... (共用文章)",
             "box_2d": [100, 0, 600, 1000], // [重點] 母題+子題的大範圍
+            "page_index": 1, // 位於第2張圖
             "sub_questions": [
                 {{
                     "number": 40,
@@ -266,7 +276,8 @@ def process_single_batch(batch_images, batch_index, api_key, start_page_idx):
                     "content": "40. 有一紅光雷射...",
                     "options": ["(A)..."],
                     "answer": "A",
-                    "box_2d": [100, 0, 600, 1000] // 繼承母題 box_2d
+                    "box_2d": [100, 0, 600, 1000],// 繼承母題 box_2d
+                    "page_index": 1
                 }},
                 {{
                     "number": 41,
@@ -274,7 +285,8 @@ def process_single_batch(batch_images, batch_index, api_key, start_page_idx):
                     "content": "41. 請說明...",
                     "options": [],
                     "answer": "",
-                    "box_2d": [100, 0, 600, 1000] // 繼承母題 box_2d
+                    "box_2d": [100, 0, 600, 1000],// 繼承母題 box_2d
+                    "page_index": 1
                 }}
             ]
         }}
@@ -320,7 +332,9 @@ def process_single_batch(batch_images, batch_index, api_key, start_page_idx):
             # 圖片裁切
             img_b, ref_b, full_b = None, None, None
             try:
+                # [關鍵修正]: 優先使用 AI 回傳的 page_index，否則才預設為 0
                 idx = item.get('page_index', 0)
+                
                 if isinstance(idx, int) and 0 <= idx < len(batch_images):
                     src = batch_images[idx]
                     full_b = img_to_bytes(src)
