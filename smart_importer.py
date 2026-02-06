@@ -195,31 +195,51 @@ def process_single_batch(batch_images, batch_index, api_key, start_page_idx):
         genai.configure(api_key=api_key)
         chapters_str = "\n".join([c for c in PHYSICS_CHAPTERS_LIST if c != "未分類"])
 
-        # [核心修改] 優化 Prompt 以支援題組圖片歸屬與局部題號辨識
+        # [核心修改] 優化 Prompt 以支援題組圖片歸屬與局部題號辨識，強制切割全域題號
         prompt = f"""
         你是一個高中物理題庫分析專家，請分析圖片中的高中物理試題，並將其轉為 JSON 格式。
         
-        【重要規則：題組處理】
-        1. 辨識題型：
+        【重要規則：完美解析題組結構】
+        1. **辨識題型**：
            - 一般題目：type 為 "Single" (單選), "Multi" (多選), "Fill" (填充)。
            - 題組母題：當偵測到「第X-Y題為題組」或「一段共用文章/圖片後接續數個小題」時，type 設為 "Group"。
-        
-        2. 題組 (Group) 的結構要求：
-           - content: 包含「題組說明」、「共用文章」及「共用圖片描述」。
-             **關鍵規則：若圖片位於所有子題目之前，該圖片屬於母題 (content)，絕不可切給第一個子題。**
-           - sub_questions: 必須是一個列表 (List)，包含該題組下的所有子題目。
-           - 嚴禁將子題目文字直接合併在 content 裡，必須拆解。
+        2.完美解析題組結構：核心任務是正確區分「題組母題」與其「子題目」。
+            2-1. **偵測題組範圍 (Critical)**：
+           - 看到「第 40-42 題為題組」或「55-57為題組」時，代表這是一個 Group。
+           - 必須立即解析出子題編號範圍，例如 55-57 代表必須找到 55, 56, 57 三個子題。
 
-        3. 子題目 (sub_questions) 內的物件結構：
-           - 必須包含完整的: number (題號), type (題型), content (子題敘述), options (選項), answer (答案)。
-           - **針對 (1), (2) 這類局部題號：請將其文字保留在 content 中 (例如 "(1) 下列何者...")，number 欄位可依序填入整數。**
+            2-2. **母題內容 (Parent Content) 切割規則**：
+           - 母題 content 包含：標題、共用文章、共用圖片描述。
+           - **重要切割點**：content 必須在**第一個子題編號** (如 "40." 或 "55.") 出現之前**結束**。
+           - 嚴禁將第一個子題的文字 (例如 "55. 關於...") 包含在母題 content 中。
 
-        4. box_2d 為試題圖片範圍 (0-1000)：包含題號、題目文字、選項與圖片的完整區域。請盡量寬鬆，包含到上一題結束與下一題開始的空白處。
+            2-3. **子題目 (sub_questions) 提取規則**：
+           - 針對全域題號 (如 55-57)：你必須在文末找到 "55.", "56.", "57." 開頭的段落。
+           - 每一個子題必須獨立成為 sub_questions 列表中的一個物件。
+           - 每個子題物件需包含：number (如 55), type, content (如 "55. 題目..."), options, answer。
+          - **絕對禁止**：把 55, 56, 57 的內容全部合併在母題 content 裡，這是嚴重錯誤，請務必拆解。
+           - **絕對禁止**：遺漏任何一個子題。
+
+            2-4. **圖片歸屬判定**：
+           - 位於子題 55 之前的圖片 -> 屬於母題 content。
+           - 位於子題 55 與 56 之間的圖片 -> 屬於子題 55。
+           - 若圖片與某子題並排，且該子題無其他圖片需求，通常歸屬母題 (共用圖)。 
+
+            【正確範例】：
+        標題：55-57題為題組
+        內文：文章... (接續圖形)
+        55. 題目一...
+        56. 題目二...
+        57. 題目三...
+
+
+        3. box_2d 為試題圖片範圍 (0-1000)：包含題號、題目文字、選項與圖片的完整區域。請盡量寬鬆，包含到上一題結束與下一題開始的空白處。
            - 垂直範圍(y1, y2)需「最大化」以填滿題目間的空隙。
            - y1(上界)應緊接在上一題的結束的最後一行(選項E)。
            - y2(下界)應緊接在下一題的開始的第一行。
            - **Group 母題：框選整個題組範圍（含文章、共用圖片與所有子題）。**
-        5. 章節 (chapter): 選擇最接近的: {chapters_str}
+           
+        4. 章節 (chapter): 選擇最接近的: {chapters_str}
         
         【JSON 輸出範例】：
         [
@@ -227,15 +247,15 @@ def process_single_batch(batch_images, batch_index, api_key, start_page_idx):
                 "number": 1, "type": "Single", "content": "第一題...", "options": ["(A).."], "answer": "A", "box_2d": [...]
             }},
             {{
-                "number": 2, 
-                "type": "Group", 
-                "content": "兩塊質量不同的磁鐵... (這是共用題幹與圖片)", 
+                "number": 55,
+                "type": "Group",
+                "content": "55-57題為題組\\n文章內容...",
                 "sub_questions": [
-                    {{ "number": 1, "type": "Single", "content": "(1) 下列哪一對...", "answer": "A", "options": ["(A).."] }},
-                    {{ "number": 2, "type": "Single", "content": "(2) 設重力加速度...", "options": ["(A)..", "(B).."], "answer": "E" }}
+                    {{ "number": 55, "type": "Single", "content": "55. 題目一...", "options": [...] }},
+                    {{ "number": 56, "type": "Multi", "content": "56. 題目二...", "options": [...] }},
+                    {{ "number": 57, "type": "Fill", "content": "57. 題目三...", "options": [] }}
                 ],
-                "box_2d": [100, 0, 500, 1000],
-                "page_index": 0 
+                "box_2d": [母題含子題的大範圍] 
             }}
         ]
         """
@@ -309,5 +329,3 @@ def process_single_batch(batch_images, batch_index, api_key, start_page_idx):
         return processed, None
 
     except Exception as e: return None, str(e)
-
-
