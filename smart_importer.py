@@ -200,7 +200,7 @@ def process_single_batch(batch_images, batch_index, api_key, start_page_idx):
         請依照以下優先順序判斷每一題的模式：
         
         **優先層級 1：題組偵測 (Group Mode)**
-        - 觸發：標題含有「題組」、「X-Y題」、「閱讀下文」。
+        - 觸發：標題含有「題組」、「X.~Y.題為題組」、「閱讀下文」。
         - 結構：必須包含母題(標題/文章/圖片)與所有子題。
         - **截圖規則 (重要)**：回傳一個包含「母題+所有子題」的全域大範圍 box_2d。母題與所有子題共用此 box_2d，不需切分。
         - **子題邏輯**：題組內的每一個子題，都必須獨立判斷是 Single/Multi/Fill。
@@ -361,3 +361,4 @@ def process_single_batch(batch_images, batch_index, api_key, start_page_idx):
         return processed, None
 
     except Exception as e: return None, str(e)
+
