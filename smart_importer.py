@@ -113,13 +113,11 @@ def crop_image(original_img, box_2d, force_full_width=False, padding_y=10):
     # [核心修改] 全寬與空白填充邏輯 (Universal Screenshot Rule)
     # ymin/ymax 是 0-1000 的比例座標。
     # 策略：padding_y 用於確保上下留白，避免切字。
-    # 對於題組，此 box_2d 已經是包含母題+所有子題的大範圍。
     
     ymin = max(0, ymin - padding_y)
     ymax = min(1000, ymax + padding_y)
     
     # 強制全寬：左右直接切齊頁面邊緣 (0~1000)
-    # 這是您 "所有的AI截圖都是全寬" 的要求
     left, right = 0, width
     
     # 計算實際像素高度
@@ -192,15 +190,19 @@ def process_single_batch(batch_images, batch_index, api_key, start_page_idx):
         genai.configure(api_key=api_key)
         chapters_str = "\n".join([c for c in PHYSICS_CHAPTERS_LIST if c != "未分類"])
         
-        # [核心 Prompt V3]: 整合四種模式判斷與全域大圖截圖邏輯
+        # [核心 Prompt V3]: 整合四種模式判斷與全域大圖截圖邏輯、修正截圖座標邏輯與科目過濾
         prompt = f"""
         你是一個高中物理題庫分析專家，請分析圖片中的高中物理試題，並將其轉為 JSON 格式。
         
-        【任務：物理題型精準辨識與結構化】
+        【任務 1：科目過濾 (Filtering)】
+        - 僅提取「物理科」題目。
+        - 若遇到化學、生物、地科題目，請直接跳過，不要輸出到 JSON。
+        
+        【任務 2：物理題型精準辨識與結構化 (Structure)】
         請依照以下優先順序判斷每一題的模式：
         
         **優先層級 1：題組偵測 (Group Mode)**
-        - 觸發：標題含有「題組」、「X.~Y.題為題組」、「閱讀下文」。
+        - 觸發：標題含有「題組」、「X.~Y.題為題組、「閱讀下文」。
         - 結構：必須包含母題(標題/文章/圖片)與所有子題。
         - **截圖規則 (重要)**：回傳一個包含「母題+所有子題」的全域大範圍 box_2d。母題與所有子題共用此 box_2d，不需切分。
         - **子題邏輯**：題組內的每一個子題，都必須獨立判斷是 Single/Multi/Fill。
@@ -211,31 +213,34 @@ def process_single_batch(batch_images, batch_index, api_key, start_page_idx):
         - **B. 單選題 (Single)**：內容含標準選項 (A)~(E) 且無複選關鍵字。
         - **C. 填充/簡答 (Fill)**：無選項列表，或為問答、作圖、計算形式。
         
-        【通用截圖規則 (Universal Screenshot Rule)】
+        【任務 3：全寬截圖規則 (Universal Screenshot Rule)】
         - **X 軸**：強制全寬 (0-1000)。
-        - **Y 軸**：必須包含「上一題結束後的空白」到「下一題開始前的空白」。
+        - **Y 軸 (box_2d)**：
+          - 請給出該題目在頁面上的「絕對座標」。
+          - 上界 (Top)：包含題目文字上方到「上一個視覺元素(可能是化學題或其他物理題)」結束處的空白。
+          - 下界 (Bottom)：包含題目文字/選項下方到「下一個視覺元素」開始處的空白。
+          - **注意**：即使上一題是化學題（被你跳過了），本題的截圖範圍仍應向上延伸至該化學題的邊界，確保不切到本題文字。
         - **題組**：box_2d 必須包覆整個題組區塊 (母題+子題)。
-        
         【JSON 輸出範例 (Ground Truth)】
         
-        // 案例 1: 單選題
+        // 案例 1: 單選題 (Single)
         {{
             "number": 3,
             "type": "Single",
             "content": "3. 將ㄇ字型的光滑金屬軌道...",
             "options": ["(A) ...", "(B) ..."],
             "answer": "A",
-            "box_2d": [0, 0, 350, 1000] // 全寬，含上下空白
+            "box_2d": [100, 0, 350, 1000] // 絕對座標，含上下空白
         }}
         
-        // 案例 2: 複選題 (Multi)
+        // 案例 2: 複選題 (Multi) - 假設第4題是化學題被跳過，故第5題從較下方開始
         {{
             "number": 5,
             "type": "Multi",
             "content": "5. 某分子最外層...有幾種可能的譜線？ (應選2項)",
             "options": ["(A) 10", "(B) 6", "(C) 4", "(D) 3", "(E) 1"],
             "answer": "AB",
-            "box_2d": [350, 0, 500, 1000] // 全寬，含上下空白
+            "box_2d": [550, 0, 700, 1000] // 絕對座標，即使與上一題不連續
         }}
         
         // 案例 3: 填充/簡答題 (Fill)
@@ -245,15 +250,15 @@ def process_single_batch(batch_images, batch_index, api_key, start_page_idx):
             "content": "41. 請說明...意義為何？(2分)",
             "options": [], // 無選項
             "answer": "",
-            "box_2d": [500, 0, 650, 1000] // 全寬，含上下空白
+            "box_2d": [750, 0, 850, 1000] 
         }}
         
         // 案例 4: 題組 (Group) - 混合子題型
         {{
-            "number": 40,
+            "number": 40 ~ 42,
             "type": "Group",
             "content": "40-42題為題組\\n19世紀末實驗發現... (共用文章)",
-            "box_2d": [650, 0, 950, 1000], // [重點] 母題+子題的大範圍
+            "box_2d": [100, 0, 600, 1000], // [重點] 母題+子題的大範圍
             "sub_questions": [
                 {{
                     "number": 40,
@@ -261,7 +266,7 @@ def process_single_batch(batch_images, batch_index, api_key, start_page_idx):
                     "content": "40. 有一紅光雷射...",
                     "options": ["(A)..."],
                     "answer": "A",
-                    "box_2d": [650, 0, 950, 1000] // 繼承母題 box_2d
+                    "box_2d": [100, 0, 600, 1000] // 繼承母題 box_2d
                 }},
                 {{
                     "number": 41,
@@ -269,7 +274,7 @@ def process_single_batch(batch_images, batch_index, api_key, start_page_idx):
                     "content": "41. 請說明...",
                     "options": [],
                     "answer": "",
-                    "box_2d": [650, 0, 950, 1000] // 繼承母題 box_2d
+                    "box_2d": [100, 0, 600, 1000] // 繼承母題 box_2d
                 }}
             ]
         }}
@@ -302,6 +307,8 @@ def process_single_batch(batch_images, batch_index, api_key, start_page_idx):
         processed = []
         for item in data:
             content = (item.get('content', '') + " " + " ".join(item.get('options', []))).lower()
+            
+            # [Python 端雙重過濾] 雖然 Prompt 已要求過濾，這裡再做一次保險
             if any(k in content for k in EXCLUDE_KEYWORDS): continue
             
             # 自動判斷 (Fallback logic if AI misses type)
@@ -350,10 +357,6 @@ def process_single_batch(batch_images, batch_index, api_key, start_page_idx):
             # [重要]: 若為題組，需確保子題也繼承截圖資料
             if q_type == "Group" and cand["sub_questions"]:
                  for sub in cand["sub_questions"]:
-                     # 雖然 JSON 中已經要求 box_2d 相同，但後端處理時 AI 可能只傳回母題圖片
-                     # 這裡不需額外處理，因為前端顯示時，子題會使用自己的 content/options
-                     # 而截圖顯示會依賴母題的 image_b64 (如果是共用大圖模式)
-                     # 但為了資料完整性，若 AI 有回傳子題的 box_2d (通常與母題同)，我們也可以在前端處理
                      pass
 
             processed.append(cand)
@@ -361,4 +364,3 @@ def process_single_batch(batch_images, batch_index, api_key, start_page_idx):
         return processed, None
 
     except Exception as e: return None, str(e)
-
