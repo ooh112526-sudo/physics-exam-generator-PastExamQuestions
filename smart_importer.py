@@ -4,7 +4,6 @@ import json
 import time
 import base64
 from PIL import Image
-
 # ==========================================
 # 依賴套件與環境檢查
 # ==========================================
@@ -12,22 +11,18 @@ HAS_GENAI = False
 HAS_PDF2IMAGE = False
 HAS_OCR = False
 HAS_DOCX = False
-
 try:
     import google.generativeai as genai
     HAS_GENAI = True
 except ImportError: pass
-
 try:
     from pdf2image import convert_from_bytes
     HAS_PDF2IMAGE = True
 except ImportError: pass
-
 try:
     import docx
     HAS_DOCX = True
 except ImportError: pass
-
 # ==========================================
 # 常數定義
 # ==========================================
@@ -40,39 +35,39 @@ PHYSICS_CHAPTERS_LIST = [
     "第五章.能量", 
     "第六章.量子現象"
 ]
-
 EXCLUDE_KEYWORDS = [
     "化學", "反應式", "有機化合物", "酸鹼", "沉澱", "氧化還原", "莫耳", "原子量",
     "生物", "細胞", "遺傳", "DNA", "染色體", "演化", "生態", "光合作用", "酵素",
     "地科", "地質", "板塊", "洋流", "大氣", "氣候", "岩石", "化石", "星系", "地層"
 ]
-
 # ==========================================
 # 候選題目物件 (資料結構升級)
 # ==========================================
 class SmartQuestionCandidate:
     def __init__(self, raw_text, question_number, options=None, chapter="未分類", 
                  is_likely=True, status_reason="", image_bytes=None, q_type="Single", 
-                 ref_image_bytes=None, full_page_bytes=None, subject="Physics", sub_questions=None):
+                 ref_image_bytes=None, full_page_bytes=None, subject="Physics", sub_questions=None,
+                 solution=""): # [New] 新增 solution 參數
         self.raw_text = raw_text
         self.number = question_number
         self.content = raw_text 
         self.options = options if options else []
+        self.answer = "" # 預設空
+        self.solution = solution # [New] 解析
         self.predicted_chapter = chapter if chapter in PHYSICS_CHAPTERS_LIST else "未分類"
         self.is_physics_likely = is_likely
         self.status_reason = status_reason
         
         # 圖片相關
-        self.image_bytes = image_bytes          # 目前使用的截圖 (可能是 AI 的，也可能是手動裁切後的)
-        self.ai_crop_backup = image_bytes       # [新] AI 原始截圖備份 (永遠不變，除非整題刪除)
+        self.image_bytes = image_bytes          # 目前使用的截圖
+        self.ai_crop_backup = image_bytes       # AI 原始截圖備份
         self.ref_image_bytes = ref_image_bytes  # 參考區域圖
         self.full_page_bytes = full_page_bytes  # 整頁底圖
-        self.use_image = False                  # [新] 預設不使用圖片，需手動勾選
+        self.use_image = False                  # 預設不使用圖片
         
         self.q_type = q_type
         self.subject = subject
         self.sub_questions = sub_questions if sub_questions else []
-
 # ==========================================
 # 工具函式
 # ==========================================
@@ -87,7 +82,6 @@ def clean_json_string(json_str):
     if start != -1 and end != -1:
         json_str = json_str[start:end+1]
     return json_str.strip()
-
 def check_is_group_header(text):
     """
     [新] 檢查文字是否包含題組關鍵字 (如: 16-18題為題組)
@@ -99,7 +93,6 @@ def check_is_group_header(text):
     if match:
         return True, f"{match.group(1)}~{match.group(2)}"
     return False, ""
-
 def crop_image(original_img, box_2d, force_full_width=False, padding_y=10):
     """
     裁切圖片函式 (已針對全寬需求優化)
@@ -125,7 +118,6 @@ def crop_image(original_img, box_2d, force_full_width=False, padding_y=10):
     bottom = (ymax / 1000) * height
     
     if right <= left or bottom <= top: return None
-
     try:
         cropped = original_img.crop((left, top, right, bottom))
         img_byte_arr = io.BytesIO()
@@ -134,14 +126,12 @@ def crop_image(original_img, box_2d, force_full_width=False, padding_y=10):
         return img_byte_arr.getvalue()
     except Exception as e:
         return None
-
 def img_to_bytes(pil_img):
     if pil_img is None: return None
     img_byte_arr = io.BytesIO()
     if pil_img.mode in ("RGBA", "P"): pil_img = pil_img.convert("RGB")
     pil_img.save(img_byte_arr, format='JPEG', quality=85)
     return img_byte_arr.getvalue()
-
 # ==========================================
 # 核心邏輯
 # ==========================================
@@ -152,7 +142,6 @@ def get_pdf_page_count(file_bytes):
         info = pdfinfo_from_bytes(file_bytes)
         return info.get("Pages", 0)
     except: return 0
-
 def convert_file_to_images(file_bytes, file_type, first_page=None, last_page=None):
     if file_type == 'pdf':
         if not HAS_PDF2IMAGE: return None, "缺少 pdf2image"
@@ -178,19 +167,16 @@ def convert_file_to_images(file_bytes, file_type, first_page=None, last_page=Non
         except Exception as e:
             return None, f"Word 解析失敗: {str(e)}"
     return None, "不支援的格式"
-
 # 批次大小
 BATCH_SIZE = 5
-
 def process_single_batch(batch_images, batch_index, api_key, start_page_idx):
     if not HAS_GENAI: return None, "缺少 google-generativeai"
     if not api_key: return None, "缺少 API Key"
-
     try:
         genai.configure(api_key=api_key)
         chapters_str = "\n".join([c for c in PHYSICS_CHAPTERS_LIST if c != "未分類"])
         
-        # [核心 Prompt V4]: 強制 AI 回傳 page_index 解決截圖錯誤問題
+        # [核心 Prompt V5]: 增加解題指令 (Solution Generation)
         prompt = f"""
         你是一個高中物理題庫分析專家，請分析圖片中的高中物理試題，並將其轉為 JSON 格式。
         
@@ -200,12 +186,11 @@ def process_single_batch(batch_images, batch_index, api_key, start_page_idx):
         
         【任務 2：物理題型結構化 (Structure)】
         請依照以下優先順序判斷每一題的模式：
-        
         **優先層級 1：題組偵測 (Group Mode)**
         - 觸發：標題含有「題組」、「X.~Y.題為題組」、「閱讀下文」。
         - 結構：必須包含母題(標題/文章/圖片)與所有子題。
-        - **截圖規則(重要)**：回傳一個包含「母題+所有子題」的全域大範圍 box_2d。母題與所有子題共用此 box_2d，不需切分。
-        - **子題邏輯**：題組內的每一個子題，都必須獨立判斷是 Single/Multi/Fill。
+       - **截圖規則(重要)**：回傳一個包含「母題+所有子題」的全域大範圍 box_2d。母題與所有子題共用此 box_2d，不需切分。
+       - **子題邏輯**：題組內的每一個子題，都必須獨立判斷是 Single/Multi/Fill。
         
         **優先層級 2：單一題型判斷 (Standalone Mode)**
         - 若非題組，則依以下特徵分類：
@@ -221,12 +206,15 @@ def process_single_batch(batch_images, batch_index, api_key, start_page_idx):
           - 下界 (Bottom)：包含題目文字/選項下方到「下一個視覺元素」開始處的空白。
           - **注意**：即使上一題是化學題（被你跳過了），本題的截圖範圍仍應向上延伸至該化學題的邊界，確保不切到本題文字。
           - **題組**：box_2d 必須包覆整個題組區塊 (母題+子題)。
-
         【任務 4：圖片索引 (Page Index) - 關鍵】
         - 因為一次輸入多張圖片，請務必標示該題目位於哪一張圖。
         - **page_index**: 0 代表第一張圖, 1 代表第二張圖...以此類推。
         - 若無此欄位，截圖將會錯誤。
         
+        【任務 5：智慧解題 (Intelligent Solving) - 重點】
+        - 若圖片中有明顯標示答案（如紅筆圈選、詳解本），優先使用該答案。
+        - **若圖片中無答案，請根據物理知識自行推導解題，並填入 "answer" 欄位。**
+        - **solution 欄位**：請提供簡短的解題思路、關鍵公式或步驟（例如："利用 F=ma，得知..."）。若為題組母題可留空。
         【JSON 輸出範例 (Ground Truth)】
         
         // 案例 1: 單選題 (Single)
@@ -236,6 +224,7 @@ def process_single_batch(batch_images, batch_index, api_key, start_page_idx):
             "content": "3. 將ㄇ字型的光滑金屬軌道...",
             "options": ["(A) ...", "(B) ..."],
             "answer": "A",
+            "solution": "根據法拉第電磁感應定律 ε = LvB，且電流方向...", // [New] AI 自動解析
             "box_2d": [100, 0, 350, 1000],// 絕對座標，含上下空白
             "page_index": 0 // 位於第1張圖
         }}
@@ -372,9 +361,7 @@ def process_single_batch(batch_images, batch_index, api_key, start_page_idx):
             if q_type == "Group" and cand["sub_questions"]:
                  for sub in cand["sub_questions"]:
                      pass
-
             processed.append(cand)
             
         return processed, None
-
     except Exception as e: return None, str(e)
