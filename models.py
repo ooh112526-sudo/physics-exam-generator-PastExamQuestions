@@ -3,7 +3,8 @@ import random
 import base64
 class Question:
     def __init__(self, q_type, content, options=None, answer=None, 
-                 solution=None, # [New] 新增解析欄位
+                 solution=None, # [New] 解析欄位
+                 image_blob_name=None, # [New] 圖片儲存路徑 (用於刪除)
                  original_id=0, image_data=None, 
                  source="一般試題", chapter="未分類", unit="", db_id=None, 
                  parent_id=None, is_group_parent=False, sub_questions=None, image_url=None,
@@ -17,6 +18,7 @@ class Question:
         self.options = options if options else []
         self.answer = answer
         self.solution = solution if solution else "" # [New] 初始化解析
+        self.image_blob_name = image_blob_name # [New]
         self.image_data = image_data 
         self.image_url = image_url   
         self.parent_id = parent_id 
@@ -31,6 +33,7 @@ class Question:
             "id": self.id, "type": self.type, "source": self.source, "chapter": self.chapter,
             "content": self.content, "options": self.options, "answer": self.answer,
             "solution": self.solution, # [New] 儲存解析
+            "image_blob_name": self.image_blob_name, # [New]
             "image_data_b64": img_str, "image_url": self.image_url,
             "parent_id": self.parent_id, "is_group_parent": self.is_group_parent,
             "sub_questions": subs, "source_file_id": self.source_file_id
@@ -45,6 +48,7 @@ class Question:
             q_type=data.get("type", "Single"), content=data.get("content", ""),
             options=data.get("options", []), answer=data.get("answer", ""),
             solution=data.get("solution", ""), # [New] 讀取解析
+            image_blob_name=data.get("image_blob_name"), # [New]
             original_id=0, image_data=img_bytes, image_url=data.get("image_url"),
             source=data.get("source", ""), chapter=data.get("chapter", "未分類"),
             db_id=data.get("id"), parent_id=data.get("parent_id"),
