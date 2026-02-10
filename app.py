@@ -17,7 +17,7 @@ except ImportError as e:
     st.error(f"模組匯入失敗: {e}")
     st.stop()
 # 標記修復版本
-LAST_UPDATED = "2026-02-10 (CST) [Feature: AI Auto-Solving & Solution Field]"
+LAST_UPDATED = "2026-02-10 (CST) [Feature: Delete Question & Images / AI Auto-Solving]"
 try:
     from streamlit_cropper import st_cropper 
 except: st_cropper = None 
@@ -506,10 +506,13 @@ with tab_review:
                             elif not final_img and item.get('ref_image_url'): final_url = item.get('ref_image_url')
                         img_data = base64.b64decode(final_img) if final_img else None
                         
+                        # [New] 從 AI 結果取得 blob_name
+                        current_blob_name = item.get('image_blob_name')
                         q = Question(
                             q_type=item.get('type'), content=item.get('content'),
                             options=item.get('options', []), answer=item.get('answer', ''),
                             solution=item.get('solution', ''), # [New] 匯入解析
+                            image_blob_name=current_blob_name, # [New]
                             chapter=item.get('chapter', '未分類'), source=sel_file['filename'],
                             image_data=img_data, image_url=final_url if not img_data else None,
                             # 確保子題也被正確轉換
@@ -534,7 +537,8 @@ with tab_bank:
         st.info("目前題庫為空。")
         if st.button("重新載入"): st.session_state['question_pool'] = [Question.from_dict(d) for d in cloud_manager.load_questions()]; st.rerun()
     else:
-        c_stat, c_export = st.columns([1, 1])
+        # [Update] 加入批量刪除按鈕
+        c_stat, c_export, c_batch_del = st.columns([2, 2, 2])
         with c_stat: st.metric("總題數", len(all_qs))
         with c_export:
             sel_cnt = len(st.session_state['selected_export_ids'])
@@ -546,6 +550,16 @@ with tab_bank:
                     b1, b2 = st.columns(2)
                     with b1: st.download_button("📄 下載試題", d_ex, "exam.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
                     with b2: st.download_button("📝 下載詳解", d_ans, "ans.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+        with c_batch_del:
+            sel_cnt = len(st.session_state['selected_export_ids'])
+            if sel_cnt > 0:
+                if st.button(f"🗑️ 刪除選取 ({sel_cnt})", type="secondary", key="batch_del_btn"):
+                    with st.spinner("刪除中..."):
+                        for qid in list(st.session_state['selected_export_ids']):
+                            cloud_manager.delete_question(qid)
+                        st.session_state['selected_export_ids'] = set()
+                        st.session_state['question_pool'] = [Question.from_dict(d) for d in cloud_manager.load_questions()]
+                    st.success(f"已刪除 {sel_cnt} 題"); time.sleep(1); st.rerun()
         st.divider()
         qs_by_source = {}
         for q in all_qs:
@@ -569,7 +583,8 @@ with tab_bank:
                     for qid in all_ids: st.session_state['selected_export_ids'].discard(qid)
                     st.rerun()
                 for q in qlist:
-                    c1, c2, c3 = st.columns([0.5, 8, 1.5])
+                    # [Update] 加入個別刪除欄位 (c4)
+                    c1, c2, c3, c4 = st.columns([0.5, 8, 1, 0.5])
                     with c1:
                         if st.checkbox("", value=(q.id in st.session_state['selected_export_ids']), key=f"ck_{q.id}"): st.session_state['selected_export_ids'].add(q.id)
                         else: st.session_state['selected_export_ids'].discard(q.id)
@@ -584,8 +599,11 @@ with tab_bank:
                             if st.button("儲存", key=f"sv_{q.id}"):
                                 q.content, q.answer, q.solution = nc, na, nsol
                                 cloud_manager.save_question(q.to_dict()); st.success("OK"); time.sleep(0.5); st.rerun()
-                            if st.button("刪除", key=f"rm_{q.id}", type="primary"):
-                                cloud_manager.delete_question(q.id)
-                                st.session_state['question_pool'] = [x for x in st.session_state['question_pool'] if x.id != q.id]
-                                st.rerun()
+                    with c4:
+                        if st.button("🗑️", key=f"rm_icon_{q.id}", help="刪除此題"):
+                            cloud_manager.delete_question(q.id)
+                            st.session_state['question_pool'] = [x for x in st.session_state['question_pool'] if x.id != q.id]
+                            st.toast(f"已刪除題目 {q.id}")
+                            time.sleep(0.5)
+                            st.rerun()
                     st.divider()
