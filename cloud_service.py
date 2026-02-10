@@ -8,7 +8,6 @@ import google.auth
 from google.cloud import firestore
 from google.cloud import storage
 from google.oauth2 import service_account
-
 class CloudManager:
     def __init__(self):
         self.bucket_name = os.getenv("GCS_BUCKET_NAME", "physics-exam-assets")
@@ -18,7 +17,6 @@ class CloudManager:
         self.connection_error = ""
         self.project_id = None
         self.credentials = None 
-
         try:
             # 1. 嘗試從環境變數讀取 JSON
             service_account_json = os.getenv("GCP_SERVICE_ACCOUNT_JSON")
@@ -37,7 +35,6 @@ class CloudManager:
                     if self.has_connection: self._ensure_bucket_exists()
                     return
                 except Exception as e: print(f"JSON Env Error: {e}")
-
             # 2. 嘗試從 Streamlit Secrets 讀取
             try:
                 if "gcp_service_account" in st.secrets:
@@ -49,13 +46,11 @@ class CloudManager:
                     self.has_connection = True
                     return 
             except: pass
-
             # 3. 嘗試使用預設憑證 (Cloud Run 自動注入)
             self.project_id = (os.getenv("GCP_PROJECT_ID") or os.getenv("GOOGLE_CLOUD_PROJECT"))
             if not self.project_id:
                 try: self.credentials, project_id_from_auth = google.auth.default(); self.project_id = project_id_from_auth
                 except: pass
-
             if self.project_id:
                 if self.credentials:
                     self.db = firestore.Client(credentials=self.credentials, project=self.project_id)
@@ -69,25 +64,21 @@ class CloudManager:
                 except: pass
             
             if self.has_connection: self._ensure_bucket_exists()
-
         except Exception as e:
             self.connection_error = str(e)
             print(f"Cloud Init Error: {e}")
-
     def _ensure_bucket_exists(self):
         if not self.storage_client: return
         try:
             bucket = self.storage_client.bucket(self.bucket_name)
             if not bucket.exists(): bucket.create(location="us-central1") 
         except: pass
-
     def get_storage_usage(self):
         if not self.storage_client: return 0
         try:
             bucket = self.storage_client.bucket(self.bucket_name)
             return sum(blob.size for blob in bucket.list_blobs() if blob.size)
         except: return 0
-
     def upload_bytes(self, file_bytes, filename, folder="uploads", content_type=None):
         if not self.storage_client: return None
         try:
@@ -110,7 +101,6 @@ class CloudManager:
             except: pass
             return url, unique_name
         except: return None, None
-
     def download_blob(self, blob_name):
         if not self.storage_client or not blob_name: return None
         try:
@@ -118,41 +108,44 @@ class CloudManager:
             blob = bucket.blob(blob_name)
             return blob.download_as_bytes()
         except: return None
-
+    # [New] 刪除 GCS Blob
+    def delete_blob(self, blob_name):
+        if not self.storage_client or not blob_name: return
+        try:
+            bucket = self.storage_client.bucket(self.bucket_name)
+            blob = bucket.blob(blob_name)
+            blob.delete()
+            print(f"Deleted blob: {blob_name}")
+        except Exception as e:
+            print(f"Failed to delete blob {blob_name}: {e}")
     # --- File/Question Management ---
     def check_file_exists(self, filename):
         if not self.db: return None
         docs = self.db.collection("exam_files").where("filename", "==", filename).limit(1).stream()
         for doc in docs: d = doc.to_dict(); d['id'] = doc.id; return d
         return None
-
     def save_file_record(self, file_info, overwrite_id=None):
         if not self.db: return False
         doc_id = overwrite_id if overwrite_id else str(uuid.uuid4())
         file_info["id"] = doc_id; file_info["updated_at"] = datetime.datetime.now()
         self.db.collection("exam_files").document(doc_id).set(file_info)
         return True
-
     def load_file_records(self):
         if not self.db: return []
         files = []
         docs = self.db.collection("exam_files").order_by("updated_at", direction=firestore.Query.DESCENDING).stream()
         for doc in docs: files.append(doc.to_dict())
         return files
-
     def delete_file_record(self, file_id):
         if self.db: 
             doc_ref = self.db.collection("exam_files").document(file_id)
             doc_ref.delete()
-
     def update_file_status(self, file_id, status):
         if self.db: self.db.collection("exam_files").document(file_id).update({"ai_status": status})
-
     # ==========================================
     # 批次處理狀態管理 (AI Processing State)
     # ==========================================
     def init_batch_process(self, file_id, total_batches):
-        """初始化批次任務狀態"""
         if not self.db: return
         self.db.collection("exam_files").document(file_id).update({
             "ai_status": "處理中",
@@ -166,21 +159,18 @@ class CloudManager:
                 doc_ref.set({
                     "batch_index": i, "status": "pending", "last_error": "", "updated_at": datetime.datetime.now()
                 })
-
     def get_processing_status(self, file_id):
         if not self.db: return []
         batches = []
         docs = self.db.collection("exam_files").document(file_id).collection("batches").order_by("batch_index").stream()
         for doc in docs: batches.append(doc.to_dict())
         return batches
-
     def save_batch_result(self, file_id, batch_index, candidates_data, status="done", error_msg=""):
         """
         儲存單一批次的辨識結果，並解決 Firestore 1MB 限制問題：
         將 Base64 圖片上傳至 GCS，JSON 中僅保留 URL。
         """
         if not self.db: return
-
         # 1. 圖片處理：Base64 -> GCS URL
         if status == "done" and candidates_data:
             # 遍歷每個題目
@@ -207,7 +197,6 @@ class CloudManager:
                                 item[url_key] = img_url
                                 # 儲存 blob_name 以便後端下載 (如果 URL 無法公開存取)
                                 item[key.replace('_b64', '_blob_name')] = blob_name
-                                
                                 # 重要：刪除原始 Base64 資料，釋放 JSON 空間
                                 del item[key]
                                 
@@ -215,11 +204,9 @@ class CloudManager:
                             print(f"圖片轉存失敗 ({key}): {e}")
                             # 若失敗，至少保留 Base64 以免資料遺失 (但可能導致 Save 失敗)
                             pass
-
             # 2. 寫入輕量化後的 JSON 至 Firestore
             results_ref = self.db.collection("exam_files").document(file_id).collection("ai_results").document(str(batch_index))
             results_ref.set({"data": candidates_data})
-
         # 3. 更新批次狀態
         batch_ref = self.db.collection("exam_files").document(file_id).collection("batches").document(str(batch_index))
         batch_ref.update({
@@ -227,7 +214,6 @@ class CloudManager:
             "last_error": error_msg,
             "updated_at": datetime.datetime.now()
         })
-
     def load_all_ai_results(self, file_id):
         if not self.db: return []
         all_results = []
@@ -242,13 +228,11 @@ class CloudManager:
         temp_data.sort(key=lambda x: x[0])
         for _, data_list in temp_data: all_results.extend(data_list)
         return all_results
-
     def reset_batch_status(self, file_id, batch_index):
         if self.db:
             self.db.collection("exam_files").document(file_id).collection("batches").document(str(batch_index)).update({
                 "status": "pending", "last_error": ""
             })
-
     def clean_old_batch_data(self, file_id):
         """清除舊的批次處理資料，以便重新辨識"""
         if not self.db: return
@@ -263,27 +247,49 @@ class CloudManager:
                 doc.reference.delete()
         except Exception as e:
             print(f"Cleanup Error: {e}")
-
     # --- Question Management ---
     def save_question(self, question_dict):
         if not self.db: return False
         # 若是正式入庫，也做一次 Base64 -> URL (如果有的話)
+        
+        # [Update] 若有新圖片資料，上傳並記錄 blob_name
         if question_dict.get("image_data_b64"):
             try:
                 img_bytes = base64.b64decode(question_dict["image_data_b64"])
                 fname = f"q_{question_dict.get('id')}.png"
-                img_url, _ = self.upload_bytes(img_bytes, fname, folder="question_images", content_type="image/png")
-                if img_url: question_dict["image_url"] = img_url; del question_dict["image_data_b64"]
+                img_url, blob_name = self.upload_bytes(img_bytes, fname, folder="question_images", content_type="image/png")
+                
+                if img_url: 
+                    question_dict["image_url"] = img_url
+                    question_dict["image_blob_name"] = blob_name # [New] 記錄 Blob Name
+                    del question_dict["image_data_b64"]
             except: pass
+            
         self.db.collection("questions").document(question_dict["id"]).set(question_dict)
         return True
-
     def load_questions(self):
         if not self.db: return []
         qs = []
         docs = self.db.collection("questions").order_by("id").stream()
         for doc in docs: qs.append(doc.to_dict())
         return qs
-
     def delete_question(self, doc_id):
-        if self.db: self.db.collection("questions").document(doc_id).delete()
+        if not self.db: return
+        
+        doc_ref = self.db.collection("questions").document(doc_id)
+        doc = doc_ref.get()
+        
+        if doc.exists:
+            data = doc.to_dict()
+            
+            # [New] 連動刪除母題圖片
+            if data.get('image_blob_name'):
+                self.delete_blob(data['image_blob_name'])
+                
+            # [New] 連動刪除子題圖片
+            if data.get('sub_questions'):
+                for sub in data['sub_questions']:
+                    if sub.get('image_blob_name'):
+                        self.delete_blob(sub['image_blob_name'])
+            
+            doc_ref.delete()
