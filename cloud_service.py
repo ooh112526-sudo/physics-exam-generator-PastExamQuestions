@@ -233,18 +233,29 @@ class CloudManager:
             self.db.collection("exam_files").document(file_id).collection("batches").document(str(batch_index)).update({
                 "status": "pending", "last_error": ""
             })
+    # [Critical Fix] 清除批次資料時，同步刪除 GCS 上的暫存圖片
     def clean_old_batch_data(self, file_id):
         """清除舊的批次處理資料，以便重新辨識"""
         if not self.db: return
         try:
-            # 1. 刪除 batches 子集合
+    # 1. 清除 Batches 集合
             batches_ref = self.db.collection("exam_files").document(file_id).collection("batches")
             for doc in batches_ref.stream():
                 doc.reference.delete()
-            # 2. 刪除 ai_results 子集合
+            
+            # 2. 清除 AI Results 集合，並同步刪除 GCS Blobs
             results_ref = self.db.collection("exam_files").document(file_id).collection("ai_results")
             for doc in results_ref.stream():
-                doc.reference.delete()
+                data = doc.to_dict()
+                # 掃描並刪除關聯的圖片
+                if 'data' in data and isinstance(data['data'], list):
+                    for q in data['data']:
+                        # 檢查所有可能的圖片欄位 key
+                        for key in ['image_blob_name', 'ref_image_blob_name', 'full_page_blob_name', 'ai_crop_backup_blob_name']:
+                            if q.get(key):
+                                self.delete_blob(q[key]) # 刪除 GCS 檔案
+                
+                doc.reference.delete() # 刪除 Firestore 文件
         except Exception as e:
             print(f"Cleanup Error: {e}")
     # --- Question Management ---
