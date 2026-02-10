@@ -176,7 +176,7 @@ def process_single_batch(batch_images, batch_index, api_key, start_page_idx):
         genai.configure(api_key=api_key)
         chapters_str = "\n".join([c for c in PHYSICS_CHAPTERS_LIST if c != "未分類"])
         
-        # [核心 Prompt V7]: 強化視覺邊界裁切規則
+        # [核心 Prompt V8]: 修正截圖下界規則 (精準觸邊即停)
         prompt = f"""
         你是一個高中物理題庫分析專家，請分析圖片中的高中物理試題，並將其轉為 JSON 格式。
  【最高指導原則：解題與解析】
@@ -205,11 +205,15 @@ def process_single_batch(batch_images, batch_index, api_key, start_page_idx):
         - **X 軸**：強制全寬 (0-1000)。
         - **Y 軸 (box_2d) 判定邏輯**：
           - 請給出該題目在頁面上的「絕對座標」。
-          - 上界 (Top)：包含題目文字上方到「上一個視覺元素(可能是化學題或其他物理題)」結束處的空白。
-          - 下界 (Bottom)：包含題目文字/選項下方到「下一個視覺元素」開始處的空白。
-          - **注意**：即使上一題是化學題（被你跳過了），本題的截圖範圍仍應向上延伸至該化學題的邊界，確保不切到本題文字。
-          - **題組**：box_2d 必須包覆整個題組區塊 (母題+子題)。
-
+            1. **上界 (ymin)**：
+               - 向上延伸至「上一個視覺區塊」(上一題或分隔線) 的結束處。
+               - 確保包含本題上方的標題或空白。
+            2. **下界 (ymax) - 重要修正**：
+               - 請包含本題所有內容（含選項、下方的圖表、註腳）。
+               - **截止點 (Stop Point)**：請延伸至**「視覺上緊鄰的下一題 (Next Question)」**的第一行文字上方停止。
+               - **關鍵指令**：不管下一題是物理、化學或生物，一旦看到**新的題號**或**分隔線**出現，截圖範圍必須在此終止。
+               - **禁止**：絕對不要包含下一題的文字內容。若本題與下一題之間有大量空白，可包含該空白，但在下一題文字開始前務必停止。
+               - **題組**：box_2d 必須包覆整個題組區塊 (母題+子題)。 
         【任務 4：圖片索引 (Page Index) - 關鍵】
         - 因為一次輸入多張圖片，請務必標示該題目位於哪一張圖。
         - **page_index**: 0 代表第一張圖, 1 代表第二張圖...以此類推。
@@ -369,5 +373,3 @@ def process_single_batch(batch_images, batch_index, api_key, start_page_idx):
             
         return processed, None
     except Exception as e: return None, str(e)
-
-
