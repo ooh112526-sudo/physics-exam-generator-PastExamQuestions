@@ -180,6 +180,10 @@ def process_single_batch(batch_images, batch_index, api_key, start_page_idx):
         prompt = f"""
         你是一個高中物理題庫分析專家，請分析圖片中的高中物理試題，並將其轉為 JSON 格式。
         
+ 【最高指導原則：解題與解析】
+ - 對於每一題（單選、複選、填充），你**必須**進行解題，並在 "answer" 欄位填入答案，在 "solution" 欄位填入詳細解析。
+        - **solution 欄位為必填**：請詳細列出解題思路、關鍵公式（如 F=ma, V=IR）與步驟。
+        - 只有「題組母題 (Group Parent)」的 solution 可以留空。
         【任務 1：科目過濾 (Filtering)】
         - 僅提取「物理科」題目。
         - 若遇到化學、生物、地科題目，請直接跳過，不要輸出到 JSON。
@@ -281,7 +285,7 @@ def process_single_batch(batch_images, batch_index, api_key, start_page_idx):
         }}
         
         5. 章節 (chapter): 選擇最接近的: {chapters_str}
-        請直接回傳 JSON 陣列。
+        請直接回傳 JSON 陣列，不要使用 Markdown 標記或其他文字。。
         """
         
         # 指定使用 Gemini 3.0 系列與 2.5 系列
@@ -347,6 +351,7 @@ def process_single_batch(batch_images, batch_index, api_key, start_page_idx):
                 "content": item.get('content', ''),
                 "options": item.get('options', []),
                 "answer": item.get('answer', ''),
+                "solution": item.get('solution', ''), # [New] 接收 AI 的解析
                 "chapter": item.get('chapter', '未分類'),
                 "type": q_type,
                 "image_b64": base64.b64encode(img_b).decode() if img_b else None,
