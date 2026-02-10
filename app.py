@@ -431,7 +431,7 @@ with tab_review:
                             opts = st.text_area("選項", "\n".join(res.get('options', [])), height=80, key=f"o_{res['ui_key']}")
                             res['options'] = opts.split('\n') if opts.strip() else []
                             
-                            c_ans, c_sol = st.columns([1, 2])
+                            c_ans, c_sol = st.columns([0.5, 2.5])
                             with c_ans:
                                 res['answer'] = st.text_input("答案", res.get('answer', ''), key=f"a_{res['ui_key']}")
                             with c_sol:
@@ -607,4 +607,5 @@ with tab_bank:
                             time.sleep(0.5)
                             st.rerun()
                     st.divider()
+
 
