@@ -219,6 +219,9 @@ def process_single_batch(batch_images, batch_index, api_key, start_page_idx):
         - 若圖片中有明顯標示答案（如紅筆圈選、詳解本），優先使用該答案。
         - **若圖片中無答案，請根據物理知識自行推導解題，並填入 "answer" 欄位。**
         - **solution 欄位**：請提供簡短的解題思路、關鍵公式或步驟（例如："利用 F=ma，得知..."）。若為題組母題可留空。
+
+        【任務6：章節 (chapter): 選擇最接近的: {chapters_str}】
+
         【JSON 輸出範例 (Ground Truth)】
         
         // 案例 1: 單選題 (Single)
@@ -283,8 +286,6 @@ def process_single_batch(batch_images, batch_index, api_key, start_page_idx):
                 }}
             ]
         }}
-        
-        5. 章節 (chapter): 選擇最接近的: {chapters_str}
         請直接回傳 JSON 陣列，不要使用 Markdown 標記或其他文字。。
         """
         
@@ -370,3 +371,4 @@ def process_single_batch(batch_images, batch_index, api_key, start_page_idx):
             
         return processed, None
     except Exception as e: return None, str(e)
+
