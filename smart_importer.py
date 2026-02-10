@@ -176,10 +176,9 @@ def process_single_batch(batch_images, batch_index, api_key, start_page_idx):
         genai.configure(api_key=api_key)
         chapters_str = "\n".join([c for c in PHYSICS_CHAPTERS_LIST if c != "未分類"])
         
-        # [核心 Prompt V5]: 增加解題指令 (Solution Generation)
+        # [核心 Prompt V7]: 強化視覺邊界裁切規則
         prompt = f"""
         你是一個高中物理題庫分析專家，請分析圖片中的高中物理試題，並將其轉為 JSON 格式。
-        
  【最高指導原則：解題與解析】
  - 對於每一題（單選、複選、填充），你**必須**進行解題，並在 "answer" 欄位填入答案，在 "solution" 欄位填入詳細解析。
         - **solution 欄位為必填**：請詳細列出解題思路、關鍵公式（如 F=ma, V=IR）與步驟。
@@ -202,13 +201,20 @@ def process_single_batch(batch_images, batch_index, api_key, start_page_idx):
         - **B. 單選題 (Single)**：內容含標準選項 (A)~(E) 且無複選關鍵字。
         - **C. 填充/簡答 (Fill)**：無選項列表，或為問答、作圖、計算形式。
         
-        【任務 3：全寬截圖規則 (Universal Screenshot Rule)】
+        【任務 3：全寬截圖規則 (Universal Screenshot Rule - 視覺錨點策略)】
         - **X 軸**：強制全寬 (0-1000)。
-        - **Y 軸 (box_2d)**：
+        - **Y 軸 (box_2d) 判定邏輯**：
           - 請給出該題目在頁面上的「絕對座標」。
-          - 上界 (Top)：包含題目文字上方到「上一個視覺元素(可能是化學題或其他物理題)」結束處的空白。
-          - 下界 (Bottom)：包含題目文字/選項下方到「下一個視覺元素」開始處的空白。
-          - **注意**：即使上一題是化學題（被你跳過了），本題的截圖範圍仍應向上延伸至該化學題的邊界，確保不切到本題文字。
+            1. **上界 (ymin)**：
+               - 向上延伸至「上一個視覺區塊」(上一題或分隔線) 的結束處。
+               - 確保包含本題上方的標題或空白。
+            2. **下界 (ymax) - 重要修正**：
+               - 請包含本題所有內容（含選項、下方的圖表、註腳）。
+               - **截止點 (Stop Point)**：請延伸至**「視覺上緊鄰的下一題 (Next Question)」**的第一行文字停止。
+               - **關鍵指令**：不管下一題是物理、化學或生物，一旦看到**新的題號**或**分隔線**出現，截圖範圍必須在此終止，並包含第一行的文字。
+               - **注意**：絕對只包含到下一題的文字內容的第一行。若本題與下一題之間有大量空白，可包含該空白，但在下一題第二行文字開始前務必停止。
+               - **注意**：即使上一題是化學題（被你跳過了），本題的截圖範圍仍應向上延伸至該化學題的最後一行文字，確保不切到本題文字。
+
           - **題組**：box_2d 必須包覆整個題組區塊 (母題+子題)。
         【任務 4：圖片索引 (Page Index) - 關鍵】
         - 因為一次輸入多張圖片，請務必標示該題目位於哪一張圖。
@@ -219,9 +225,7 @@ def process_single_batch(batch_images, batch_index, api_key, start_page_idx):
         - 若圖片中有明顯標示答案（如紅筆圈選、詳解本），優先使用該答案。
         - **若圖片中無答案，請根據物理知識自行推導解題，並填入 "answer" 欄位。**
         - **solution 欄位**：請提供簡短的解題思路、關鍵公式或步驟（例如："利用 F=ma，得知..."）。若為題組母題可留空。
-
         【任務6：章節 (chapter): 選擇最接近的: {chapters_str}】
-
         【JSON 輸出範例 (Ground Truth)】
         
         // 案例 1: 單選題 (Single)
@@ -232,7 +236,7 @@ def process_single_batch(batch_images, batch_index, api_key, start_page_idx):
             "options": ["(A) ...", "(B) ..."],
             "answer": "A",
             "solution": "根據法拉第電磁感應定律 ε = LvB，且電流方向...", // [New] AI 自動解析
-            "box_2d": [100, 0, 350, 1000],// 絕對座標，含上下空白
+            "box_2d": [100, 0, 350, 1000], // 絕對座標，含上下空白
             "page_index": 0 // 位於第1張圖
         }}
         
@@ -272,7 +276,7 @@ def process_single_batch(batch_images, batch_index, api_key, start_page_idx):
                     "content": "40. 有一紅光雷射...",
                     "options": ["(A)..."],
                     "answer": "A",
-                    "box_2d": [100, 0, 600, 1000],// 繼承母題 box_2d
+                    "box_2d": [100, 0, 600, 1000], // 繼承母題 box_2d
                     "page_index": 1
                 }},
                 {{
@@ -281,7 +285,7 @@ def process_single_batch(batch_images, batch_index, api_key, start_page_idx):
                     "content": "41. 請說明...",
                     "options": [],
                     "answer": "",
-                    "box_2d": [100, 0, 600, 1000],// 繼承母題 box_2d
+                    "box_2d": [100, 0, 600, 1000], // 繼承母題 box_2d
                     "page_index": 1
                 }}
             ]
@@ -371,4 +375,3 @@ def process_single_batch(batch_images, batch_index, api_key, start_page_idx):
             
         return processed, None
     except Exception as e: return None, str(e)
-
