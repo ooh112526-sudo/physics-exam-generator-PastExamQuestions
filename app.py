@@ -454,7 +454,7 @@ with tab_review:
                                     sub['type'] = TYPE_MAP_ZH_TO_EN[sub_new_type]
                                     
                                     # 子題答案
-                                    c_sub_ans, c_sub_sol = c_sub_2.columns([1, 2])
+                                    c_sub_ans, c_sub_sol = c_sub_2.columns([0.5, 2.5])
                                     sub['answer'] = c_sub_ans.text_input("答案", sub.get('answer', ''), key=f"sa_{sub_key}")
                                     sub['solution'] = c_sub_sol.text_area("解析", sub.get('solution', ''), height=68, key=f"ssol_{sub_key}")
                                     
@@ -607,3 +607,4 @@ with tab_bank:
                             time.sleep(0.5)
                             st.rerun()
                     st.divider()
+
