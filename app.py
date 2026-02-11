@@ -17,7 +17,7 @@ except ImportError as e:
     st.error(f"模組匯入失敗: {e}")
     st.stop()
 # 標記修復版本
-LAST_UPDATED = "2026-02-11 (CST) [UI: User API Key Required]"
+LAST_UPDATED = "2026-02-12 (CST) [UI Update: Sub-question Layout]"
 try:
     from streamlit_cropper import st_cropper 
 except: st_cropper = None 
@@ -464,26 +464,34 @@ with tab_review:
                             for idx, sub in enumerate(sub_qs):
                                 sub_key = f"{res['ui_key']}_{idx}"
                                 with st.expander(f"子題 {idx+1}. (第 {sub.get('number', idx+1)} 題)", expanded=True):
-                                    c_sub_1, c_sub_2 = st.columns([1, 3])
-                                    # 子題題型
+                                    
+                                    # (0) 題型設定 (放在最上面，作為 Metadata)
                                     sub_curr_type = TYPE_MAP_EN_TO_ZH.get(sub.get('type'), "單選")
                                     # 避免 index error
                                     sub_type_idx = TYPE_OPTIONS.index(sub_curr_type) if sub_curr_type in TYPE_OPTIONS else 0
                                     sub_new_type = c_sub_1.selectbox("類型", TYPE_OPTIONS, index=sub_type_idx, key=f"st_{sub_key}")
                                     sub['type'] = TYPE_MAP_ZH_TO_EN[sub_new_type]
                                     
-                                    # 子題答案
-                                    c_sub_ans, c_sub_sol = c_sub_2.columns([0.5, 2.5])
-                                    sub['answer'] = c_sub_ans.text_input("答案", sub.get('answer', ''), key=f"sa_{sub_key}")
-                                    sub['solution'] = c_sub_sol.text_area("解析", sub.get('solution', ''), height=68, key=f"ssol_{sub_key}")
+                                    # 使用小欄位來放題型選擇，節省空間
+                                    c_type_sel, _ = st.columns([1, 4])
+                                    with c_type_sel:
+                                        sub_new_type = st.selectbox("子題題型", TYPE_OPTIONS, index=sub_type_idx, key=f"st_{sub_key}")
+                                        sub['type'] = TYPE_MAP_ZH_TO_EN[sub_new_type]
                                     
-                                    # 子題內容
+                                    # (1) 第一行：題目敘述
                                     sub['content'] = st.text_area("題目敘述", sub.get('content', ''), height=60, key=f"sc_{sub_key}")
-                                    # 子題選項 (若非填充)
+                                    
+                                    # (2) 第二行：選項 (若非填充題)
                                     if sub['type'] != "Fill":
                                         sub_opts_str = "\n".join(sub.get('options', []))
                                         new_sub_opts = st.text_area("選項 (每行一個)", sub_opts_str, height=80, key=f"so_{sub_key}")
                                         sub['options'] = new_sub_opts.split('\n') if new_sub_opts.strip() else []
+                                    
+                                    # (3) 第三行：答案
+                                    sub['answer'] = st.text_input("答案", sub.get('answer', ''), key=f"sa_{sub_key}")
+                                    
+                                    # (4) 第四行：解析
+                                    sub['solution'] = st.text_area("解析", sub.get('solution', ''), height=68, key=f"ssol_{sub_key}")
                     with col_img:
                         # (2) 圖片模式與使用開關
                         st.markdown("**圖片設定**")
