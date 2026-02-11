@@ -326,21 +326,21 @@ with tab_files:
                                             try:
                                                 status_ph.info("⏳ 下載中...")
                                                 f_bytes = cloud_manager.download_blob(f.get('blob_name'))
-                                            if f_bytes:
-                                                status_ph.info("⏳ 分析頁數...")
-                                                ftype = 'pdf' if not f.get('filename', '').lower().endswith('.docx') else 'docx'
-                                                total_pages = smart_importer.get_pdf_page_count(f_bytes)
-                                                if total_pages == 0:
-                                                    imgs, _ = smart_importer.convert_file_to_images(f_bytes, ftype)
-                                                    total_pages = len(imgs) if imgs else 0
-                                                if total_pages > 0:
-                                                    total_batches = (total_pages + smart_importer.BATCH_SIZE - 1) // smart_importer.BATCH_SIZE
-                                                    cloud_manager.init_batch_process(f['id'], total_batches)
-                                                    status_ph.success("✅ 初始化完成")
-                                                    st.rerun()
-                                                else: status_ph.error("❌ 頁數錯誤")
-                                            else: status_ph.error("❌ 下載失敗")
-                                        except Exception as e: status_ph.error(f"❌ {e}")
+                                                if f_bytes:
+                                                    status_ph.info("⏳ 分析頁數...")
+                                                    ftype = 'pdf' if not f.get('filename', '').lower().endswith('.docx') else 'docx'
+                                                    total_pages = smart_importer.get_pdf_page_count(f_bytes)
+                                                    if total_pages == 0:
+                                                        imgs, _ = smart_importer.convert_file_to_images(f_bytes, ftype)
+                                                        total_pages = len(imgs) if imgs else 0
+                                                    if total_pages > 0:
+                                                        total_batches = (total_pages + smart_importer.BATCH_SIZE - 1) // smart_importer.BATCH_SIZE
+                                                        cloud_manager.init_batch_process(f['id'], total_batches)
+                                                        status_ph.success("✅ 初始化完成")
+                                                        st.rerun()
+                                                    else: status_ph.error("❌ 頁數錯誤")
+                                                else: status_ph.error("❌ 下載失敗")
+                                            except Exception as e: status_ph.error(f"❌ {e}")
                                 elif status == "處理中":
                                     st.caption("⚡ 處理中...") 
                                     if run_pending_batch(f, api_key_input): st.rerun()
