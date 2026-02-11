@@ -17,7 +17,7 @@ except ImportError as e:
     st.error(f"模組匯入失敗: {e}")
     st.stop()
 # 標記修復版本
-LAST_UPDATED = "2026-02-11 (CST) [Feature: API Key Default Empty]"
+LAST_UPDATED = "2026-02-11 (CST) [UI: User API Key Required]"
 try:
     from streamlit_cropper import st_cropper 
 except: st_cropper = None 
@@ -131,8 +131,9 @@ def run_pending_batch(file_record, api_key):
     start_page = (batch_idx * BATCH_SIZE) + 1
     end_page = start_page + BATCH_SIZE - 1
     
-    # [修改] 若 API Key 為空，嘗試讀取環境變數作為備援
+    # [修改] 使用者輸入優先；若無輸入但有環境變數則使用環境變數（保持後端彈性，但前端已強制要求輸入）
     final_api_key = api_key if api_key else os.getenv("GOOGLE_API_KEY", "")
+    
     with st.spinner(f"正在處理 {fname} - 第 {batch_idx + 1} 批次 (頁數 {start_page}~{end_page})..."):
         try:
             blob_name = file_record.get('blob_name')
@@ -161,10 +162,18 @@ def run_pending_batch(file_record, api_key):
 st.title("🧲 物理題庫系統 Pro (Cloud Storage)")
 with st.sidebar:
     st.header("設定")
-    # [修改] 移除預設值，讓 API Key 輸入框一開始為空
-    api_key_input = st.text_input("Gemini API Key", value="", type="password", key="sidebar_api_key", placeholder="若未設定環境變數，請在此輸入 Key")
-    if cloud_manager.has_connection: st.success("☁️ Cloud: 已連線")
-    else: st.warning("☁️ Cloud: 未連線")
+    # [UI修改] 預設為空，且不讀取環境變數到輸入框中
+    api_key_input = st.text_input("Gemini API Key", value="", type="password", key="sidebar_api_key", placeholder="請輸入 API Key 以啟動系統")
+    
+    # [UI修改] 根據是否輸入 Key 來決定顯示內容
+    if not api_key_input:
+        st.warning("⚠️ 請輸入 API Key")
+    else:
+        if cloud_manager.has_connection: 
+            st.success("✅ 系統已連線 (API Key 設定完成)")
+        else: 
+            st.error("☁️ Cloud 資料庫未連線 (請檢查後台)")
+            
     st.divider()
     if st.button("強制儲存至雲端"):
         for q in st.session_state['question_pool']: cloud_manager.save_question(q.to_dict())
