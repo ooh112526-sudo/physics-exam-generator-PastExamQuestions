@@ -483,7 +483,7 @@ with tab_review:
                                     # (2) 第二行：選項 (若非填充題)
                                     if sub['type'] != "Fill":
                                         sub_opts_str = "\n".join(sub.get('options', []))
-                                        new_sub_opts = st.text_area("選項 (每行一個)", sub_opts_str, height=80, key=f"so_{sub_key}")
+                                        new_sub_opts = st.text_area("選項", sub_opts_str, height=80, key=f"so_{sub_key}")
                                         sub['options'] = new_sub_opts.split('\n') if new_sub_opts.strip() else []
                                     
                                     # (3) 第三行：答案
@@ -633,3 +633,4 @@ with tab_bank:
                             time.sleep(0.5)
                             st.rerun()
                     st.divider()
+
