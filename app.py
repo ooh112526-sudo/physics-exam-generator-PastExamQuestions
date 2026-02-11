@@ -461,6 +461,7 @@ with tab_review:
                             st.markdown("##### 📂 題組子題列表")
                             sub_qs = res.get('sub_questions', [])
                             if not sub_qs: st.warning("此題組目前沒有子題。")
+                            
                             for idx, sub in enumerate(sub_qs):
                                 sub_key = f"{res['ui_key']}_{idx}"
                                 with st.expander(f"子題 {idx+1}. (第 {sub.get('number', idx+1)} 題)", expanded=True):
@@ -469,8 +470,6 @@ with tab_review:
                                     sub_curr_type = TYPE_MAP_EN_TO_ZH.get(sub.get('type'), "單選")
                                     # 避免 index error
                                     sub_type_idx = TYPE_OPTIONS.index(sub_curr_type) if sub_curr_type in TYPE_OPTIONS else 0
-                                    sub_new_type = c_sub_1.selectbox("類型", TYPE_OPTIONS, index=sub_type_idx, key=f"st_{sub_key}")
-                                    sub['type'] = TYPE_MAP_ZH_TO_EN[sub_new_type]
                                     
                                     # 使用小欄位來放題型選擇，節省空間
                                     c_type_sel, _ = st.columns([1, 4])
