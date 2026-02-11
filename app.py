@@ -131,8 +131,12 @@ def run_pending_batch(file_record, api_key):
     start_page = (batch_idx * BATCH_SIZE) + 1
     end_page = start_page + BATCH_SIZE - 1
     
-    # [修改] 使用者輸入優先；若無輸入但有環境變數則使用環境變數（保持後端彈性，但前端已強制要求輸入）
-    final_api_key = api_key if api_key else os.getenv("GOOGLE_API_KEY", "")
+    # [修改] 嚴格強制模式：若無 API Key，直接報錯並終止，絕不使用環境變數備援
+    if not api_key:
+        cloud_manager.save_batch_result(file_id, batch_idx, None, "error", "錯誤: 未輸入 API Key (嚴格模式)")
+        return True # 標記為已處理(雖然是失敗)，避免卡死
+    
+    final_api_key = api_key
     
     with st.spinner(f"正在處理 {fname} - 第 {batch_idx + 1} 批次 (頁數 {start_page}~{end_page})..."):
         try:
@@ -314,10 +318,14 @@ with tab_files:
                             with btn_col_main:
                                 if status == "未辨識":
                                     if st.button("🚀 辨識", key=f"s_{f['id']}", use_container_width=True):
-                                        status_ph = st.empty()
-                                        try:
-                                            status_ph.info("⏳ 下載中...")
-                                            f_bytes = cloud_manager.download_blob(f.get('blob_name'))
+                                        # [修改] 前端強制檢查：若無 API Key，直接顯示錯誤並阻止啟動
+                                        if not api_key_input:
+                                            st.error("請先在左側輸入 API Key")
+                                        else:
+                                            status_ph = st.empty()
+                                            try:
+                                                status_ph.info("⏳ 下載中...")
+                                                f_bytes = cloud_manager.download_blob(f.get('blob_name'))
                                             if f_bytes:
                                                 status_ph.info("⏳ 分析頁數...")
                                                 ftype = 'pdf' if not f.get('filename', '').lower().endswith('.docx') else 'docx'
