@@ -189,6 +189,9 @@ def process_single_batch(batch_images, batch_index, api_key, start_page_idx):
         
         【任務 2：物理題型結構化 (Structure)】
         請依照以下優先順序判斷每一題的模式：
+        **[關鍵規則：內容淨化]**
+        - **content (題目內容)**：僅包含題幹敘述。**嚴禁包含選項文字**。請將 (A), (B), (C), (D), (E) 等選項文字從 content 中完全移除。
+        - **options (選項)**：所有選項文字必須移動到 options 陣列中。
         **優先層級 1：題組偵測 (Group Mode)**
         - 觸發：標題含有「題組」、「X.~Y.題為題組」、「閱讀下文」。
         - 結構：必須包含母題(標題/文章/圖片)與所有子題。
