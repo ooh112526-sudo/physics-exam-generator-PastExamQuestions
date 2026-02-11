@@ -17,7 +17,7 @@ except ImportError as e:
     st.error(f"模組匯入失敗: {e}")
     st.stop()
 # 標記修復版本
-LAST_UPDATED = "2026-02-10 (CST) [Feature: Delete Question & Images / AI Auto-Solving]"
+LAST_UPDATED = "2026-02-11 (CST) [Feature: API Key Default Empty]"
 try:
     from streamlit_cropper import st_cropper 
 except: st_cropper = None 
@@ -131,6 +131,8 @@ def run_pending_batch(file_record, api_key):
     start_page = (batch_idx * BATCH_SIZE) + 1
     end_page = start_page + BATCH_SIZE - 1
     
+    # [修改] 若 API Key 為空，嘗試讀取環境變數作為備援
+    final_api_key = api_key if api_key else os.getenv("GOOGLE_API_KEY", "")
     with st.spinner(f"正在處理 {fname} - 第 {batch_idx + 1} 批次 (頁數 {start_page}~{end_page})..."):
         try:
             blob_name = file_record.get('blob_name')
@@ -145,7 +147,7 @@ def run_pending_batch(file_record, api_key):
                 status = "done" if not err else "error"
                 cloud_manager.save_batch_result(file_id, batch_idx, [], status, err or "無圖片")
                 return True
-            candidates, error = smart_importer.process_single_batch(batch_imgs, batch_idx, api_key, start_page)
+            candidates, error = smart_importer.process_single_batch(batch_imgs, batch_idx, final_api_key, start_page)
             if error:
                 cloud_manager.save_batch_result(file_id, batch_idx, None, "error", error)
             else:
@@ -159,8 +161,8 @@ def run_pending_batch(file_record, api_key):
 st.title("🧲 物理題庫系統 Pro (Cloud Storage)")
 with st.sidebar:
     st.header("設定")
-    env_api_key = os.getenv("GOOGLE_API_KEY", "")
-    api_key_input = st.text_input("Gemini API Key", value=env_api_key, type="password", key="sidebar_api_key")
+    # [修改] 移除預設值，讓 API Key 輸入框一開始為空
+    api_key_input = st.text_input("Gemini API Key", value="", type="password", key="sidebar_api_key", placeholder="若未設定環境變數，請在此輸入 Key")
     if cloud_manager.has_connection: st.success("☁️ Cloud: 已連線")
     else: st.warning("☁️ Cloud: 未連線")
     st.divider()
@@ -607,5 +609,3 @@ with tab_bank:
                             time.sleep(0.5)
                             st.rerun()
                     st.divider()
-
-
