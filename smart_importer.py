@@ -108,7 +108,7 @@ def crop_image(original_img, box_2d, force_full_width=False, padding_y=20):
     # 策略：padding_y 用於確保上下留白，避免切字。
     
     ymin = max(0, ymin - padding_y)
-    ymax = min(1000, ymax + padding_y)
+    ymax = min(1000, ymax + 2*padding_y)
     
     # 強制全寬：左右直接切齊頁面邊緣 (0~1000)
     left, right = 0, width
@@ -376,3 +376,4 @@ def process_single_batch(batch_images, batch_index, api_key, start_page_idx):
             
         return processed, None
     except Exception as e: return None, str(e)
+
