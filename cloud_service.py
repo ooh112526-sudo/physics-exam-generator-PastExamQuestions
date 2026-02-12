@@ -8,6 +8,7 @@ import google.auth
 from google.cloud import firestore
 from google.cloud import storage
 from google.oauth2 import service_account
+from models import ExamRecord # [Spec] 匯入 ExamRecord
 class CloudManager:
     def __init__(self):
         self.bucket_name = os.getenv("GCS_BUCKET_NAME", "physics-exam-assets")
@@ -73,12 +74,14 @@ class CloudManager:
             bucket = self.storage_client.bucket(self.bucket_name)
             if not bucket.exists(): bucket.create(location="us-central1") 
         except: pass
+        
     def get_storage_usage(self):
         if not self.storage_client: return 0
         try:
             bucket = self.storage_client.bucket(self.bucket_name)
             return sum(blob.size for blob in bucket.list_blobs() if blob.size)
         except: return 0
+        
     def upload_bytes(self, file_bytes, filename, folder="uploads", content_type=None):
         if not self.storage_client: return None
         try:
@@ -88,10 +91,8 @@ class CloudManager:
                 unique_name = f"{folder}/{int(datetime.datetime.now().timestamp())}_{str(uuid.uuid4())[:8]}_{filename}"
             else:
                 unique_name = f"{int(datetime.datetime.now().timestamp())}_{str(uuid.uuid4())[:8]}_{filename}"
-                
             blob = bucket.blob(unique_name)
             blob.upload_from_string(file_bytes, content_type=content_type)
-            
             url = blob.public_url
             try:
                 if self.credentials and hasattr(self.credentials, 'service_account_email'):
@@ -101,6 +102,7 @@ class CloudManager:
             except: pass
             return url, unique_name
         except: return None, None
+        
     def download_blob(self, blob_name):
         if not self.storage_client or not blob_name: return None
         try:
@@ -108,7 +110,6 @@ class CloudManager:
             blob = bucket.blob(blob_name)
             return blob.download_as_bytes()
         except: return None
-    # [New] 刪除 GCS Blob
     def delete_blob(self, blob_name):
         if not self.storage_client or not blob_name: return
         try:
@@ -240,9 +241,7 @@ class CloudManager:
         try:
     # 1. 清除 Batches 集合
             batches_ref = self.db.collection("exam_files").document(file_id).collection("batches")
-            for doc in batches_ref.stream():
-                doc.reference.delete()
-            
+            for doc in batches_ref.stream(): doc.reference.delete()
             # 2. 清除 AI Results 集合，並同步刪除 GCS Blobs
             results_ref = self.db.collection("exam_files").document(file_id).collection("ai_results")
             for doc in results_ref.stream():
@@ -272,7 +271,7 @@ class CloudManager:
                 
                 if img_url: 
                     question_dict["image_url"] = img_url
-                    question_dict["image_blob_name"] = blob_name # [New] 記錄 Blob Name
+                    question_dict["image_blob_name"] = blob_name 
                     del question_dict["image_data_b64"]
             except: pass
             
@@ -300,7 +299,48 @@ class CloudManager:
             # [New] 連動刪除子題圖片
             if data.get('sub_questions'):
                 for sub in data['sub_questions']:
-                    if sub.get('image_blob_name'):
-                        self.delete_blob(sub['image_blob_name'])
-            
+                    if sub.get('image_blob_name'): self.delete_blob(sub['image_blob_name'])
             doc_ref.delete()
+    
+    # ==========================================
+    # [Spec] 試卷履歷管理 (Exam History)
+    # ==========================================
+    def save_exam_history(self, title, question_ids):
+        """將生成的試卷存入履歷"""
+        if not self.db: return False
+        try:
+            record = ExamRecord(title, question_ids)
+            doc_ref = self.db.collection("exam_history").document() # Auto ID
+            doc_ref.set(record.to_dict())
+            return True
+        except Exception as e:
+            print(f"Save History Error: {e}")
+            return False
+    def load_exam_history(self):
+        """讀取所有試卷履歷"""
+        if not self.db: return []
+        records = []
+        try:
+            docs = self.db.collection("exam_history").order_by("created_at", direction=firestore.Query.DESCENDING).stream()
+            for doc in docs:
+                records.append(ExamRecord.from_dict(doc.to_dict(), db_id=doc.id))
+        except: pass
+        return records
+    def delete_exam_history(self, doc_id):
+        """刪除試卷履歷 (釋放題目)"""
+        if not self.db: return
+        self.db.collection("exam_history").document(doc_id).delete()
+    def get_used_question_ids(self):
+        """取得所有歷史試卷中已使用過的題目 ID 集合"""
+        if not self.db: return set()
+        used_ids = set()
+        try:
+            # 為了效能，只抓 question_ids 欄位
+            docs = self.db.collection("exam_history").select(["question_ids"]).stream()
+            for doc in docs:
+                d = doc.to_dict()
+                if "question_ids" in d and isinstance(d["question_ids"], list):
+                    used_ids.update(d["question_ids"])
+        except Exception as e:
+            print(f"Get Used IDs Error: {e}")
+        return used_ids
