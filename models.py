@@ -3,8 +3,9 @@ import random
 import base64
 class Question:
     def __init__(self, q_type, content, options=None, answer=None, 
-                 solution=None, # [New] 解析欄位
-                 image_blob_name=None, # [New] 圖片儲存路徑 (用於刪除)
+                 solution=None, # [Spec] 詳細解析
+                 exam_code=None, # [Spec] 自動編碼 (如 111-學測-...)
+                 image_blob_name=None, 
                  original_id=0, image_data=None, 
                  source="一般試題", chapter="未分類", unit="", db_id=None, 
                  parent_id=None, is_group_parent=False, sub_questions=None, image_url=None,
@@ -18,7 +19,8 @@ class Question:
         self.options = options if options else []
         self.answer = answer
         self.solution = solution if solution else "" # [New] 初始化解析
-        self.image_blob_name = image_blob_name # [New]
+        self.exam_code = exam_code if exam_code else "" # [Spec]
+        self.image_blob_name = image_blob_name 
         self.image_data = image_data 
         self.image_url = image_url   
         self.parent_id = parent_id 
@@ -33,7 +35,8 @@ class Question:
             "id": self.id, "type": self.type, "source": self.source, "chapter": self.chapter,
             "content": self.content, "options": self.options, "answer": self.answer,
             "solution": self.solution, # [New] 儲存解析
-            "image_blob_name": self.image_blob_name, # [New]
+            "exam_code": self.exam_code, # [Spec]
+            "image_blob_name": self.image_blob_name,
             "image_data_b64": img_str, "image_url": self.image_url,
             "parent_id": self.parent_id, "is_group_parent": self.is_group_parent,
             "sub_questions": subs, "source_file_id": self.source_file_id
@@ -48,7 +51,8 @@ class Question:
             q_type=data.get("type", "Single"), content=data.get("content", ""),
             options=data.get("options", []), answer=data.get("answer", ""),
             solution=data.get("solution", ""), # [New] 讀取解析
-            image_blob_name=data.get("image_blob_name"), # [New]
+            exam_code=data.get("exam_code", ""), # [Spec]
+            image_blob_name=data.get("image_blob_name"), 
             original_id=0, image_data=img_bytes, image_url=data.get("image_url"),
             source=data.get("source", ""), chapter=data.get("chapter", "未分類"),
             db_id=data.get("id"), parent_id=data.get("parent_id"),
@@ -58,3 +62,25 @@ class Question:
         if data.get("sub_questions"):
             q.sub_questions = [Question.from_dict(sub) for sub in data["sub_questions"]]
         return q
+class ExamRecord:
+    """[Spec] 試卷履歷物件，用於紀錄已生成的試卷與題目"""
+    def __init__(self, title, question_ids, created_at=None, db_id=None):
+        self.id = db_id 
+        self.title = title
+        self.question_ids = question_ids # List of question IDs
+        self.created_at = created_at if created_at else time.time()
+    def to_dict(self):
+        return {
+            "title": self.title,
+            "question_ids": self.question_ids,
+            "created_at": self.created_at
+        }
+    
+    @staticmethod
+    def from_dict(data, db_id=None):
+        return ExamRecord(
+            title=data.get("title", "未命名試卷"),
+            question_ids=data.get("question_ids", []),
+            created_at=data.get("created_at"),
+            db_id=db_id
+        )
