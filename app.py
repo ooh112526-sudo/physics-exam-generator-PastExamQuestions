@@ -546,43 +546,43 @@ with tab_review:
                 if unclassified_count > 0:
                     st.error(f"❌ 匯入失敗！尚有 {unclassified_count} 題未分類。請檢查紅色警示的題目並完成分類。")
                 else:
-                with st.spinner("匯入中..."):
-                    count = 0
-                    total = len(all_results)
-                    progress = st.progress(0)
-                    for idx, item in enumerate(all_results):
-                       # 檢查是否啟用截圖
-                        final_img, final_url = None, None
-                        if item.get('use_image', False):
-                            final_img = item.get('image_b64')
-                            # 如果是 AI 截圖且有 URL，優先用 URL
-                            if not final_img and item.get('image_url'): final_url = item.get('image_url')
-                            elif not final_img and item.get('ref_image_url'): final_url = item.get('ref_image_url')
-                        img_data = base64.b64decode(final_img) if final_img else None
-                        
-                        # [New] 從 AI 結果取得 blob_name
-                        current_blob_name = item.get('image_blob_name')
-                        q = Question(
-                            q_type=item.get('type'), content=item.get('content'),
-                            options=item.get('options', []), answer=item.get('answer', ''),
-                            solution=item.get('solution', ''), # [New] 匯入解析
-                            image_blob_name=current_blob_name, # [New]
-                            chapter=item.get('chapter', '未分類'), source=sel_file['filename'],
-                            image_data=img_data, image_url=final_url if not img_data else None,
-                            # 確保子題也被正確轉換
-                            sub_questions=[Question.from_dict(sq) for sq in item.get('sub_questions', [])] if item.get('sub_questions') else []
-                        )
-                        cloud_manager.save_question(q.to_dict())
-                        count += 1
-                        progress.progress((idx+1)/total)
-                     # [修正邏輯]: 匯入完成後，清除 AI 的暫存結果 (Batches/Results)，但保留檔案紀錄
-                     # 使用 clean_old_batch_data 清除舊資料，確保檔案紀錄乾淨，等待下次可能的重新辨識
-                    cloud_manager.clean_old_batch_data(sel_file['id'])
-                    # 將檔案狀態更新為「已匯入」
-                    cloud_manager.update_file_status(sel_file['id'], "已匯入")
-                    del st.session_state['review_data_cache']
-                    st.session_state['current_review_file_id'] = None
-                    st.success(f"匯入 {count} 題並已自動清除 AI 暫存資料！"); time.sleep(2); st.rerun()
+                    with st.spinner("匯入中..."):
+                        count = 0
+                        total = len(all_results)
+                        progress = st.progress(0)
+                        for idx, item in enumerate(all_results):
+                           # 檢查是否啟用截圖
+                            final_img, final_url = None, None
+                            if item.get('use_image', False):
+                                final_img = item.get('image_b64')
+                                # 如果是 AI 截圖且有 URL，優先用 URL
+                                if not final_img and item.get('image_url'): final_url = item.get('image_url')
+                                elif not final_img and item.get('ref_image_url'): final_url = item.get('ref_image_url')
+                            img_data = base64.b64decode(final_img) if final_img else None
+                            
+                            # [New] 從 AI 結果取得 blob_name
+                            current_blob_name = item.get('image_blob_name')
+                            q = Question(
+                                q_type=item.get('type'), content=item.get('content'),
+                                options=item.get('options', []), answer=item.get('answer', ''),
+                                solution=item.get('solution', ''), # [New] 匯入解析
+                                image_blob_name=current_blob_name, # [New]
+                                chapter=item.get('chapter', '未分類'), source=sel_file['filename'],
+                                image_data=img_data, image_url=final_url if not img_data else None,
+                                # 確保子題也被正確轉換
+                                sub_questions=[Question.from_dict(sq) for sq in item.get('sub_questions', [])] if item.get('sub_questions') else []
+                            )
+                            cloud_manager.save_question(q.to_dict())
+                            count += 1
+                            progress.progress((idx+1)/total)
+                         # [修正邏輯]: 匯入完成後，清除 AI 的暫存結果 (Batches/Results)，但保留檔案紀錄
+                         # 使用 clean_old_batch_data 清除舊資料，確保檔案紀錄乾淨，等待下次可能的重新辨識
+                        cloud_manager.clean_old_batch_data(sel_file['id'])
+                        # 將檔案狀態更新為「已匯入」
+                        cloud_manager.update_file_status(sel_file['id'], "已匯入")
+                        del st.session_state['review_data_cache']
+                        st.session_state['current_review_file_id'] = None
+                        st.success(f"匯入 {count} 題並已自動清除 AI 暫存資料！"); time.sleep(2); st.rerun()
 # === Tab 4: 題庫管理 (保留基本列表) ===
 with tab_bank:
     st.subheader("📚 題庫列表")
